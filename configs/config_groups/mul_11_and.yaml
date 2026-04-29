@@ -2,19 +2,19 @@ experiment:
   kwargs:
     seed: 42
     log_level: INFO
-    experiment_prefix: mac_16_and_routing_gene
+    experiment_prefix: mul_8_and_routing_gene
     device: &device cuda:0
     log_dir: logs
     build_dir: build
-    rtl_file: MAC.v
-    n_processing: 8
+    rtl_file: MUL.v
+    n_processing: 25
     n_full_target_delay_processing: 12
-    bit_width: 16
-    encode_type: and_mac
+    bit_width: 11
+    encode_type: and
     ct_arch: dadda
 
 trainer:
-  name: CompressorRoutingGeneArchMac
+  name: CompressorRoutingGeneArch
   kwargs:
     # loss params
     use_ppo_loss: true
@@ -32,11 +32,11 @@ trainer:
     num_episodes: 100
     num_samples: 2
     num_epochs: 1 # ppo epochs
-    save_freq: 20
+    save_freq: 50
     log_freq: 1
     # learning params
     optim_name: Adam
-    optim_kwargs:
+    optim_kwargs: 
       lr: 1e-4
     scheduler_name: CosineAnnealingLR
     scheduler_kwargs:
@@ -56,10 +56,10 @@ trainer:
     delay_weight: 2.0
     area_weight: 2.0
     power_weight: 1.0
-    delay_scale: 1.394475
-    area_scale: 2026.5
-    power_scale: 0.0035775
-    reference_point: [2.0, 2500]
+    delay_scale: 0.792875
+    area_scale: 453.5
+    power_scale: 0.00050775
+    reference_point: [1.2, 800]
     pareto_target: ["delay", "area"]
     pool_size: 20
     gomil_path: null

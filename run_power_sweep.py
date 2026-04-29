@@ -9,10 +9,6 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-# 导入 ARITH-DAS 组件
-from utils import get_initial_partial_product, CompressorTree, Mul
-from trainer.arith_das import CompressorGraph
-
 # ==============================================================================
 # 1. 纯净版 Verilog 连线生成器 & 随机合法连线发生器
 # ==============================================================================
@@ -146,7 +142,7 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
     # 打散初始并发洪峰
     time.sleep(random.uniform(0.5, 5.0))
     
-    top_module = "MUL1"
+    top_module = "MUL"
     match = re.search(r'module\s+([a-zA-Z0-9_]+)', verilog_content)
     if match: top_module = match.group(1)
 
@@ -234,8 +230,13 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
 # 3. 并发主循环与绘图
 # ==============================================================================
 if __name__ == "__main__":
+    # --------- 删掉这两行 ---------
+    from utils import get_initial_partial_product, CompressorTree, Mul
+    from trainer.arith_das import CompressorGraph
+    # ------------------------------
+
     BIT_WIDTH = 16
-    ENCODE_TYPE = "booth"
+    ENCODE_TYPE = "and"
     TARGET_PERIOD = 1.5
     TOTAL_SAMPLES = 1000     
     MAX_WORKERS = 50          # ⚠️ 强烈建议不要超过 10，保护 SSH 隧道！
@@ -283,7 +284,7 @@ if __name__ == "__main__":
                         "area": res["area"],
                         "delay": res["delay"]
                     })
-                    print(f"✅ [ID: {res['id']:04d}] 成功! 功耗: {res['power_mw']:.4f} mW | 面积: {res['area']} | 延迟: {res['delay']}")
+                    print(f"✅ [ID: {res['id']:04d}] 成功! 功耗: {res['power_mw']:.4f} mW | 面积: {res['area']:.4f} | 延迟: {res['delay']:.4f}")
             else:
                 print(f"❌ [ID: {res['id']:04d}] 失败！请检查日志。")
                 print(f"--- ERROR LOG ---\n{res['log']}\n-----------------")

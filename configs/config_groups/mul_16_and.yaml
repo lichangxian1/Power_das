@@ -7,7 +7,7 @@ experiment:
     log_dir: logs
     build_dir: build
     rtl_file: MUL.v
-    n_processing: 8
+    n_processing: 12
     n_full_target_delay_processing: 12
     bit_width: 16
     encode_type: and
@@ -29,14 +29,14 @@ trainer:
     disc_loss_weight: 1e-2
     disc_loss_weight_incr: 1e-3
     # training scale
-    num_episodes: 5000
-    num_samples: 2
+    num_episodes: 50
+    num_samples: 3
     num_epochs: 1 # ppo epochs
-    save_freq: 500
+    save_freq: 10
     log_freq: 1
     # learning params
     optim_name: Adam
-    optim_kwargs: 
+    optim_kwargs:
       lr: 1e-4
     scheduler_name: CosineAnnealingLR
     scheduler_kwargs:

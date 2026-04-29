@@ -333,27 +333,18 @@ endmodule
         )
         return booth_selector
 
-    @staticmethod
     def simulate_worker(
-        worker_path, rtl_path, target_delay, worker_id, keep_files=False
+        self, worker_path, rtl_path, target_delay, worker_id, keep_files=False
     ):
-        # ==========================================
-        # [TSMC 28nm 并发评估引擎注入]
-        # ==========================================
-        
-        # 1. 直接使用函数参数里的 rtl_path 和 target_delay 调用我们的引擎
-        area, delay = evaluate_single_design(rtl_path, target_delay)
-        
-        # 2. 赋予默认的 power 值 (因为原框架需要这个 key，我们目前没测功耗)
-        power = 0.0
-        
-        # 3. 惩罚非法拓扑结构
-        if area == float('inf') or delay == float('inf'):
+        # 注意这里接收 3 个参数：面积，延迟，功耗
+        area, delay, power = evaluate_single_design(rtl_path, target_delay, bit_width=self.bit_width)
+        print(f"✅ 成功! 功耗: {power:.4f} mW | 面积: {area} | 延迟: {delay}")
+
+        # 惩罚非法拓扑结构
+        if area == float('inf') or delay == float('inf') or power == float('inf'):
             area = 99999.0
             delay = 99.0
             power = 99.0
-            
-        # ==========================================
 
         return {
             "delay": delay,
