@@ -96,6 +96,30 @@ def compute_kendall_tau(pred, true):
     return (tau if not np.isnan(tau) else 0.0), pval
 
 
+def compute_spearman(pred, true):
+    p = pred.detach().cpu().numpy()
+    t = true.detach().cpu().numpy()
+    rho, pval = stats.spearmanr(p, t)
+    return (rho if not np.isnan(rho) else 0.0), pval
+
+
+def compute_topk_recall(pred, true, k_ratios=(0.05, 0.10, 0.20)):
+    """
+    Top-K Recall：真实 power 最低的 K 个样本中，模型预测的 Top-K 命中了多少。
+    power 越低越好 → 取最小的 K 个 (largest=False)。
+    返回 dict: {ratio: recall}
+    """
+    n = pred.size(0)
+    results = {}
+    for r in k_ratios:
+        k = max(1, int(round(n * r)))
+        true_topk = set(torch.topk(true, k, largest=False).indices.cpu().tolist())
+        pred_topk = set(torch.topk(pred, k, largest=False).indices.cpu().tolist())
+        hit = len(true_topk & pred_topk)
+        results[r] = hit / k
+    return results
+
+
 def compute_rank_loss(pred, true, criterion, device):
     B = pred.size(0)
     if B < 2:
@@ -145,6 +169,8 @@ def train_one_fold(
     rank_fn = nn.MarginRankingLoss(margin=0.01)
 
     best_tau = -1.0
+    best_spearman = -1.0
+    best_recall10 = -1.0
     best_state = None
     patience_counter = 0
     max_patience = 150
@@ -195,17 +221,26 @@ def train_one_fold(
             all_true = torch.cat(all_true)
 
             tau, pval = compute_kendall_tau(all_pred, all_true)
+            rho, rho_p = compute_spearman(all_pred, all_true)
+            recalls = compute_topk_recall(all_pred, all_true, k_ratios=(0.05, 0.10, 0.20))
             mse = nn.functional.mse_loss(all_pred, all_true).item()
             mape = (((all_pred - all_true).abs() / (all_true.abs() + 1e-8)).mean() * 100).item()
 
             print(f"  [Fold {fold_id}] Epoch {epoch + 1:03d} | Loss: {avg_loss:.4f} "
-                  f"| τ={tau:+.4f} (p={pval:.4f}) | MSE={mse:.6f} | MAPE={mape:.2f}%")
+                  f"| τ={tau:+.4f} | ρ={rho:+.4f} "
+                  f"| R@5%={recalls[0.05]:.3f} R@10%={recalls[0.10]:.3f} R@20%={recalls[0.20]:.3f} "
+                  f"| MSE={mse:.6f} | MAPE={mape:.2f}%")
 
-            if tau > best_tau:
+            recall10 = recalls[0.10]
+            improved = recall10 > best_recall10
+            if improved:
+                best_recall10 = recall10
                 best_tau = tau
+                best_spearman = rho
                 patience_counter = 0
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
-                print(f"       🌟 Fold {fold_id} best τ = {best_tau:+.4f}")
+                print(f"       🌟 Fold {fold_id} best R@10%={best_recall10:.3f} "
+                      f"(τ={best_tau:+.4f}, ρ={best_spearman:+.4f})")
             else:
                 patience_counter += 5
                 if patience_counter >= max_patience:
