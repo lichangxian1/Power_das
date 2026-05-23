@@ -21,6 +21,8 @@ trainer:
     ppo_loss_weight: 1.0
     use_delay_loss: false
     delay_loss_weight: 0.1
+    use_glitch_loss: false
+    glitch_loss_weight: 0.1
     lse_gamma_val: 0.01
     use_rule_loss: true
     rule_loss_weight: 1e-2

@@ -21,9 +21,6 @@ import time
 import json
 import logging
 
-import sys
-sys.path.append(".") # 确保能找到根目录下的 send_eda.py
-from send_eda import evaluate_single_design
 
 class Mul:
     def __init__(
@@ -333,18 +330,60 @@ endmodule
         )
         return booth_selector
 
+    @staticmethod
     def simulate_worker(
-        self, worker_path, rtl_path, target_delay, worker_id, keep_files=False
+        worker_path, rtl_path, target_delay, worker_id, keep_files=False
     ):
-        # 注意这里接收 3 个参数：面积，延迟，功耗
-        area, delay, power = evaluate_single_design(rtl_path, target_delay, bit_width=self.bit_width)
-        print(f"✅ 成功! 功耗: {power:.4f} mW | 面积: {area} | 延迟: {delay}")
+        os.makedirs(worker_path, exist_ok=True)
+        yosys_script_path = os.path.join(worker_path, f"yosys.ys")
+        sta_script_path = os.path.join(worker_path, f"sta.tcl")
+        netlist_path = os.path.join(worker_path, f"netlist.v")
+        constr_path = os.path.join(worker_path, f"constr.sdc")
+        yosys_out_path = os.path.join(worker_path, f"yosys_out.log")
+        sta_out_path = os.path.join(worker_path, f"sta_out.log")
 
-        # 惩罚非法拓扑结构
-        if area == float('inf') or delay == float('inf') or power == float('inf'):
-            area = 99999.0
-            delay = 99.0
-            power = 99.0
+        yosys_script = yosys_script_template.format(
+            rtl_path=rtl_path,
+            liberty_path=lib_path,
+            target_delay=target_delay,
+            constr_path=constr_path,
+            netlist_path=netlist_path,
+        )
+        with open(yosys_script_path, "w") as f:
+            f.write(yosys_script)
+        sta_script = sta_script_template.format(
+            lef_path=lef_path,
+            lib_path=lib_path,
+            verilog_path=netlist_path,
+        )
+        with open(sta_script_path, "w") as f:
+            f.write(sta_script)
+        with open(constr_path, "w") as f:
+            f.write(abc_constr)
+
+        os.system(f"yosys {yosys_script_path} > {yosys_out_path}")
+        os.system(f"openroad  {sta_script_path} > {sta_out_path}")
+
+        with open(sta_out_path, "r") as f:
+            lines = f.readlines()
+            for line in lines:
+                words = line.split()
+                if len(words) > 0:
+                    if words[0] == "wns":
+                        # CRITICAL: we set 0.2 * 5 input delay in sta script
+                        delay = float(words[1]) - 1
+                    if words[0] == "Design":
+                        area = float(words[2])
+                    if words[0] == "Total":
+                        power = float(words[-2])
+
+        if not keep_files:
+            os.remove(yosys_script_path)
+            os.remove(sta_script_path)
+            os.remove(netlist_path)
+            os.remove(constr_path)
+            os.remove(yosys_out_path)
+            os.remove(sta_out_path)
 
         return {
             "delay": delay,
