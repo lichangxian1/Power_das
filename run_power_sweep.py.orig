@@ -201,9 +201,7 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
             # 🌟 数据解析与逻辑报错拦截
             power, area, delay = None, None, None
             logic_failed = False
-            node_powers = {}            # POC: per-node power dict (inst_name → avg_W)
-            in_node_block = False
-
+            
             for line in stdout.split('\n'):
                 if "总功耗" in line and "W" in line:
                     val_str = line.split(':')[1].strip().split()[0]
@@ -212,29 +210,11 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
                     area = float(line.split(':')[1].strip().split()[0])
                 elif "极限工作延迟" in line:
                     delay = float(line.split(':')[1].strip().split()[0])
-                elif "FAILED:" in line:
+                elif "FAILED:" in line: # 拦截到了仿真平台的报错打印！
                     logic_failed = True
-                # POC: per-node power 段解析
-                elif "--- BEGIN_NODE_POWER" in line:
-                    in_node_block = True
-                elif "--- END_NODE_POWER" in line:
-                    in_node_block = False
-                elif in_node_block and line.startswith("NODE_POWER:"):
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        inst_name = parts[1]
-                        try:
-                            node_powers[inst_name] = float(parts[2])
-                        except ValueError:
-                            pass
-
+            
             if power is not None:
-                return {
-                    "id": idx, "power_mw": power * 1000,
-                    "area": area, "delay": delay,
-                    "success": True, "logic_failed": logic_failed,
-                    "node_powers": node_powers,   # POC: 空 dict 表示旧版 sandbox
-                }
+                return {"id": idx, "power_mw": power * 1000, "area": area, "delay": delay, "success": True, "logic_failed": logic_failed}
             else:
                 return {"id": idx, "success": False, "log": stdout}
 

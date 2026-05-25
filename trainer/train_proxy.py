@@ -1,15 +1,82 @@
 import os
+import random
 import torch
 import torch.nn as nn
 import numpy as np
 import scipy.stats as stats
 from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset, Sampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.model_selection import KFold
 
 from proxy_mlp import ArithProxyGNN     # ← 新 GNN
+
+
+# ========================== Stratified-N Batch Sampler ==========================
+class StratifiedNBatchSampler(Sampler):
+    """Batch 内所有样本节点数 N 相同 (按 X.shape[0] 分桶)。
+
+    目的: 让 rank/list/scale loss 不被跨结构家族 (N 异构) 的样本污染,
+          所有 batch 内的 pair 都在公平的"同结构"前提下比较。
+    """
+
+    def __init__(self, dataset_subset, batch_size, drop_last=True, shuffle=True, seed=42):
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        self.seed = seed
+
+        # Subset: local_index → base_index, 通过 base.data[base_index]["X"].shape[0] 拿 N
+        if isinstance(dataset_subset, Subset):
+            base = dataset_subset.dataset
+            base_indices = dataset_subset.indices
+        else:
+            base = dataset_subset
+            base_indices = list(range(len(dataset_subset)))
+
+        # 按 N 分桶 (存 local index, 即 dataset_subset 的索引)
+        buckets = {}
+        for local_i, base_i in enumerate(base_indices):
+            n = base.data[int(base_i)]["X"].shape[0]
+            buckets.setdefault(n, []).append(local_i)
+        self.buckets = buckets
+        self._epoch = 0
+
+        # 信息日志 (第一次构造时)
+        sizes = sorted(((n, len(ids)) for n, ids in buckets.items()), key=lambda x: -x[1])
+        bucket_summary = ", ".join(f"N={n}:{c}" for n, c in sizes[:5])
+        print(f"  [StratifiedNBatchSampler] {len(buckets)} 个 N 桶, "
+              f"top5: {bucket_summary}{'...' if len(sizes) > 5 else ''}")
+        print(f"     batch_size={batch_size}, drop_last={drop_last}, total_batches={len(self)}")
+
+    def set_epoch(self, epoch):
+        self._epoch = epoch
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self._epoch)
+        all_batches = []
+        for n, ids in self.buckets.items():
+            ids = ids.copy()
+            if self.shuffle:
+                rng.shuffle(ids)
+            for i in range(0, len(ids), self.batch_size):
+                batch = ids[i:i + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                all_batches.append(batch)
+        if self.shuffle:
+            rng.shuffle(all_batches)
+        return iter(all_batches)
+
+    def __len__(self):
+        total = 0
+        for ids in self.buckets.values():
+            if self.drop_last:
+                total += len(ids) // self.batch_size
+            else:
+                total += (len(ids) + self.batch_size - 1) // self.batch_size
+        return total
 
 
 # ========================== 数据集 ==========================
@@ -156,11 +223,22 @@ def listwise_loss(pred, true):
 
 
 # ========================== 单 Fold 训练 ==========================
+def _compute_metrics(pred, true):
+    """统一计算 τ, ρ, R@K, MSE, MAPE。"""
+    tau, _ = compute_kendall_tau(pred, true)
+    rho, _ = compute_spearman(pred, true)
+    recalls = compute_topk_recall(pred, true, k_ratios=(0.05, 0.10, 0.20))
+    mse = nn.functional.mse_loss(pred, true).item()
+    mape = (((pred - true).abs() / (true.abs() + 1e-8)).mean() * 100).item()
+    return {"tau": tau, "rho": rho, "recalls": recalls, "mse": mse, "mape": mape}
+
+
 def train_one_fold(
     model, train_loader, val_loader,
     device, epochs, lr, weight_decay,
-    w_mse, w_rank, w_list,
+    w_mse, w_rank, w_list, w_scale,
     power_mean, power_std, fold_id=0,
+    eval_filter_n=None,
 ):
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
@@ -193,7 +271,17 @@ def train_one_fold(
             loss_rank = compute_rank_loss(pred, power_raw, rank_fn, device)
             loss_list = listwise_loss(pred, power_norm)
 
-            loss = w_mse * loss_mse + w_rank * loss_rank + w_list * loss_list
+            # Scale loss: 惩罚 pred 的 std 偏离 true 的 std (修正 Huber 压缩)
+            # 用 unbiased=False 避免 batch_size 小时的 bias
+            if pred.numel() >= 2:
+                pred_std = pred.std(unbiased=False)
+                true_std = power_norm.std(unbiased=False)
+                loss_scale = (pred_std - true_std).abs()
+            else:
+                loss_scale = torch.tensor(0.0, device=device)
+
+            loss = (w_mse * loss_mse + w_rank * loss_rank
+                    + w_list * loss_list + w_scale * loss_scale)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -205,7 +293,7 @@ def train_one_fold(
 
         if (epoch + 1) % 5 == 0:
             model.eval()
-            all_pred, all_true = [], []
+            all_pred, all_true, all_n = [], [], []
 
             with torch.no_grad():
                 for X, edge_index, mask, pn, pr in val_loader:
@@ -216,30 +304,47 @@ def train_one_fold(
                     pred_raw = pred * power_std + power_mean
                     all_pred.append(pred_raw)
                     all_true.append(pr.to(device, non_blocking=True))
+                    all_n.append(mask.sum(dim=1).long())
 
             all_pred = torch.cat(all_pred)
             all_true = torch.cat(all_true)
+            all_n = torch.cat(all_n)
 
-            tau, pval = compute_kendall_tau(all_pred, all_true)
-            rho, rho_p = compute_spearman(all_pred, all_true)
-            recalls = compute_topk_recall(all_pred, all_true, k_ratios=(0.05, 0.10, 0.20))
-            mse = nn.functional.mse_loss(all_pred, all_true).item()
-            mape = (((all_pred - all_true).abs() / (all_true.abs() + 1e-8)).mean() * 100).item()
+            # Mixed-N 指标（被 N→power 短路污染，仅作参考）
+            m_mix = _compute_metrics(all_pred, all_true)
 
-            print(f"  [Fold {fold_id}] Epoch {epoch + 1:03d} | Loss: {avg_loss:.4f} "
-                  f"| τ={tau:+.4f} | ρ={rho:+.4f} "
-                  f"| R@5%={recalls[0.05]:.3f} R@10%={recalls[0.10]:.3f} R@20%={recalls[0.20]:.3f} "
-                  f"| MSE={mse:.6f} | MAPE={mape:.2f}%")
+            # Fixed-N 指标（去除 N 短路，真实路由学习能力）
+            m_fix = None
+            if eval_filter_n is not None:
+                keep = (all_n == eval_filter_n)
+                n_kept = int(keep.sum().item())
+                if n_kept >= 16:
+                    m_fix = _compute_metrics(all_pred[keep], all_true[keep])
+                    m_fix["n_kept"] = n_kept
 
-            recall10 = recalls[0.10]
-            improved = recall10 > best_recall10
+            line = (f"  [Fold {fold_id}] Epoch {epoch + 1:03d} | Loss: {avg_loss:.4f}"
+                    f" | mix: τ={m_mix['tau']:+.3f} ρ={m_mix['rho']:+.3f} "
+                    f"R@10={m_mix['recalls'][0.10]:.3f} MAPE={m_mix['mape']:.2f}%")
+            if m_fix is not None:
+                line += (f" || fix(N={eval_filter_n},n={m_fix['n_kept']}): "
+                         f"τ={m_fix['tau']:+.3f} ρ={m_fix['rho']:+.3f} "
+                         f"R@5={m_fix['recalls'][0.05]:.3f} "
+                         f"R@10={m_fix['recalls'][0.10]:.3f} "
+                         f"R@20={m_fix['recalls'][0.20]:.3f}")
+            print(line)
+
+            # best 选择标准：优先用 fixed-N R@10%（去除短路污染），fallback mixed-N
+            track_metric = m_fix["recalls"][0.10] if m_fix is not None else m_mix["recalls"][0.10]
+            tracked = m_fix if m_fix is not None else m_mix
+            improved = track_metric > best_recall10
             if improved:
-                best_recall10 = recall10
-                best_tau = tau
-                best_spearman = rho
+                best_recall10 = track_metric
+                best_tau = tracked["tau"]
+                best_spearman = tracked["rho"]
                 patience_counter = 0
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
-                print(f"       🌟 Fold {fold_id} best R@10%={best_recall10:.3f} "
+                tag = f"fix-N={eval_filter_n}" if m_fix is not None else "mix"
+                print(f"       🌟 Fold {fold_id} best R@10% [{tag}]={best_recall10:.3f} "
                       f"(τ={best_tau:+.4f}, ρ={best_spearman:+.4f})")
             else:
                 patience_counter += 5
@@ -252,7 +357,7 @@ def train_one_fold(
 
 # ========================== 主函数: K-Fold ==========================
 def train_proxy(
-    data_path: str = "dataset/glitch_power_data_16bit_merged.pt",
+    data_path: str = "dataset/glitch_power_data_16bit_enriched.pt",
     save_path: str = "dataset/glitch_power_proxy_gnn.pth",
     n_folds: int = 5,
     batch_size: int = 64,
@@ -261,13 +366,21 @@ def train_proxy(
     lr: float = 3e-4,             # ← GNN 参数多，LR 调小一些
     weight_decay: float = 5e-3,   # ← 加大 weight decay 防过拟合
     node_feature_dim: int = 9,
-    hidden_dim: int = 64,
-    num_gnn_layers: int = 3,      # ← 3 层 GNN
+    hidden_dim: int = 96,         # ← 64→96，增加表达力
+    num_gnn_layers: int = 4,      # ← 3→4 层，扩大感受野
     dropout: float = 0.15,        # ← 略大于之前的 0.1
-    w_mse: float = 1.0,
+    w_mse: float = 0.5,       # ← 从 1.0 降到 0.5：Huber 压缩输出 scale，降权
     w_rank: float = 0.2,
     w_list: float = 0.5,
+    w_scale: float = 0.5,     # ← 新增：惩罚 std(pred) 偏离 std(true)，对抗 Huber 压缩
     num_workers: int = 4,
+    max_folds: int = 1,       # 只跑前 N 个 fold，便于快速对比实验
+    start_fold: int = 0,      # 从第几个 fold 开始 (方便补跑剩余 fold)
+    use_mean_agg: bool = True,   # GNN 用 mean 聚合（按 degree 归一化）
+    use_edge_feat: bool = True,  # 用 arrival_time 差作为边特征
+    eval_filter_n: int = 730,    # val 评估时只算 N==该值 的子集 (None=全集)
+    train_filter_n: int = None,  # 训练时只用 N==该值 的子集 (C 方案: 消除 N 短路)
+    use_stratified_batch: bool = False,  # batch 内同 N (B 方案: rank loss 不被 N 污染)
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  🖥  Device: {device}")
@@ -288,20 +401,48 @@ def train_proxy(
     best_overall_state = None
 
     # 参数量统计
-    tmp_model = ArithProxyGNN(node_feature_dim, hidden_dim, num_gnn_layers, dropout=dropout)
+    tmp_model = ArithProxyGNN(
+        node_feature_dim, hidden_dim, num_gnn_layers, dropout=dropout,
+        use_mean_agg=use_mean_agg, use_edge_feat=use_edge_feat,
+    )
     n_params = sum(p.numel() for p in tmp_model.parameters())
+    actual_use_edge_feat = tmp_model.use_edge_feat  # 可能被自动降级
     del tmp_model
 
-    print(f"\n  🚀 开始 {n_folds}-Fold 交叉验证训练")
+    print(f"\n  🚀 开始 {n_folds}-Fold 交叉验证训练"
+          + (f" (只跑前 {max_folds} 个 fold)" if max_folds else ""))
     print(f"     模型: ArithProxyGNN ({num_gnn_layers}-layer Bidirectional GNN")
     print(f"            + 异构投影 + 图级双池化)")
+    print(f"     聚合方式: {'mean (degree-normalized)' if use_mean_agg else 'sum'}")
+    print(f"     边特征  : {'arrival_skew + arrival_src' if actual_use_edge_feat else '关闭'}")
     print(f"     参数量: {n_params:,}")
     print(f"     hidden_dim={hidden_dim}, in_dim={node_feature_dim}, dropout={dropout}")
     print(f"     LR={lr}, weight_decay={weight_decay}")
-    print(f"     Loss: {w_mse}×Huber + {w_rank}×RankLoss + {w_list}×ListMLE")
+    print(f"     Loss: {w_mse}×Huber + {w_rank}×RankLoss + {w_list}×ListMLE + {w_scale}×ScaleLoss")
+    print(f"     评估 : best 选择基于 "
+          + (f"fix-N={eval_filter_n} R@10%" if eval_filter_n else "mixed-N R@10%"))
+    print(f"     训练数据: "
+          + (f"只用 N={train_filter_n} 子集" if train_filter_n else "全集")
+          + (" + stratified batch (同 N 同 batch)" if use_stratified_batch else ""))
     print(f"     DataLoader: train_bs={batch_size}, val_bs={val_batch_size}, num_workers={num_workers}\n")
 
+    # POC: 预先算每个样本的 N 用于 filter / stratify
+    sample_ns = np.array([dataset.data[i]["X"].shape[0] for i in range(len(dataset))])
+
     for fold_id, (train_idx, val_idx) in enumerate(kf.split(range(len(dataset)))):
+        if fold_id < start_fold:
+            continue
+        if max_folds is not None and fold_id >= max_folds:
+            print(f"\n  ⏭  达到 max_folds={max_folds}，提前结束")
+            break
+
+        # C 方案: 只保留 N==train_filter_n 的训练样本
+        train_idx_full = train_idx
+        if train_filter_n is not None:
+            train_idx = train_idx[sample_ns[train_idx] == train_filter_n]
+            print(f"  📌 train_filter_n={train_filter_n}: "
+                  f"训练样本 {len(train_idx_full)} → {len(train_idx)}")
+
         print(f"  {'=' * 60}")
         print(f"  Fold {fold_id}: train={len(train_idx)}, val={len(val_idx)}")
         print(f"  {'=' * 60}")
@@ -312,16 +453,31 @@ def train_proxy(
         actual_bs = min(batch_size, len(train_idx))
         actual_val_bs = min(val_batch_size, len(val_idx))
 
-        train_loader = DataLoader(
-            train_subset,
-            batch_size=actual_bs,
-            shuffle=True,
-            drop_last=True,
-            collate_fn=custom_collate,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=(num_workers > 0),
-        )
+        if use_stratified_batch:
+            # B 方案: 自定义 BatchSampler 让 batch 内 N 一致
+            train_batch_sampler = StratifiedNBatchSampler(
+                train_subset, batch_size=actual_bs, drop_last=True,
+                shuffle=True, seed=42 + fold_id,
+            )
+            train_loader = DataLoader(
+                train_subset,
+                batch_sampler=train_batch_sampler,
+                collate_fn=custom_collate,
+                num_workers=num_workers,
+                pin_memory=True,
+                persistent_workers=(num_workers > 0),
+            )
+        else:
+            train_loader = DataLoader(
+                train_subset,
+                batch_size=actual_bs,
+                shuffle=True,
+                drop_last=True,
+                collate_fn=custom_collate,
+                num_workers=num_workers,
+                pin_memory=True,
+                persistent_workers=(num_workers > 0),
+            )
         val_loader = DataLoader(
             val_subset,
             batch_size=actual_val_bs,
@@ -337,14 +493,35 @@ def train_proxy(
             hidden_dim=hidden_dim,
             num_gnn_layers=num_gnn_layers,
             dropout=dropout,
+            use_mean_agg=use_mean_agg,
+            use_edge_feat=use_edge_feat,
         ).to(device)
 
         tau, state = train_one_fold(
             model, train_loader, val_loader,
             device, epochs, lr, weight_decay,
-            w_mse, w_rank, w_list,
+            w_mse, w_rank, w_list, w_scale,
             power_mean, power_std, fold_id,
+            eval_filter_n=eval_filter_n,
         )
+
+        # 每个 fold 训练完立即保存，避免后续中断丢失
+        fold_ckpt_path = save_path.replace(".pth", f"_fold{fold_id}.pth")
+        torch.save({
+            "model_state_dict": state,
+            "node_feature_dim": node_feature_dim,
+            "hidden_dim": hidden_dim,
+            "num_gnn_layers": num_gnn_layers,
+            "dropout": dropout,
+            "power_mean": dataset.power_mean.item(),
+            "power_std": dataset.power_std.item(),
+            "model_class": "ArithProxyGNN",
+            "use_mean_agg": use_mean_agg,
+            "use_edge_feat": use_edge_feat,
+            "fold_id": fold_id,
+            "best_tau": tau,
+        }, fold_ckpt_path)
+        print(f"       💾 Fold {fold_id} ckpt 已保存: {fold_ckpt_path}")
 
         fold_taus.append(tau)
         if tau > best_overall_tau:
@@ -369,9 +546,38 @@ def train_proxy(
         "power_mean": dataset.power_mean.item(),
         "power_std": dataset.power_std.item(),
         "model_class": "ArithProxyGNN",
+        "use_mean_agg": use_mean_agg,
+        "use_edge_feat": use_edge_feat,
     }, save_path)
     print(f"\n  ✅ 最佳模型已保存至: {save_path}")
 
 
 if __name__ == "__main__":
-    train_proxy()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["B", "C", "default"], default="default",
+                        help="B=stratified batch (全集), C=train_filter_n=730, default=Run4 设定")
+    parser.add_argument("--folds", type=int, default=1,
+                        help="max_folds: 跑到第几个 fold 为止 (5 = 跑完全部)")
+    parser.add_argument("--start_fold", type=int, default=0,
+                        help="从第几个 fold 开始 (便于补跑剩余 fold)")
+    parser.add_argument("--save_suffix", type=str, default=None,
+                        help="ckpt 保存路径后缀 (避免覆盖现有 ckpt)")
+    args = parser.parse_args()
+
+    if args.mode == "C":
+        save_path = f"dataset/glitch_power_proxy_gnn_C{args.save_suffix or ''}.pth"
+        train_proxy(
+            max_folds=args.folds, start_fold=args.start_fold,
+            train_filter_n=730, use_stratified_batch=False,
+            save_path=save_path,
+        )
+    elif args.mode == "B":
+        save_path = f"dataset/glitch_power_proxy_gnn_B{args.save_suffix or ''}.pth"
+        train_proxy(
+            max_folds=args.folds, start_fold=args.start_fold,
+            train_filter_n=None, use_stratified_batch=True,
+            save_path=save_path,
+        )
+    else:
+        train_proxy(max_folds=args.folds, start_fold=args.start_fold)

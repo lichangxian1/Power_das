@@ -187,12 +187,29 @@ def collect_dataset(
         for info in sample_info_list:
             res = result_dict.get(info["rtl_path"])
             if res and res["power"] != float('inf') and res["delay"] != float('inf'):
+                # POC: 把 node_powers dict { "ct32_X": power_W } 转成 [N] tensor
+                #      节点身份: ct32_X 对应 vertex_idx=X (FA), ct22_X 对应 vertex_idx=X (HA)
+                num_nodes = info["X"].shape[0]
+                node_powers_arr = torch.zeros(num_nodes, dtype=torch.float32)
+                node_power_mask = torch.zeros(num_nodes, dtype=torch.bool)
+                for inst_name, p_w in (res.get("node_powers") or {}).items():
+                    try:
+                        # inst_name like "ct32_45" or "ct22_27"
+                        idx = int(inst_name.split("_")[1])
+                        if 0 <= idx < num_nodes:
+                            node_powers_arr[idx] = float(p_w)
+                            node_power_mask[idx] = True
+                    except (ValueError, IndexError):
+                        pass
+
                 dataset.append({
                     "X": info["X"].clone(),
                     "P": info["P"].clone(),
                     "area":  res["area"],
                     "delay": res["delay"],
                     "power": res["power"],
+                    "node_powers": node_powers_arr,        # [N] W (PP/output 节点为 0)
+                    "node_power_mask": node_power_mask,    # [N] bool (FA/HA 节点为 True)
                 })
                 success_count += 1
                 batch_success += 1
@@ -241,18 +258,33 @@ def collect_dataset(
         sample_P = dataset[0]["P"]
         print(f"     X shape:      {list(sample_X.shape)} (node_feature_dim={sample_X.shape[1]})")
         print(f"     P shape:      {list(sample_P.shape)} (num_nodes={sample_P.shape[0]})")
+
+        # POC: node_powers 统计
+        n_with_np = sum(1 for d in dataset if d.get("node_power_mask") is not None
+                        and bool(d["node_power_mask"].any()))
+        if n_with_np > 0:
+            sample_d = next(d for d in dataset
+                            if d.get("node_power_mask") is not None and bool(d["node_power_mask"].any()))
+            mask = sample_d["node_power_mask"]
+            np_arr = sample_d["node_powers"]
+            valid_np = np_arr[mask]
+            print(f"     node_powers 覆盖: {n_with_np}/{len(dataset)} 样本含 per-node power")
+            print(f"     sample[0] FA+HA 数: {int(mask.sum())} / {len(mask)}, "
+                  f"node power 范围 [{valid_np.min():.2e}, {valid_np.max():.2e}] W")
     print(f"  {'='*60}")
 
 
 if __name__ == "__main__":
+    # POC: 跑 5000 样本验证 per-node supervision (100 batch × 50/batch)
+    # 输出新数据集 *_node_power.pt，不覆盖现有的 *_enriched.pt
     collect_dataset(
-        num_batches=500,
+        num_batches=100,
         samples_per_batch=50,
         bit_width=16,
         encode_type="and",
-        save_path="dataset/glitch_power_data_16bit_v3.pt",
+        save_path="dataset/glitch_power_data_16bit_node_power.pt",
         target_delay=2.0,
         max_eda_workers=32,
-        save_every=5,
+        save_every=2,
         resume=True,
     )

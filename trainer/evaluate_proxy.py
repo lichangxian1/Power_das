@@ -9,7 +9,7 @@ from train_proxy import ArithDataset, custom_collate
 from proxy_mlp import ArithProxyMLP
 
 def evaluate_model(data_path="dataset/glitch_power_data_16bit.pt", 
-                   ckpt_path="dataset/glitch_power_proxy.pth"):
+                   ckpt_path="dataset/glitch_power_proxy_gnn_B.pth"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥  Device: {device}")
     

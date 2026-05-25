@@ -51,11 +51,28 @@ class HeterogeneousProjection(nn.Module):
 
 
 class BidirectionalGNNLayer(nn.Module):
-    """单层 GNN: 聚合前驱 + 后继 + 自身 → 残差 + LayerNorm"""
+    """单层 GNN: 聚合前驱 + 后继 + 自身 → 残差 + LayerNorm
 
-    def __init__(self, hidden_dim, dropout=0.1):
+    支持：
+      - mean aggregation (按 in/out degree 归一化)，避免 sum 让 hidden 数量级被 degree 主导
+      - 边特征调制 (例如 arrival_skew)：edge_msg = edge_proj(edge_feat) 加到源节点消息上
+    """
+
+    def __init__(self, hidden_dim, dropout=0.1, edge_feat_dim=0, use_mean_agg=True):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.edge_feat_dim = edge_feat_dim
+        self.use_mean_agg = use_mean_agg
+
+        if edge_feat_dim > 0:
+            self.edge_proj = nn.Sequential(
+                nn.Linear(edge_feat_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.edge_proj = None
+
         # 三路特征拼接：自身 + 前驱聚合 + 后继聚合
         self.msg_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
@@ -67,41 +84,59 @@ class BidirectionalGNNLayer(nn.Module):
         )
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, h, edge_index):
+    def forward(self, h, edge_index, edge_feat=None):
         """
         h:          [B*N, H]
         edge_index: [2, E]   edge_index[0]=src, edge_index[1]=dst
+        edge_feat:  [E, edge_feat_dim] 或 None
         """
         H = self.hidden_dim
         src = edge_index[0]
         dst = edge_index[1]
+        E = src.size(0)
+        N_total = h.size(0)
+
+        # 边消息：在 src/dst 节点 hidden 上叠加边特征投影
+        if self.edge_proj is not None and edge_feat is not None:
+            edge_msg = self.edge_proj(edge_feat)   # [E, H]
+            msg_fwd = h[src] + edge_msg            # dst 接收的消息
+            msg_bwd = h[dst] + edge_msg            # src 接收的反向消息（共享边特征）
+        else:
+            msg_fwd = h[src]
+            msg_bwd = h[dst]
 
         # 1) 聚合前驱: dst ← src
         h_pred = torch.zeros_like(h)
-        h_pred.scatter_add_(
-            0,
-            dst.unsqueeze(1).expand(-1, H),
-            h[src],
-        )
+        h_pred.scatter_add_(0, dst.unsqueeze(1).expand(-1, H), msg_fwd)
 
         # 2) 聚合后继: src ← dst (反向边)
         h_succ = torch.zeros_like(h)
-        h_succ.scatter_add_(
-            0,
-            src.unsqueeze(1).expand(-1, H),
-            h[dst],
-        )
+        h_succ.scatter_add_(0, src.unsqueeze(1).expand(-1, H), msg_bwd)
 
-        # 3) 拼接 + 变换
+        # 3) Mean aggregation：除以 in/out degree，防止 hidden 数量级被 degree 主导
+        if self.use_mean_agg:
+            ones = torch.ones(E, device=h.device, dtype=h.dtype)
+            in_deg = torch.zeros(N_total, device=h.device, dtype=h.dtype).scatter_add_(0, dst, ones)
+            out_deg = torch.zeros(N_total, device=h.device, dtype=h.dtype).scatter_add_(0, src, ones)
+            h_pred = h_pred / in_deg.clamp_min(1.0).unsqueeze(-1)
+            h_succ = h_succ / out_deg.clamp_min(1.0).unsqueeze(-1)
+
+        # 4) 拼接 + 变换
         h_cat = torch.cat([h, h_pred, h_succ], dim=-1)  # [B*N, 3H]
         h_new = self.msg_mlp(h_cat)
 
-        # 4) 残差 + 归一化
+        # 5) 残差 + 归一化
         return self.norm(h + h_new)
 
 
 class ArithProxyGNN(nn.Module):
-    """基于 GNN 的功耗预测代理"""
+    """基于 GNN 的功耗预测代理
+
+    可配置开关 (默认全开)：
+      - use_mean_agg:  GNN 用 mean 聚合（按 degree 归一化）替代 sum
+      - use_edge_feat: 用 arrival_time 差分作为边特征调制消息
+      - arrival_idx:   X 中 arrival_time 所在列；若 X 维度不足则自动降级
+    """
 
     def __init__(
         self,
@@ -110,12 +145,21 @@ class ArithProxyGNN(nn.Module):
         num_gnn_layers=3,
         num_node_types=4,
         dropout=0.1,
+        use_mean_agg=True,
+        use_edge_feat=True,
+        arrival_idx=7,
     ):
         super().__init__()
         self.node_feature_dim = node_feature_dim
         self.hidden_dim = hidden_dim
         self.num_gnn_layers = num_gnn_layers
         self.num_node_types = num_node_types
+
+        # 当 X 维度不足以提供 arrival_time 时自动关掉 edge_feat
+        self.use_edge_feat = use_edge_feat and (node_feature_dim > arrival_idx)
+        self.arrival_idx = arrival_idx
+        self.use_mean_agg = use_mean_agg
+        edge_feat_dim = 2 if self.use_edge_feat else 0   # [arrival_skew, arrival_src]
 
         # 1) 异构输入投影
         self.input_proj = HeterogeneousProjection(
@@ -125,7 +169,11 @@ class ArithProxyGNN(nn.Module):
 
         # 2) GNN 主干
         self.gnn_layers = nn.ModuleList([
-            BidirectionalGNNLayer(hidden_dim, dropout)
+            BidirectionalGNNLayer(
+                hidden_dim, dropout,
+                edge_feat_dim=edge_feat_dim,
+                use_mean_agg=use_mean_agg,
+            )
             for _ in range(num_gnn_layers)
         ])
 
@@ -144,6 +192,7 @@ class ArithProxyGNN(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+
 
     def forward(self, x_node, edge_index, mask):
         """
@@ -166,9 +215,19 @@ class ArithProxyGNN(nn.Module):
         h = self.input_proj(x_flat, types_flat, mask_flat)  # [B*N, H]
         h = self.input_norm(h)
 
+        # 边特征：arrival skew (src→dst 的 timing 不同步是 glitch 的物理来源)
+        edge_feat = None
+        if self.use_edge_feat:
+            src = edge_index[0]
+            dst = edge_index[1]
+            arrival_flat = x_flat[:, self.arrival_idx]            # [B*N]
+            edge_skew = arrival_flat[src] - arrival_flat[dst]     # [E]
+            edge_src_at = arrival_flat[src]                       # [E]
+            edge_feat = torch.stack([edge_skew, edge_src_at], dim=-1)  # [E, 2]
+
         # GNN 主干
         for layer in self.gnn_layers:
-            h = layer(h, edge_index)
+            h = layer(h, edge_index, edge_feat)
 
         # ===== 节点级预测 (extensive part) =====
         mask_f = mask_flat.unsqueeze(-1).float()      # [B*N, 1]
