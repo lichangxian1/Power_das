@@ -14,15 +14,20 @@ from send_eda import evaluate_batch_parallel
 
 
 # ========================== 特征提取 ==========================
-def extract_X_P(comp_graph, samples_connection):
+def extract_X_edge(comp_graph, samples_connection):
     """
-    核心特征提取器：将 arith-das 的内部图结构转化为代理模型所需的张量 X 和 P
+    将 arith-das 的图结构转化为 GNN 训练所需的稀疏图表示。
 
-    适配当前 proxy_mlp.py:
-      - X: [N, 7]  原始节点特征 (stage_idx, col_idx, idx, type_onehot×4)
-                    不做归一化，模型内部的 input_proj + LayerNorm 会处理
-      - P: [N, N]  邻接矩阵, P[src, dst]=1 表示 src→dst 有边
-                    proxy_mlp.py 中用 P^T @ X 来聚合前驱特征
+    返回:
+      X:          [N, 7]  节点特征 (stage_idx, col_idx, idx, type_onehot×4)
+      edge_index: [2, E]  有向边 src→dst (信号流方向)
+      edge_attr:  [E, 5]  [is_sum, is_carry, port_a, port_b, port_c]
+                          is_sum: src 与 dst 在同列 (sum 信号 / PP 输入)
+                          is_carry: src.col + 1 = dst.col (carry 信号)
+                          port_*: dst 端口 one-hot (a/b/c)
+
+    samples_connection 由 arith_das.sample_from_logits 产生，覆盖 s=0..stage_num,
+    s=0 时 src 是 PP 节点, dst 是 stage-0 节点 → 已包含真实 PP→stage0 边。
     """
     num_nodes = len(comp_graph.vertex_list)
 
@@ -36,32 +41,42 @@ def extract_X_P(comp_graph, samples_connection):
         x_features.append(attr)
     X = torch.tensor(x_features, dtype=torch.float32)
 
-    # -------- 邻接矩阵 P [N, N] --------
-    # P[src, dst] = 1 表示 src 的输出连接到 dst 的输入 (src→dst)
-    P = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    # -------- 边 (edge_index + edge_attr) --------
+    src_list, dst_list, attr_list = [], [], []
+    for src_idx, dst_idx, dst_connec_type, _ in samples_connection:
+        if not (0 <= src_idx < num_nodes and 0 <= dst_idx < num_nodes):
+            continue
+        src_col = comp_graph.vertex_list[src_idx][1]
+        dst_col = comp_graph.vertex_list[dst_idx][1]
+        is_sum = 1.0 if src_col == dst_col else 0.0
+        is_carry = 1.0 if (src_col + 1) == dst_col else 0.0
+        # dst_connec_type ∈ {0, 1, 2} → port a/b/c (FA 三端口; HA 用 a/c)
+        port = [0.0, 0.0, 0.0]
+        if 0 <= dst_connec_type <= 2:
+            port[dst_connec_type] = 1.0
+        src_list.append(src_idx)
+        dst_list.append(dst_idx)
+        attr_list.append([is_sum, is_carry] + port)
 
-    # samples_connection 包含所有采样出的连接边
-    for src_idx, dst_idx, dst_conc_type, _ in samples_connection:
-        if 0 <= src_idx < num_nodes and 0 <= dst_idx < num_nodes:
-            P[src_idx, dst_idx] = 1.0
-
-    # 填入 PP 节点的固定输入边 (Partial Products → Stage 0 compressors)
-    # PP 节点 (type=2) 连接到同列的 Stage 0 节点
-    for src_idx in range(num_nodes):
-        src_info = comp_graph.vertex_list[src_idx]
-        if src_info[2] == 2:  # PP 节点
-            for dst_idx in range(src_idx + 1, num_nodes):
-                dst_info = comp_graph.vertex_list[dst_idx]
-                if src_info[1] == dst_info[1] and dst_info[0] == 0:
-                    P[src_idx, dst_idx] = 1.0
-
-    return X, P
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    edge_attr = torch.tensor(attr_list, dtype=torch.float32)
+    return X, edge_index, edge_attr
 
 
 # ========================== 去重工具 ==========================
-def compute_graph_hash(X, P):
-    """计算图的 MD5 哈希，用于去重"""
-    data = torch.cat([X.flatten(), P.flatten()]).numpy().tobytes()
+def compute_graph_hash(X, edge_index, edge_attr):
+    """计算图的 MD5 哈希，用于去重 (新签名: 基于稀疏边表示)"""
+    # edge_index/edge_attr 顺序可能略有差异 → 排序后再 hash
+    if edge_index.numel() > 0:
+        keys = edge_index[0].long() * (X.shape[0] + 1) + edge_index[1].long()
+        order = torch.argsort(keys)
+        ei_sorted = edge_index[:, order]
+        ea_sorted = edge_attr[order]
+        data = X.flatten().numpy().tobytes() \
+             + ei_sorted.numpy().tobytes() \
+             + ea_sorted.numpy().tobytes()
+    else:
+        data = X.flatten().numpy().tobytes()
     return hashlib.md5(data).hexdigest()
 
 
@@ -76,6 +91,8 @@ def collect_dataset(
     max_eda_workers=25,
     save_every=5,
     resume=True,
+    stagger_waves=1,
+    stagger_delay=0,
 ):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     build_dir = "build_data_gen"
@@ -89,9 +106,14 @@ def collect_dataset(
 
     if resume and os.path.exists(save_path):
         try:
-            dataset = torch.load(save_path, map_location="cpu")
+            dataset = torch.load(save_path, map_location="cpu", weights_only=False)
+            # 兼容旧格式（含 P 矩阵）和新格式（含 edge_index + edge_attr）
             for item in dataset:
-                h = compute_graph_hash(item["X"], item["P"])
+                if "edge_index" in item and "edge_attr" in item:
+                    h = compute_graph_hash(item["X"], item["edge_index"], item["edge_attr"])
+                else:
+                    # 旧格式: 用 X + P 算 hash, 这些样本无法续接新格式 → 直接跳过
+                    h = hashlib.md5(item["X"].numpy().tobytes()).hexdigest()
                 seen_hashes.add(h)
             start_batch = len(dataset) // max(samples_per_batch // 2, 1)
             print(f"  📂 断点续采: 已有 {len(dataset)} 个样本")
@@ -142,11 +164,13 @@ def collect_dataset(
                     samples_connection, _ = env.sample_from_logits(Z_mat_dict)
                     assignment = env.emit_assignment(samples_connection)
 
-                    # 提取张量特征
-                    X, P = extract_X_P(env.comp_graph, samples_connection)
+                    # 提取张量特征 (新格式: X + edge_index + edge_attr)
+                    X, edge_index, edge_attr = extract_X_edge(
+                        env.comp_graph, samples_connection,
+                    )
 
                     # 去重检查
-                    graph_hash = compute_graph_hash(X, P)
+                    graph_hash = compute_graph_hash(X, edge_index, edge_attr)
                     if graph_hash in seen_hashes:
                         duplicate_count += 1
                         continue
@@ -160,7 +184,8 @@ def collect_dataset(
 
                     sample_info_list.append({
                         "X": X,
-                        "P": P,
+                        "edge_index": edge_index,
+                        "edge_attr": edge_attr,
                         "rtl_path": rtl_path,
                         "graph_hash": graph_hash,
                     })
@@ -177,7 +202,8 @@ def collect_dataset(
         verilog_files = [info["rtl_path"] for info in sample_info_list]
         actual_workers = min(max_eda_workers, len(verilog_files))
         eda_results = evaluate_batch_parallel(
-            verilog_files, target_delay, bit_width, max_workers=actual_workers
+            verilog_files, target_delay, bit_width, max_workers=actual_workers,
+            stagger_waves=stagger_waves, stagger_delay=stagger_delay,
         )
 
         # 4. 结果对齐与入库
@@ -204,7 +230,8 @@ def collect_dataset(
 
                 dataset.append({
                     "X": info["X"].clone(),
-                    "P": info["P"].clone(),
+                    "edge_index": info["edge_index"].clone(),
+                    "edge_attr":  info["edge_attr"].clone(),
                     "area":  res["area"],
                     "delay": res["delay"],
                     "power": res["power"],
@@ -255,9 +282,18 @@ def collect_dataset(
 
         # 打印特征维度供训练时确认
         sample_X = dataset[0]["X"]
-        sample_P = dataset[0]["P"]
-        print(f"     X shape:      {list(sample_X.shape)} (node_feature_dim={sample_X.shape[1]})")
-        print(f"     P shape:      {list(sample_P.shape)} (num_nodes={sample_P.shape[0]})")
+        sample_ei = dataset[0]["edge_index"]
+        sample_ea = dataset[0]["edge_attr"]
+        print(f"     X shape:          {list(sample_X.shape)} (node_feature_dim={sample_X.shape[1]})")
+        print(f"     edge_index shape: {list(sample_ei.shape)} (num_edges={sample_ei.shape[1]})")
+        print(f"     edge_attr shape:  {list(sample_ea.shape)} "
+              f"(dims: [is_sum, is_carry, port_a, port_b, port_c])")
+        # 验证关键统计量
+        edge_n = sample_ei.shape[1]
+        is_sum = sample_ea[:, 0].sum().item()
+        is_carry = sample_ea[:, 1].sum().item()
+        print(f"     edges: sum={int(is_sum)} ({is_sum/edge_n*100:.1f}%), "
+              f"carry={int(is_carry)} ({is_carry/edge_n*100:.1f}%)")
 
         # POC: node_powers 统计
         n_with_np = sum(1 for d in dataset if d.get("node_power_mask") is not None
@@ -275,16 +311,30 @@ def collect_dataset(
 
 
 if __name__ == "__main__":
-    # POC: 跑 5000 样本验证 per-node supervision (100 batch × 50/batch)
-    # 输出新数据集 *_node_power.pt，不覆盖现有的 *_enriched.pt
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_batches", type=int, default=100)
+    parser.add_argument("--samples_per_batch", type=int, default=50)
+    parser.add_argument("--save_path", default="dataset/glitch_power_data_16bit_v2.pt",
+                        help="新数据集路径 (v2 = 修复 PP 笛卡尔积 + edge_attr)")
+    parser.add_argument("--max_workers", type=int, default=32)
+    parser.add_argument("--save_every", type=int, default=2)
+    parser.add_argument("--stagger_waves", type=int, default=1,
+                        help="把 batch 内任务切成 N 波依次启动 (避开 vcs spike). 例 2 = 分两波")
+    parser.add_argument("--stagger_delay", type=int, default=0,
+                        help="波之间间隔秒数. 例 900 = 15 分钟")
+    args = parser.parse_args()
+
     collect_dataset(
-        num_batches=100,
-        samples_per_batch=50,
+        num_batches=args.num_batches,
+        samples_per_batch=args.samples_per_batch,
         bit_width=16,
         encode_type="and",
-        save_path="dataset/glitch_power_data_16bit_node_power.pt",
+        save_path=args.save_path,
         target_delay=2.0,
-        max_eda_workers=32,
-        save_every=2,
+        max_eda_workers=args.max_workers,
+        save_every=args.save_every,
         resume=True,
+        stagger_waves=args.stagger_waves,
+        stagger_delay=args.stagger_delay,
     )

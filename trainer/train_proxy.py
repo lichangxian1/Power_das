@@ -122,37 +122,55 @@ class ArithDataset(Dataset):
         item = self.data[idx]
         X = item["X"]
         edge_index = item["edge_index"]
+        # v2 数据带 edge_attr; 旧数据没有 → 返回 None 占位
+        edge_attr = item.get("edge_attr", None)
         power_val = item["power"]
         power_norm = torch.tensor(
             (power_val - self.power_mean.item()) / self.power_std.item(),
             dtype=torch.float32,
         )
         power_raw = torch.tensor(power_val, dtype=torch.float32)
-        return X, edge_index, power_norm, power_raw
+        # node_power 标签 (Route D 用; 没有则填占位)
+        node_powers = item.get("node_powers", None)
+        node_mask = item.get("node_power_mask", None)
+        if node_powers is None:
+            N = X.shape[0]
+            node_powers = torch.zeros(N)
+            node_mask = torch.zeros(N, dtype=torch.bool)
+        return X, edge_index, edge_attr, power_norm, power_raw, node_powers, node_mask
 
 
 # ========================== Collate ==========================
 def custom_collate(batch):
-    X_list, ei_list, pn_list, pr_list = zip(*batch)
+    X_list, ei_list, ea_list, pn_list, pr_list, np_list, nm_list = zip(*batch)
     B = len(batch)
     max_N = max(x.size(0) for x in X_list)
     feat_dim = X_list[0].size(1)
 
     X_pad = torch.zeros(B, max_N, feat_dim)
     mask = torch.zeros(B, max_N, dtype=torch.bool)
+    npw_pad = torch.zeros(B, max_N)
+    nmask_pad = torch.zeros(B, max_N, dtype=torch.bool)
     ei_offset_list = []
 
-    for i, (ei, x) in enumerate(zip(ei_list, X_list)):
+    for i, (ei, x, npw, nm) in enumerate(zip(ei_list, X_list, np_list, nm_list)):
         n = x.size(0)
         X_pad[i, :n, :] = x
         mask[i, :n] = True
+        npw_pad[i, :n] = npw
+        nmask_pad[i, :n] = nm
         ei_offset_list.append(ei + i * max_N)
 
     edge_index = torch.cat(ei_offset_list, dim=1)
+    # edge_attr: 若所有样本都有则拼接, 否则返回 None
+    if all(ea is not None for ea in ea_list):
+        edge_attr = torch.cat(ea_list, dim=0)
+    else:
+        edge_attr = None
 
     power_norm = torch.stack(pn_list)
     power_raw = torch.stack(pr_list)
-    return X_pad, edge_index, mask, power_norm, power_raw
+    return X_pad, edge_index, edge_attr, mask, power_norm, power_raw, npw_pad, nmask_pad
 
 
 # ========================== 工具 ==========================
@@ -239,12 +257,14 @@ def train_one_fold(
     w_mse, w_rank, w_list, w_scale,
     power_mean, power_std, fold_id=0,
     eval_filter_n=None,
+    w_node=0.0, node_warmup_epochs=20,
 ):
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     huber_fn = nn.SmoothL1Loss()
     rank_fn = nn.MarginRankingLoss(margin=0.01)
+    node_huber = nn.SmoothL1Loss(reduction="none")
 
     best_tau = -1.0
     best_spearman = -1.0
@@ -257,15 +277,23 @@ def train_one_fold(
         model.train()
         epoch_loss = 0.0
 
-        for X, edge_index, mask, power_norm, power_raw in train_loader:
+        for X, edge_index, edge_attr, mask, power_norm, power_raw, npw, nm in train_loader:
             X = X.to(device, non_blocking=True)
             edge_index = edge_index.to(device, non_blocking=True)
+            if edge_attr is not None:
+                edge_attr = edge_attr.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             power_norm = power_norm.to(device, non_blocking=True)
             power_raw = power_raw.to(device, non_blocking=True)
+            npw = npw.to(device, non_blocking=True)
+            nm = nm.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            pred = model(X, edge_index, mask)
+            if w_node > 0:
+                pred, node_pred = model(X, edge_index, mask, edge_attr=edge_attr, return_nodes=True)
+            else:
+                pred = model(X, edge_index, mask, edge_attr=edge_attr)
+                node_pred = None
 
             loss_mse = huber_fn(pred, power_norm)
             loss_rank = compute_rank_loss(pred, power_raw, rank_fn, device)
@@ -280,8 +308,18 @@ def train_one_fold(
             else:
                 loss_scale = torch.tensor(0.0, device=device)
 
+            # Node loss (Route D): warmup 后才加, 仅在有 mask 的节点上算
+            if w_node > 0 and node_pred is not None and nm.any() and epoch >= node_warmup_epochs:
+                diff = node_huber(node_pred, npw) * nm.float()
+                loss_node = diff.sum() / nm.float().sum().clamp_min(1.0)
+                w_node_eff = w_node
+            else:
+                loss_node = torch.tensor(0.0, device=device)
+                w_node_eff = 0.0
+
             loss = (w_mse * loss_mse + w_rank * loss_rank
-                    + w_list * loss_list + w_scale * loss_scale)
+                    + w_list * loss_list + w_scale * loss_scale
+                    + w_node_eff * loss_node)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -296,11 +334,13 @@ def train_one_fold(
             all_pred, all_true, all_n = [], [], []
 
             with torch.no_grad():
-                for X, edge_index, mask, pn, pr in val_loader:
+                for X, edge_index, edge_attr, mask, pn, pr, _npw, _nm in val_loader:
                     X = X.to(device, non_blocking=True)
                     edge_index = edge_index.to(device, non_blocking=True)
+                    if edge_attr is not None:
+                        edge_attr = edge_attr.to(device, non_blocking=True)
                     mask = mask.to(device, non_blocking=True)
-                    pred = model(X, edge_index, mask)
+                    pred = model(X, edge_index, mask, edge_attr=edge_attr)
                     pred_raw = pred * power_std + power_mean
                     all_pred.append(pred_raw)
                     all_true.append(pr.to(device, non_blocking=True))
@@ -381,6 +421,9 @@ def train_proxy(
     eval_filter_n: int = 730,    # val 评估时只算 N==该值 的子集 (None=全集)
     train_filter_n: int = None,  # 训练时只用 N==该值 的子集 (C 方案: 消除 N 短路)
     use_stratified_batch: bool = False,  # batch 内同 N (B 方案: rank loss 不被 N 污染)
+    external_edge_attr_dim: int = 0,     # v2 数据传入的 edge_attr 维度 (5 = sum/carry/port_a/b/c)
+    w_node: float = 0.0,                 # Route D: per-FA node power 辅助损失权重
+    node_warmup_epochs: int = 20,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  🖥  Device: {device}")
@@ -395,6 +438,12 @@ def train_proxy(
         print(f"  ℹ  自动将 node_feature_dim 从 {node_feature_dim} 调整为 {actual_dim}")
         node_feature_dim = actual_dim
 
+    # 自动检测 v2 数据 (含 edge_attr) → 启用 external_edge_attr_dim
+    sample_ea = dataset.data[0].get("edge_attr", None)
+    if sample_ea is not None and external_edge_attr_dim == 0:
+        external_edge_attr_dim = sample_ea.shape[-1]
+        print(f"  ℹ  检测到 v2 edge_attr (dim={external_edge_attr_dim})，启用 external edge feature")
+
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
     fold_taus = []
     best_overall_tau = -1.0
@@ -404,6 +453,7 @@ def train_proxy(
     tmp_model = ArithProxyGNN(
         node_feature_dim, hidden_dim, num_gnn_layers, dropout=dropout,
         use_mean_agg=use_mean_agg, use_edge_feat=use_edge_feat,
+        external_edge_attr_dim=external_edge_attr_dim,
     )
     n_params = sum(p.numel() for p in tmp_model.parameters())
     actual_use_edge_feat = tmp_model.use_edge_feat  # 可能被自动降级
@@ -495,6 +545,7 @@ def train_proxy(
             dropout=dropout,
             use_mean_agg=use_mean_agg,
             use_edge_feat=use_edge_feat,
+            external_edge_attr_dim=external_edge_attr_dim,
         ).to(device)
 
         tau, state = train_one_fold(
@@ -503,6 +554,7 @@ def train_proxy(
             w_mse, w_rank, w_list, w_scale,
             power_mean, power_std, fold_id,
             eval_filter_n=eval_filter_n,
+            w_node=w_node, node_warmup_epochs=node_warmup_epochs,
         )
 
         # 每个 fold 训练完立即保存，避免后续中断丢失
@@ -563,21 +615,34 @@ if __name__ == "__main__":
                         help="从第几个 fold 开始 (便于补跑剩余 fold)")
     parser.add_argument("--save_suffix", type=str, default=None,
                         help="ckpt 保存路径后缀 (避免覆盖现有 ckpt)")
+    parser.add_argument("--data", type=str, default=None,
+                        help="自定义训练数据路径 (默认 dataset/glitch_power_data_16bit_enriched.pt)")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--w_node", type=float, default=0.0,
+                        help="Route D: 节点级 power 辅助损失权重 (>0 启用)")
     args = parser.parse_args()
+
+    kw = {}
+    if args.data is not None:
+        kw["data_path"] = args.data
+    if args.epochs is not None:
+        kw["epochs"] = args.epochs
+    if args.w_node > 0:
+        kw["w_node"] = args.w_node
 
     if args.mode == "C":
         save_path = f"dataset/glitch_power_proxy_gnn_C{args.save_suffix or ''}.pth"
         train_proxy(
             max_folds=args.folds, start_fold=args.start_fold,
             train_filter_n=730, use_stratified_batch=False,
-            save_path=save_path,
+            save_path=save_path, **kw,
         )
     elif args.mode == "B":
         save_path = f"dataset/glitch_power_proxy_gnn_B{args.save_suffix or ''}.pth"
         train_proxy(
             max_folds=args.folds, start_fold=args.start_fold,
             train_filter_n=None, use_stratified_batch=True,
-            save_path=save_path,
+            save_path=save_path, **kw,
         )
     else:
-        train_proxy(max_folds=args.folds, start_fold=args.start_fold)
+        train_proxy(max_folds=args.folds, start_fold=args.start_fold, **kw)

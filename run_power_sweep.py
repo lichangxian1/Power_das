@@ -137,6 +137,21 @@ EDA_USER = "lchangxian"
 EDA_HOST = "202.120.39.27"
 EDA_PORT = "16822"
 EDA_BASE_DIR = "/home/lchangxian/sandbox/sandbox_base" 
+SSH_SETUP_TIMEOUT = 120
+RSYNC_TIMEOUT = 120
+EDA_RUN_TIMEOUT = 1200
+SSH_CLEANUP_TIMEOUT = 60
+
+
+def _cleanup_remote_sandbox(remote_sandbox):
+    try:
+        subprocess.run(
+            ["ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}", f"rm -rf {remote_sandbox}"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=SSH_CLEANUP_TIMEOUT,
+        )
+    except Exception as e:
+        print(f"⚠️ 远端 sandbox 清理失败: {remote_sandbox} → {e}")
 
 def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5):
     # 打散初始并发洪峰
@@ -166,36 +181,48 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
                 f"sed -i 's#> /dev/null 2>&1##g' {remote_sandbox}/scripts/run_xa_vcs.sh && "
                 f"rm -rf {remote_sandbox}/results/* {remote_sandbox}/reports/* {remote_sandbox}/src/rtl/* {remote_sandbox}/src/tb/file_* || true"
             ]
-            subprocess.run(ssh_setup_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ssh_setup_cmd, check=True, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=SSH_SETUP_TIMEOUT,
+            )
 
             rsync_cmd = [
                 "rsync", "-avz", "-e", f"ssh -p {EDA_PORT}", 
                 local_v_path, f"{EDA_USER}@{EDA_HOST}:{remote_sandbox}/src/rtl/{top_module}_{bit_width}.v"
             ]
-            subprocess.run(rsync_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                rsync_cmd, check=True, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=RSYNC_TIMEOUT,
+            )
 
             ssh_run_cmd = [
                 "ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}",
                 f"cd {remote_sandbox} && bash scripts/run_all.sh {top_module} {bit_width} {target_delay}"
             ]
-            result = subprocess.run(ssh_run_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+            result = subprocess.run(
+                ssh_run_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, check=False, timeout=EDA_RUN_TIMEOUT,
+            )
             stdout = result.stdout
 
             # [License 挤兑保护机制]
             if "FATAL" in stdout:
                 log_cmd = ["ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}", f"tail -n 100 {remote_sandbox}/dc_synth*.log 2>/dev/null; tail -n 50 {remote_sandbox}/*.log 2>/dev/null"]
-                log_res = subprocess.run(log_cmd, capture_output=True, text=True, check=False)
+                log_res = subprocess.run(
+                    log_cmd, capture_output=True, text=True, check=False,
+                    timeout=SSH_SETUP_TIMEOUT,
+                )
                 
                 if "DCSH-1" in log_res.stdout or "is not enabled" in log_res.stdout:
                     print(f"⚠️ [ID: {idx:04d}] DC License 被抢光 (Attempt {attempt+1}/{MAX_RETRIES})，等待 15-30 秒后重试...")
-                    subprocess.run(["ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}", f"rm -rf {remote_sandbox}"], check=False)
+                    _cleanup_remote_sandbox(remote_sandbox)
                     time.sleep(random.uniform(15.0, 30.0)) 
                     continue 
                 else:
                     if log_res.stdout: stdout += f"\n\n--- 🕵️ 远端崩溃现场核心日志 ---\n{log_res.stdout[-2500:]}\n-----------------------------------------\n"
 
             # 正常清理
-            subprocess.run(["ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}", f"rm -rf {remote_sandbox}"], check=False)
+            _cleanup_remote_sandbox(remote_sandbox)
             if os.path.exists(local_v_path): os.remove(local_v_path)
 
             # 🌟 数据解析与逻辑报错拦截
@@ -239,7 +266,7 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
                 return {"id": idx, "success": False, "log": stdout}
 
         except Exception as e:
-            subprocess.run(["ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}", f"rm -rf {remote_sandbox}"], check=False)
+            _cleanup_remote_sandbox(remote_sandbox)
             return {"id": idx, "success": False, "log": str(e)}
 
     # 耗尽重试次数

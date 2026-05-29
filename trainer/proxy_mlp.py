@@ -148,6 +148,7 @@ class ArithProxyGNN(nn.Module):
         use_mean_agg=True,
         use_edge_feat=True,
         arrival_idx=7,
+        external_edge_attr_dim=0,    # 外部 edge_attr 的维度 (v2 数据: 5 [is_sum, is_carry, port_a/b/c])
     ):
         super().__init__()
         self.node_feature_dim = node_feature_dim
@@ -155,11 +156,15 @@ class ArithProxyGNN(nn.Module):
         self.num_gnn_layers = num_gnn_layers
         self.num_node_types = num_node_types
 
-        # 当 X 维度不足以提供 arrival_time 时自动关掉 edge_feat
+        # 当 X 维度不足以提供 arrival_time 时自动关掉 arrival-based edge_feat
         self.use_edge_feat = use_edge_feat and (node_feature_dim > arrival_idx)
         self.arrival_idx = arrival_idx
         self.use_mean_agg = use_mean_agg
-        edge_feat_dim = 2 if self.use_edge_feat else 0   # [arrival_skew, arrival_src]
+        self.external_edge_attr_dim = external_edge_attr_dim
+
+        # edge_feat = [arrival_skew, arrival_src] (2) + external_edge_attr (5: sum/carry/port_a/b/c)
+        arrival_feat_dim = 2 if self.use_edge_feat else 0
+        edge_feat_dim = arrival_feat_dim + external_edge_attr_dim
 
         # 1) 异构输入投影
         self.input_proj = HeterogeneousProjection(
@@ -193,15 +198,28 @@ class ArithProxyGNN(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
+        # 5) 节点级辅助预测头 (Route D: per-FA power supervision)
+        # 独立于 node_head，避免节点级标签的尺度强行扭曲 global sum
+        self.node_aux_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
 
-    def forward(self, x_node, edge_index, mask):
+
+    def forward(self, x_node, edge_index, mask, edge_attr=None, return_nodes=False):
         """
         Args:
             x_node:     [B, N, F]
             edge_index: [2, E]   含 batch offset 的全局边索引
             mask:       [B, N]   True = 真实节点
+            edge_attr:  [E, external_edge_attr_dim] 或 None
+                          v2 数据: [is_sum, is_carry, port_a, port_b, port_c]
+            return_nodes: 若 True 额外返回 node_power [B, N]
         Returns:
             global_power: [B]
+            (若 return_nodes) node_power: [B, N]
         """
         B, N, _ = x_node.shape
         H = self.hidden_dim
@@ -215,15 +233,18 @@ class ArithProxyGNN(nn.Module):
         h = self.input_proj(x_flat, types_flat, mask_flat)  # [B*N, H]
         h = self.input_norm(h)
 
-        # 边特征：arrival skew (src→dst 的 timing 不同步是 glitch 的物理来源)
-        edge_feat = None
+        # 边特征 = arrival 相关 (内部算) + external edge_attr (来自 dataset)
+        edge_feat_parts = []
         if self.use_edge_feat:
             src = edge_index[0]
             dst = edge_index[1]
             arrival_flat = x_flat[:, self.arrival_idx]            # [B*N]
             edge_skew = arrival_flat[src] - arrival_flat[dst]     # [E]
             edge_src_at = arrival_flat[src]                       # [E]
-            edge_feat = torch.stack([edge_skew, edge_src_at], dim=-1)  # [E, 2]
+            edge_feat_parts.append(torch.stack([edge_skew, edge_src_at], dim=-1))
+        if self.external_edge_attr_dim > 0 and edge_attr is not None:
+            edge_feat_parts.append(edge_attr)
+        edge_feat = torch.cat(edge_feat_parts, dim=-1) if edge_feat_parts else None
 
         # GNN 主干
         for layer in self.gnn_layers:
@@ -254,6 +275,11 @@ class ArithProxyGNN(nn.Module):
         graph_feat = torch.cat([mean_pool, max_pool], dim=-1)  # [B, 2H]
         global_corr = self.global_head(graph_feat).squeeze(-1)  # [B]
 
+        if return_nodes:
+            # 用独立的 aux head 预测 per-node power（不影响 global 求和路径）
+            node_aux_flat = self.node_aux_head(h_masked).squeeze(-1)  # [B*N]
+            node_aux = node_aux_flat.reshape(B, N) * mask.float()
+            return sum_power + global_corr, node_aux
         return sum_power + global_corr
 
 
