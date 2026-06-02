@@ -40,3 +40,5 @@ get_*
 
 *.pt
 sandbox_base
+library
+library/t28_official/*.lib

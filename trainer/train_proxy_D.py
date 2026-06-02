@@ -217,7 +217,7 @@ def train(
     best_recall = -1.0
     best_state = None
     patience = 0
-    max_patience = 100
+    max_patience = 300
 
     for epoch in range(epochs):
         model.train()
