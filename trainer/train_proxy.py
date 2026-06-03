@@ -572,7 +572,13 @@ def train_proxy(
     w_delay: float = 0.2,                # 方案 2: delay 辅助 loss 权重
     target: str = "area",                # 主预测目标 (默认 area, 可选 power/delay)
     skip_aggregate_save: bool = False,   # --only_fold 模式: 跳过最终聚合 save 避免多进程竞争
+    seed: int = 42,                      # KFold + torch seed (多次跑同 fold 测方差)
 ):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  🖥  Device: {device}")
 
@@ -596,7 +602,7 @@ def train_proxy(
         external_edge_attr_dim = sample_ea.shape[-1]
         print(f"  ℹ  检测到 v2 edge_attr (dim={external_edge_attr_dim})，启用 external edge feature")
 
-    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
     fold_taus = []
     fold_test_metrics = []
     best_overall_tau = -1.0
@@ -912,6 +918,8 @@ if __name__ == "__main__":
                         help="主预测目标 (默认 area)")
     parser.add_argument("--eval_filter_n", type=int, default=730,
                         help="fix-N 子集 (默认 730 是 16-bit; 8-bit 用 369)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="KFold + torch seed (默认 42, 多次跑用不同 seed 测方差)")
     args = parser.parse_args()
 
     kw = {"target": args.target}
@@ -940,6 +948,7 @@ if __name__ == "__main__":
     if args.use_pure_gcn:
         kw["use_pure_gcn"] = True
     kw["eval_filter_n"] = args.eval_filter_n if args.eval_filter_n > 0 else None
+    kw["seed"] = args.seed
 
     # --only_fold N: 只跑单个 fold (多进程外部并行用)
     # 转成 start_fold=N, max_folds=N+1, 并禁用聚合 save 防多进程竞争

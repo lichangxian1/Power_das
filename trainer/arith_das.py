@@ -36,6 +36,11 @@ from utils import (
     BoundedParetoPool,
 )
 
+try:
+    from .power_proxy import PowerProxyPredictor
+except ImportError:
+    from power_proxy import PowerProxyPredictor
+
 
 def get_masked_logits(logits: torch.Tensor, mask: torch.Tensor):
     masked_logits = logits.masked_fill(mask == 0, -1e9)
@@ -455,6 +460,17 @@ class CompressorRouting:
         pool_size,
         rule_loss_wight_incr,
         disc_loss_weight_incr,
+        use_power_proxy=False,
+        power_proxy_ckpt=None,
+        power_proxy_lib_path="library/t28_official/tcbn28hpcplusbwp12t40p140tt0p9v25c.lib",
+        power_proxy_fa_cell="FA1D0BWP12T40P140",
+        power_proxy_ha_cell="HA1D0BWP12T40P140",
+        power_proxy_output_scale=1e-3,
+        fixed_target_delay=None,
+        area_budget=None,
+        area_violation_weight=100.0,
+        delay_violation_weight=100.0,
+        power_source=None,
         gomil_path=None,
         synth="openroad",
         **kwargs,
@@ -502,6 +518,29 @@ class CompressorRouting:
         self.gomil_path = gomil_path
         self.synth = synth
         self.kwargs = kwargs
+        self.fixed_target_delay = fixed_target_delay
+        self.area_budget = area_budget
+        self.area_violation_weight = area_violation_weight
+        self.delay_violation_weight = delay_violation_weight
+        if power_source is None:
+            power_source = "proxy" if use_power_proxy else "eda"
+        if power_source not in {"proxy", "eda"}:
+            raise ValueError(
+                f"Invalid power_source={power_source!r}; expected 'proxy' or 'eda'"
+            )
+        self.power_source = power_source
+        self.power_proxy_output_scale = power_proxy_output_scale
+        self.power_proxy = None
+        if self.power_source == "proxy":
+            if power_proxy_ckpt is None:
+                raise ValueError("power_source='proxy' requires power_proxy_ckpt")
+            self.power_proxy = PowerProxyPredictor(
+                ckpt_path=power_proxy_ckpt,
+                device=device,
+                lib_path=power_proxy_lib_path,
+                fa_cell=power_proxy_fa_cell,
+                ha_cell=power_proxy_ha_cell,
+            )
 
         if self.log_dir is not None:
             os.makedirs(self.log_dir, exist_ok=True)
@@ -551,7 +590,10 @@ class CompressorRouting:
         build_dir = self.build_dir + "_full_ppa"
         rtl_path = os.path.join(build_dir, "MUL.v")
         if self.synth == "openroad":
-            full_target_delay = get_full_target_delay(self.bit_width)
+            if self.fixed_target_delay is not None:
+                full_target_delay = [self.fixed_target_delay]
+            else:
+                full_target_delay = get_full_target_delay(self.bit_width)
         else:
             raise NotImplementedError
         n_full_target_delay_processing = self.kwargs.get(
@@ -569,6 +611,10 @@ class CompressorRouting:
             rtl_path,
             full_target_delay,
             n_processing=n_full_target_delay_processing,
+        )
+        simulated_result = self._apply_power_proxy_to_results(
+            simulated_result,
+            self.found_best_info["connection"],
         )
         return simulated_result
 
@@ -1222,6 +1268,24 @@ class CompressorRouting:
             "target_delay": target_delay,
         }
 
+    def _apply_power_proxy_to_results(self, simulated_result, samples_connection):
+        for item in simulated_result:
+            item["eda_power"] = item.get("power")
+
+        if self.power_source == "eda":
+            for item in simulated_result:
+                item["proxy_power_mw"] = None
+                item["power_source"] = "eda"
+            return simulated_result
+
+        proxy_power_mw = self.power_proxy.predict_mw(self.comp_graph, samples_connection)
+        proxy_power = proxy_power_mw * self.power_proxy_output_scale
+        for item in simulated_result:
+            item["proxy_power_mw"] = proxy_power_mw
+            item["power"] = proxy_power
+            item["power_source"] = "proxy"
+        return simulated_result
+
     def get_samples(self):
         with torch.no_grad():
             sample_info = []
@@ -1247,7 +1311,10 @@ class CompressorRouting:
                 )
 
             if self.synth == "openroad":
-                target_delay_list = get_target_delay(self.bit_width)
+                if self.fixed_target_delay is not None:
+                    target_delay_list = [self.fixed_target_delay]
+                else:
+                    target_delay_list = get_target_delay(self.bit_width)
             else:
                 raise NotImplementedError
             params_list = [
@@ -1281,21 +1348,126 @@ class CompressorRouting:
                 processed_results[id].append(result["result"][0])
 
             for i, result_list in processed_results.items():
+                result_list = self._apply_power_proxy_to_results(
+                    result_list,
+                    sample_info[i]["connection"],
+                )
                 sample_info[i]["result"] = result_list
                 sample_info[i]["objective"] = self.get_objective(result_list)
         return sample_info
 
+    def _summarize_result(self, simulated_result):
+        delay = float(np.mean([item["delay"] for item in simulated_result]))
+        area = float(np.mean([item["area"] for item in simulated_result]))
+        power = float(np.mean([item["power"] for item in simulated_result]))
+        eda_power_values = [item.get("eda_power") for item in simulated_result]
+        eda_power = None
+        if all(value is not None for value in eda_power_values):
+            eda_power = float(np.mean(eda_power_values))
+        proxy_values = [item.get("proxy_power_mw") for item in simulated_result]
+        proxy_power_mw = None
+        if all(value is not None for value in proxy_values):
+            proxy_power_mw = float(np.mean(proxy_values))
+
+        area_violation = 0.0
+        area_feasible = True
+        if self.area_budget is not None:
+            area_violation = max(0.0, area - float(self.area_budget))
+            area_feasible = area_violation <= 0.0
+
+        delay_violation = 0.0
+        delay_feasible = True
+        if self.fixed_target_delay is not None:
+            delay_violation = max(0.0, delay - float(self.fixed_target_delay))
+            delay_feasible = delay_violation <= 0.0
+
+        return {
+            "delay": delay,
+            "area": area,
+            "power": power,
+            "eda_power": eda_power,
+            "proxy_power_mw": proxy_power_mw,
+            "area_budget": self.area_budget,
+            "fixed_target_delay": self.fixed_target_delay,
+            "area_violation": area_violation,
+            "delay_violation": delay_violation,
+            "area_feasible": area_feasible,
+            "delay_feasible": delay_feasible,
+            "power_source": self.power_source,
+        }
+
     def get_objective(self, simulated_result):
-        delay = np.mean([item["delay"] for item in simulated_result])
-        area = np.mean([item["area"] for item in simulated_result])
-        power = np.mean([item["power"] for item in simulated_result])
+        summary = self._summarize_result(simulated_result)
+        if self.area_budget is not None:
+            objective = summary["power"] / self.power_scale
+            objective += (
+                self.area_violation_weight
+                * summary["area_violation"]
+                / self.area_scale
+            )
+            if self.fixed_target_delay is not None:
+                objective += (
+                    self.delay_violation_weight
+                    * summary["delay_violation"]
+                    / self.delay_scale
+                )
+            return objective
 
         objective = (
-            self.delay_weight * delay / self.delay_scale
-            + self.area_weight * area / self.area_scale
-            + self.power_weight * power / self.power_scale
+            self.delay_weight * summary["delay"] / self.delay_scale
+            + self.area_weight * summary["area"] / self.area_scale
+            + self.power_weight * summary["power"] / self.power_scale
         )
         return objective
+
+    def _candidate_rank(self, sample_info):
+        result = sample_info.get("result", sample_info.get("simulated_result"))
+        summary = self._summarize_result(result)
+        feasible = summary["area_feasible"] and summary["delay_feasible"]
+        violation = summary["area_violation"] + summary["delay_violation"]
+        return (0 if feasible else 1, violation, summary["power"])
+
+    def _best_info_metadata(self):
+        if self.found_best_info["simulated_result"] is None:
+            return {}
+        summary = self._summarize_result(self.found_best_info["simulated_result"])
+        summary["objective"] = self.found_best_info["objective"]
+        return summary
+
+    def export_best_candidate(self, export_dir):
+        if self.found_best_info["connection"] is None:
+            raise ValueError("No best candidate has been found; run training first")
+
+        os.makedirs(export_dir, exist_ok=True)
+        old_state = self.state
+        old_assignment = self.assignment
+        old_comp_graph = self.comp_graph
+        try:
+            self.state = copy.deepcopy(self.found_best_info["ct"])
+            self.assignment = copy.deepcopy(self.found_best_info["assignment"])
+            self.comp_graph = CompressorGraph(self.initial_pp, self.assignment)
+            routing_assignment = self.emit_assignment(self.found_best_info["connection"])
+            ct = CompressorTree(self.initial_pp, self.state["ct32"], self.state["ct22"])
+            mul = Mul(self.bit_width, self.encode_type, ct)
+            rtl_path = os.path.join(export_dir, "MUL.v")
+            mul.emit_verilog(rtl_path, assignment=routing_assignment)
+
+            best_info = {
+                **self._best_info_metadata(),
+                "connection": self.found_best_info["connection"],
+                "ct": self.found_best_info["ct"],
+                "assignment": self.found_best_info["assignment"],
+                "routing_assignment": routing_assignment,
+                "rtl_path": rtl_path,
+                "simulated_result": self.found_best_info["simulated_result"],
+            }
+            with open(os.path.join(export_dir, "best_info.json"), "w") as f:
+                json.dump(best_info, f, indent=4, default=convert_to_serializable)
+            return rtl_path
+        finally:
+            self.state = old_state
+            self.assignment = old_assignment
+            self.comp_graph = old_comp_graph
 
     def get_ppo_loss(
         self,
@@ -1358,12 +1530,18 @@ class CompressorRouting:
 
     def update_found_best_info(self, sample_info_list):
         for sample_info in sample_info_list:
-            if sample_info["objective"] < self.found_best_info["objective"]:
+            is_better = self.found_best_info["connection"] is None
+            if not is_better:
+                is_better = self._candidate_rank(sample_info) < self._candidate_rank(
+                    self.found_best_info
+                )
+            if is_better:
                 self.found_best_info["objective"] = sample_info["objective"]
                 self.found_best_info["connection"] = sample_info["connection"]
-                self.found_best_info["ct"] = self.state
-                self.found_best_info["assignment"] = self.assignment
+                self.found_best_info["ct"] = copy.deepcopy(self.state)
+                self.found_best_info["assignment"] = copy.deepcopy(self.assignment)
                 self.found_best_info["simulated_result"] = sample_info["result"]
+                self.found_best_info.update(self._best_info_metadata())
 
     def log_episode(self, episode_idx, info):
         self.tb_logger.add_scalar("objective", info["objective"], episode_idx)

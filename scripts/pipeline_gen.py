@@ -41,7 +41,7 @@ def _now_ts():
 def main(total_samples, rate_per_min, save_path, save_every_n,
          bit_width=16, encode_type="and", target_delay=2.0,
          build_dir="build", max_active=200, tick_seconds=10,
-         max_failures=0):
+         max_failures=0, reset_interval=50):
 
     # ===== 1. 断点续采 + 去重 =====
     dataset = []
@@ -58,6 +58,7 @@ def main(total_samples, rate_per_min, save_path, save_every_n,
     print(f"  🚗 发车速率: {rate_per_min} 个/min  (tick={tick_seconds}s)")
     print(f"  ⛽ 单样本基线: 13.5min  ⇒ 稳态活跃数 ≈ {int(rate_per_min * 13.5)} 个")
     print(f"  💾 保存间隔: 每 {save_every_n} 个完成")
+    print(f"  🔄 env reset 间隔: 每 {reset_interval} 个 sample (防 logits 锁死)")
     print()
 
     # ===== 2. 初始化采样环境 =====
@@ -81,11 +82,20 @@ def main(total_samples, rate_per_min, save_path, save_every_n,
     os.makedirs(build_dir, exist_ok=True)
 
     # ===== 3. 单样本采样函数 =====
+    # 注: 必须周期性 reset env 重算 Z_mat_dict, 否则 logits 锁死 → 集中采样高概率 routing
+    #     → power std 砍半, 数据"多样性"严重退化 (实测 5669 样本 std 0.038→0.020 = -47%)
+    z_mat_state = {"Z": Z_mat_dict}
+
     def sample_one(sample_id):
         """采一个 sample，返回 {X, edge_index, edge_attr, rtl_path, graph_hash}"""
+        # 每 reset_interval 个 sample 重 reset env, 刷新 logits 分布
+        if sample_id > 0 and sample_id % reset_interval == 0:
+            env.reset()
+            z_mat_state["Z"] = env.get_Z_mat()
+
         with torch.no_grad():
             for _ in range(20):  # 最多重试 20 次找到未见过的图
-                samples_connection, _ = env.sample_from_logits(Z_mat_dict)
+                samples_connection, _ = env.sample_from_logits(z_mat_state["Z"])
                 assignment = env.emit_assignment(samples_connection)
                 X, edge_index, edge_attr = extract_X_edge(env.comp_graph, samples_connection)
                 gh = compute_graph_hash(X, edge_index, edge_attr)
@@ -231,5 +241,7 @@ if __name__ == "__main__":
     p.add_argument("--target_delay", type=float, default=2.0)
     p.add_argument("--build_dir", default="build",
                    help="本地 verilog 文件临时目录 (并行多 bit_width 必须分开)")
+    p.add_argument("--reset_interval", type=int, default=50,
+                   help="每 N 个 sample 重置 env 刷新 Z_mat (默认 50, 防止 logits 锁死)")
     args = p.parse_args()
     main(**vars(args))
