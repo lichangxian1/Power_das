@@ -1,8 +1,8 @@
 import os
 
 # Change your library and LEF paths accordingly
-lib_path = "/path/to/NangateOpenCellLibrary_typical.lib"
-lef_path = "/path/to/NangateOpenCellLibrary.lef"
+lib_path = os.path.expanduser("~/library/t28_official/tcbn28hpcplusbwp12t40p140tt0p9v25c.lib")
+lef_path = os.path.expanduser("~/library/t28_official/tcbn28hpcplusbwp12t40p140.lef")
 
 
 verilate_header_template = """

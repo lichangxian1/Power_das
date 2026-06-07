@@ -90,19 +90,22 @@ class BoundedParetoPool:
     def __init__(self, max_size: int):
         self.max_size = max_size
         self._pool = []
+        self._counter = 0  # tiebreaker: prevents heapq from comparing state objects
 
     def add(self, objective: float, state):
+        entry = (-objective, self._counter, state)
+        self._counter += 1
         if len(self._pool) < self.max_size:
-            heapq.heappush(self._pool, (-objective, state))
+            heapq.heappush(self._pool, entry)
         else:
             if -objective > self._pool[0][0]:
-                for obj, _ in self._pool:
+                for obj, _, _ in self._pool:
                     if obj == -objective:
                         return
-                heapq.heapreplace(self._pool, (-objective, state))
+                heapq.heapreplace(self._pool, entry)
 
     def get_pool(self) -> list:
-        return [(-obj, state) for obj, state in self._pool]
+        return [(-obj, state) for obj, _, state in self._pool]
 
     def get_best(self):
         if self._pool:
@@ -111,7 +114,7 @@ class BoundedParetoPool:
 
     def get_worst(self):
         if self._pool:
-            obj, state = self._pool[0]
+            obj, _, state = self._pool[0]
             return (-obj, state)
         return None
 

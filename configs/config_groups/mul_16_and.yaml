@@ -31,10 +31,10 @@ trainer:
     disc_loss_weight: 1e-2
     disc_loss_weight_incr: 1e-3
     # training scale
-    num_episodes: 50
-    num_samples: 3
+    num_episodes: 2000
+    num_samples: 2
     num_epochs: 1 # ppo epochs
-    save_freq: 10
+    save_freq: 100
     log_freq: 1
     # learning params
     optim_name: Adam
@@ -64,16 +64,16 @@ trainer:
     # power proxy params
     use_power_proxy: true
     power_proxy_ckpt: dataset/glitch_power_proxy_gnn_B_v2_11k_phys_E4_fold1.pth
-    power_proxy_lib_path: library/t28_official/tcbn28hpcplusbwp12t40p140tt0p9v25c.lib
+    power_proxy_lib_path: ~/library/t28_official/tcbn28hpcplusbwp12t40p140tt0p9v25c.lib
     power_proxy_fa_cell: FA1D0BWP12T40P140
     power_proxy_ha_cell: HA1D0BWP12T40P140
     # checkpoint labels are mW; arith_das.py objective uses OpenROAD W.
     power_proxy_output_scale: 1e-3
     # fixed-delay area-budget sweep params
-    fixed_target_delay: 2.0
-    area_budgets: [980, 1000, 1020, 1040, 1060]
-    area_violation_weight: 100.0
-    delay_violation_weight: 100.0
+    fixed_target_delay: 2000
+    area_budgets: [1160, 1200, 1240, 1280, 1320]
+    area_violation_weight: 1.0
+    delay_violation_weight: 1.0
     power_source: proxy
     reference_point: [2.0, 2500]
     pareto_target: ["delay", "area"]

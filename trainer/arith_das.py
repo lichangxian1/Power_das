@@ -468,8 +468,8 @@ class CompressorRouting:
         power_proxy_output_scale=1e-3,
         fixed_target_delay=None,
         area_budget=None,
-        area_violation_weight=100.0,
-        delay_violation_weight=100.0,
+        area_violation_weight=2.0,
+        delay_violation_weight=2.0,
         power_source=None,
         gomil_path=None,
         synth="openroad",
@@ -652,7 +652,12 @@ class CompressorRouting:
         pareto_value_1 = [point[1] for point in pareto_points]
         hv = hypervolume(pareto_points)
         try:
-            hv_value = hv.compute(self.reference_point)
+            # Ensure reference point strictly dominates all pareto points
+            ref = [
+                max(self.reference_point[i], max(p[i] for p in pareto_points) * 1.1)
+                for i in range(len(self.reference_point))
+            ]
+            hv_value = hv.compute(ref)
             self.tb_logger.add_scalar("hv_value", hv_value, episode_idx)
         except Exception as e:
             logging.error(f"Error computing hypervolume: {e}")
