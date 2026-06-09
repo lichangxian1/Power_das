@@ -522,6 +522,228 @@ class OneHotGIN(nn.Module):
         return self.head(graph_repr).squeeze(-1)
 
 
+
+class DAGForwardLayer(nn.Module):
+    """One directed propagation layer for a DAG.
+
+    The layer aggregates messages only along the edge direction src -> dst. The
+    caller is responsible for applying it in topological groups, so predecessor
+    states can be consumed immediately by later nodes in the same DAG pass.
+    """
+
+    def __init__(self, hidden_dim, dropout=0.1, edge_feat_dim=0, use_mean_agg=True):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.edge_feat_dim = edge_feat_dim
+        self.use_mean_agg = use_mean_agg
+
+        self.src_msg = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        if edge_feat_dim > 0:
+            self.edge_proj = nn.Sequential(
+                nn.Linear(edge_feat_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.edge_proj = None
+
+        self.update_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.gate = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, h, edge_index, edge_feat=None, target_nodes=None, target_mask=None):
+        src, dst = edge_index
+        H = self.hidden_dim
+        n_total = h.size(0)
+
+        if target_nodes is None:
+            target_nodes = torch.arange(n_total, device=h.device)
+            edge_keep = torch.ones(dst.size(0), device=h.device, dtype=torch.bool)
+        else:
+            if target_nodes.numel() == 0:
+                return h.new_empty(0, H)
+            if target_mask is None:
+                target_mask = torch.zeros(n_total, device=h.device, dtype=torch.bool)
+                target_mask[target_nodes] = True
+            edge_keep = target_mask[dst]
+
+        h_target = h[target_nodes]
+        pred_agg = torch.zeros(target_nodes.numel(), H, device=h.device, dtype=h.dtype)
+
+        if bool(edge_keep.any()):
+            src_keep = src[edge_keep]
+            dst_keep = dst[edge_keep]
+            local_dst = torch.searchsorted(target_nodes, dst_keep)
+
+            msg = self.src_msg(h[src_keep])
+            if self.edge_proj is not None and edge_feat is not None:
+                msg = msg + self.edge_proj(edge_feat[edge_keep])
+
+            pred_agg.scatter_add_(0, local_dst.unsqueeze(1).expand(-1, H), msg)
+
+            if self.use_mean_agg:
+                deg = torch.zeros(target_nodes.numel(), device=h.device, dtype=h.dtype)
+                deg.scatter_add_(0, local_dst, torch.ones_like(local_dst, dtype=h.dtype))
+                pred_agg = pred_agg / deg.clamp_min(1.0).unsqueeze(-1)
+
+        fused = torch.cat([h_target, pred_agg], dim=-1)
+        delta = self.update_mlp(fused)
+        gate = torch.sigmoid(self.gate(fused))
+        return self.norm(h_target + gate * delta)
+
+
+class DAGTimingGNN(nn.Module):
+    """DAG-aware graph model for post-synthesis delay prediction.
+
+    It differs from ArithProxyGNN in two timing-oriented ways:
+      1. Messages flow only src -> dst and are applied in topological stage order.
+      2. The graph readout uses a smooth max over node scores, matching critical
+         path delay better than an extensive node-sum readout.
+    """
+
+    def __init__(
+        self,
+        node_feature_dim=13,
+        hidden_dim=96,
+        num_gnn_layers=4,
+        num_node_types=4,
+        dropout=0.1,
+        topo_idx=0,
+        onehot_start=3,
+        onehot_dim=4,
+        use_edge_feat=True,
+        arrival_idx=7,
+        external_edge_attr_dim=0,
+        use_mean_agg=True,
+        readout_beta=8.0,
+        **unused_kwargs,
+    ):
+        super().__init__()
+        self.node_feature_dim = node_feature_dim
+        self.hidden_dim = hidden_dim
+        self.num_gnn_layers = num_gnn_layers
+        self.num_node_types = num_node_types
+        self.topo_idx = topo_idx
+        self.onehot_start = onehot_start
+        self.onehot_dim = onehot_dim
+        self.use_edge_feat = use_edge_feat and (node_feature_dim > arrival_idx)
+        self.arrival_idx = arrival_idx
+        self.external_edge_attr_dim = external_edge_attr_dim
+        self.use_mean_agg = use_mean_agg
+        self.readout_beta = readout_beta
+
+        if node_feature_dim < onehot_start + onehot_dim:
+            raise ValueError("node_feature_dim is too small for requested one-hot slice")
+
+        self.input_proj = HeterogeneousProjection(
+            node_feature_dim, hidden_dim, num_types=num_node_types
+        )
+        self.input_norm = nn.LayerNorm(hidden_dim)
+
+        arrival_feat_dim = 2 if self.use_edge_feat else 0
+        edge_feat_dim = arrival_feat_dim + external_edge_attr_dim
+        self.gnn_layers = nn.ModuleList([
+            DAGForwardLayer(
+                hidden_dim=hidden_dim,
+                dropout=dropout,
+                edge_feat_dim=edge_feat_dim,
+                use_mean_agg=use_mean_agg,
+            )
+            for _ in range(num_gnn_layers)
+        ])
+
+        self.node_score_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+        self.global_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def _build_edge_feat(self, x_flat, edge_index, edge_attr):
+        parts = []
+        if self.use_edge_feat:
+            src, dst = edge_index
+            arrival = x_flat[:, self.arrival_idx]
+            parts.append(torch.stack([arrival[src] - arrival[dst], arrival[src]], dim=-1))
+        if self.external_edge_attr_dim > 0 and edge_attr is not None:
+            parts.append(edge_attr)
+        return torch.cat(parts, dim=-1) if parts else None
+
+    def _smooth_max(self, node_scores, mask):
+        masked = node_scores.masked_fill(~mask, -1.0e4)
+        beta = max(float(self.readout_beta), 1e-6)
+        return torch.logsumexp(masked * beta, dim=1) / beta
+
+    def forward(self, x_node, edge_index, mask, edge_attr=None,
+                return_nodes=False, return_aux=False):
+        del return_aux
+        B, N, _ = x_node.shape
+        H = self.hidden_dim
+
+        x_flat = x_node.reshape(B * N, -1)
+        mask_flat = mask.reshape(B * N)
+        type_slice = x_flat[:, self.onehot_start:self.onehot_start + self.onehot_dim]
+        types_flat = type_slice.argmax(dim=-1).clamp(max=self.num_node_types - 1)
+
+        h = self.input_proj(x_flat, types_flat, mask_flat)
+        h = self.input_norm(h) * mask_flat.unsqueeze(-1).float()
+
+        edge_feat = self._build_edge_feat(x_flat, edge_index, edge_attr)
+        topo_flat = x_flat[:, self.topo_idx]
+        # 拓扑分层只依赖结构与 mask（与 h 无关），预计算一次供所有层复用。
+        # tolist() 避免在层循环里反复迭代 GPU tensor 触发的同步开销。
+        topo_values = torch.unique(topo_flat[mask_flat]).sort()[0].tolist()
+        level_groups = []
+        for topo_value in topo_values:
+            update_mask = (topo_flat == topo_value) & mask_flat
+            if not bool(update_mask.any()):
+                continue
+            target_nodes = update_mask.nonzero(as_tuple=False).flatten()
+            level_groups.append((target_nodes, update_mask))
+
+        for layer in self.gnn_layers:
+            for target_nodes, update_mask in level_groups:
+                h_update = layer(
+                    h, edge_index, edge_feat,
+                    target_nodes=target_nodes, target_mask=update_mask,
+                )
+                h = h.scatter(0, target_nodes.unsqueeze(1).expand(-1, H), h_update)
+                h = h * mask_flat.unsqueeze(-1).float()
+
+        h_3d = h.reshape(B, N, H) * mask.unsqueeze(-1).float()
+        node_scores = self.node_score_head(h_3d).squeeze(-1)
+        critical_score = self._smooth_max(node_scores, mask)
+
+        n_real = mask.sum(dim=1, keepdim=True).float().clamp_min(1.0)
+        mean_pool = h_3d.sum(dim=1) / n_real
+        h_for_max = h_3d.masked_fill(~mask.unsqueeze(-1), float("-inf"))
+        max_pool = h_for_max.max(dim=1)[0]
+        max_pool = torch.where(torch.isinf(max_pool), torch.zeros_like(max_pool), max_pool)
+        graph_corr = self.global_head(torch.cat([mean_pool, max_pool], dim=-1)).squeeze(-1)
+
+        pred = critical_score + graph_corr
+        if return_nodes:
+            return pred, node_scores * mask.float()
+        return pred
+
+
 class ArithProxyGNN(nn.Module):
     """基于 GNN 的功耗预测代理
 
