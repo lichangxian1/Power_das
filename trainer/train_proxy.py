@@ -11,6 +11,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.model_selection import KFold
 
 from proxy_mlp import ArithProxyGNN, PureGIN, PureGCN     # ← 新 GNN + 纯 GIN/GCN 对照
+from out_dir_util import resolve_out_dir, place
 
 
 # ========================== Stratified-N Batch Sampler ==========================
@@ -811,6 +812,7 @@ def train_proxy(
             "use_pure_gcn": use_pure_gcn,
             "fold_id": fold_id,
             "best_tau": tau,
+            "data_path": data_path,
         }, fold_ckpt_path)
         print(f"       💾 Fold {fold_id} ckpt 已保存: {fold_ckpt_path}")
 
@@ -871,6 +873,7 @@ def train_proxy(
             "use_gin": use_gin,
             "use_pure_gin": use_pure_gin,
             "use_pure_gcn": use_pure_gcn,
+            "data_path": data_path,
         }, save_path)
         print(f"\n  ✅ 最佳模型已保存至: {save_path}")
 
@@ -888,6 +891,8 @@ if __name__ == "__main__":
                         help="只跑指定的单个 fold (用于外部并行多进程跑 5 fold)")
     parser.add_argument("--save_suffix", type=str, default=None,
                         help="ckpt 保存路径后缀 (避免覆盖现有 ckpt)")
+    parser.add_argument("--out_dir", default=None,
+                        help="权重输出目录; 不填则自动用日志(stdout重定向)所在目录, 否则 dataset/")
     parser.add_argument("--data", type=str, default=None,
                         help="自定义训练数据路径 (默认 dataset/glitch_power_data_16bit_enriched.pt)")
     parser.add_argument("--epochs", type=int, default=None)
@@ -920,6 +925,11 @@ if __name__ == "__main__":
                         help="fix-N 子集 (默认 730 是 16-bit; 8-bit 用 369)")
     parser.add_argument("--seed", type=int, default=42,
                         help="KFold + torch seed (默认 42, 多次跑用不同 seed 测方差)")
+    # Loss 权重 (默认: 0.5 Huber + 0.2 Rank + 0.5 List + 0.5 Scale)
+    parser.add_argument("--w_mse",   type=float, default=None, help="Huber loss 权重 (默认 0.5)")
+    parser.add_argument("--w_rank",  type=float, default=None, help="RankLoss 权重 (默认 0.2)")
+    parser.add_argument("--w_list",  type=float, default=None, help="ListMLE 权重 (默认 0.5)")
+    parser.add_argument("--w_scale", type=float, default=None, help="ScaleLoss 权重 (默认 0.5)")
     args = parser.parse_args()
 
     kw = {"target": args.target}
@@ -949,6 +959,10 @@ if __name__ == "__main__":
         kw["use_pure_gcn"] = True
     kw["eval_filter_n"] = args.eval_filter_n if args.eval_filter_n > 0 else None
     kw["seed"] = args.seed
+    if args.w_mse   is not None: kw["w_mse"]   = args.w_mse
+    if args.w_rank  is not None: kw["w_rank"]  = args.w_rank
+    if args.w_list  is not None: kw["w_list"]  = args.w_list
+    if args.w_scale is not None: kw["w_scale"] = args.w_scale
 
     # --only_fold N: 只跑单个 fold (多进程外部并行用)
     # 转成 start_fold=N, max_folds=N+1, 并禁用聚合 save 防多进程竞争
@@ -962,14 +976,16 @@ if __name__ == "__main__":
 
     # 路径里带 target 后缀, 避免覆盖不同目标的 ckpt
     tgt_tag = "" if args.target == "power" else f"_{args.target}"
+    out_dir = resolve_out_dir(args.out_dir)
+    print(f"  💾 权重输出目录: {out_dir}")
     if args.mode == "C":
-        save_path = f"dataset/glitch_power_proxy_gnn_C{tgt_tag}{args.save_suffix or ''}.pth"
+        save_path = place(f"glitch_power_proxy_gnn_C{tgt_tag}{args.save_suffix or ''}.pth", out_dir)
         train_proxy(
             train_filter_n=730, use_stratified_batch=False,
             save_path=save_path, **kw,
         )
     elif args.mode == "B":
-        save_path = f"dataset/glitch_power_proxy_gnn_B{tgt_tag}{args.save_suffix or ''}.pth"
+        save_path = place(f"glitch_power_proxy_gnn_B{tgt_tag}{args.save_suffix or ''}.pth", out_dir)
         train_proxy(
             train_filter_n=None, use_stratified_batch=True,
             save_path=save_path, **kw,

@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+"""Train a DAG-aware GNN proxy for post-synthesis delay prediction."""
+
 import argparse
 import os
 import random
@@ -5,12 +8,12 @@ import sys
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import KFold
+from torch.utils.data import DataLoader, Subset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from out_dir_util import resolve_out_dir, place
-from proxy_mlp import OneHotGIN
+from proxy_mlp import DAGTimingGNN
 from train_proxy import (
     ArithDataset,
     StratifiedNBatchSampler,
@@ -32,20 +35,35 @@ def _aggregate_test_metrics(fold_test_metrics, eval_filter_n):
     st_tau = agg(lambda m: m["strat"]["tau"] if m["strat"] else None)
     st_rho = agg(lambda m: m["strat"]["rho"] if m["strat"] else None)
     st_r10 = agg(lambda m: m["strat"]["r10"] if m["strat"] else None)
-    print("  🧪 TEST 无偏泛化 (主指标, 对外汇报用):")
-    print(f"     per-N 加权 : τ = {st_tau[0]:+.4f} ± {st_tau[1]:.4f}"
-          f" | ρ = {st_rho[0]:+.4f} ± {st_rho[1]:.4f}"
-          f" | R@10 = {st_r10[0]:.4f} ± {st_r10[1]:.4f}")
+    print("  TEST unbiased generalization:")
+    print(f"     per-N weighted: tau={st_tau[0]:+.4f} +/- {st_tau[1]:.4f}"
+          f" | rho={st_rho[0]:+.4f} +/- {st_rho[1]:.4f}"
+          f" | R@10={st_r10[0]:.4f} +/- {st_r10[1]:.4f}")
     if eval_filter_n is not None:
         fx_tau = agg(lambda m: m["fix"]["tau"] if m["fix"] else None)
         fx_r10 = agg(lambda m: m["fix"]["recalls"][0.10] if m["fix"] else None)
-        print(f"     fix-N={eval_filter_n}  : τ = {fx_tau[0]:+.4f} ± {fx_tau[1]:.4f}"
-              f" | R@10 = {fx_r10[0]:.4f} ± {fx_r10[1]:.4f}")
+        print(f"     fix-N={eval_filter_n}: tau={fx_tau[0]:+.4f} +/- {fx_tau[1]:.4f}"
+              f" | R@10={fx_r10[0]:.4f} +/- {fx_r10[1]:.4f}")
 
 
-def train_onehot_gin(
-    data_path="dataset/glitch_power_data_16bit_v2.pt",
-    save_path="dataset/glitch_power_onehot_gin.pth",
+def _save_ckpt(path, state, dataset, model_kwargs, target, fold_id=None, best_tau=None):
+    payload = {
+        "model_state_dict": state,
+        "model_class": "DAGTimingGNN",
+        "target": target,
+        "power_mean": dataset.power_mean.item(),
+        "power_std": dataset.power_std.item(),
+        "best_tau": best_tau,
+        **model_kwargs,
+    }
+    if fold_id is not None:
+        payload["fold_id"] = fold_id
+    torch.save(payload, path)
+
+
+def train_dag_gnn_delay(
+    data_path="dataset/glitch_power_data_16bit_v2_13k_edge10.pt",
+    save_path="dataset/glitch_power_dag_gnn_delay.pth",
     n_splits=5,
     max_folds=1,
     start_fold=0,
@@ -56,68 +74,75 @@ def train_onehot_gin(
     weight_decay=5e-3,
     hidden_dim=96,
     num_gnn_layers=4,
-    dropout=0.0,
-    w_mse=0.5,
+    dropout=0.10,
+    w_mse=0.7,
     w_rank=0.2,
-    w_list=0.5,
-    w_scale=0.5,
+    w_list=0.3,
+    w_scale=0.3,
     num_workers=4,
     eval_filter_n=730,
     train_filter_n=None,
-    use_stratified_batch=False,
-    target="power",
-    onehot_start=3,
-    onehot_dim=4,
+    use_stratified_batch=True,
+    target="delay",
+    topo_idx=0,
+    arrival_idx=7,
+    use_edge_feat=True,
+    use_mean_agg=True,
+    readout_beta=8.0,
     skip_aggregate_save=False,
+    seed=42,
 ):
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  🖥  Device: {device}")
-
-    if target == "area" and eval_filter_n is not None:
-        print("  ℹ  target=area: 关闭 fixed-N 评估/选模，使用 mixed-N R@10%")
-        eval_filter_n = None
+    print(f"  Device: {device}")
 
     dataset = ArithDataset(data_path, target=target)
-    power_mean = dataset.power_mean.to(device)
-    power_std = dataset.power_std.to(device)
-    actual_dim = dataset.data[0]["X"].shape[1]
-    if actual_dim < onehot_start + onehot_dim:
-        raise ValueError(
-            f"X dim={actual_dim} 不足以读取 onehot slice "
-            f"[{onehot_start}:{onehot_start + onehot_dim}]"
-        )
+    target_mean = dataset.power_mean.to(device)
+    target_std = dataset.power_std.to(device)
 
+    node_feature_dim = int(dataset.data[0]["X"].shape[1])
+    sample_ea = dataset.data[0].get("edge_attr", None)
+    external_edge_attr_dim = int(sample_ea.shape[-1]) if sample_ea is not None else 0
     sample_ns = np.array([dataset.data[i]["X"].shape[0] for i in range(len(dataset))])
-    model_probe = OneHotGIN(
-        node_feature_dim=actual_dim,
-        hidden_dim=hidden_dim,
-        num_gnn_layers=num_gnn_layers,
-        dropout=dropout,
-        onehot_start=onehot_start,
-        onehot_dim=onehot_dim,
-    )
-    n_params = sum(p.numel() for p in model_probe.parameters())
-    del model_probe
 
-    print(f"\n  🚀 开始 OneHotGIN {target} 预测")
-    print(f"     模型: pure GIN, 单向 sum aggregation, graph-level multi-layer sum readout")
-    print(f"     输入特征: 仅 X[:, {onehot_start}:{onehot_start + onehot_dim}] 节点类型 one-hot")
-    print(f"     忽略: stage/col/idx/arrival/edge_attr/physics/node_power/area/delay aux")
-    print(f"     参数量: {n_params:,}")
+    model_kwargs = {
+        "node_feature_dim": node_feature_dim,
+        "hidden_dim": hidden_dim,
+        "num_gnn_layers": num_gnn_layers,
+        "dropout": dropout,
+        "topo_idx": topo_idx,
+        "arrival_idx": arrival_idx,
+        "use_edge_feat": use_edge_feat,
+        "external_edge_attr_dim": external_edge_attr_dim,
+        "use_mean_agg": use_mean_agg,
+        "readout_beta": readout_beta,
+    }
+    probe = DAGTimingGNN(**model_kwargs)
+    n_params = sum(p.numel() for p in probe.parameters())
+    actual_use_edge_feat = probe.use_edge_feat
+    del probe
+
+    print("\n  Starting DAGTimingGNN training")
+    print(f"     target={target}, samples={len(dataset)}, X_dim={node_feature_dim}")
+    print(f"     model: directed DAG pass by X[:, {topo_idx}] + smooth critical-path readout")
     print(f"     hidden_dim={hidden_dim}, layers={num_gnn_layers}, dropout={dropout}")
-    print(f"     Loss: {w_mse}×Huber + {w_rank}×RankLoss + {w_list}×ListMLE + {w_scale}×ScaleLoss")
-    print("     训练数据: "
-          + (f"只用 N={train_filter_n} 子集" if train_filter_n else "全集")
-          + (" + stratified batch (同 N 同 batch)" if use_stratified_batch else ""))
-    print(f"     评估: best 选择基于 "
-          + (f"fix-N={eval_filter_n} R@10%" if eval_filter_n else "mixed-N R@10%"))
-    print(f"     DataLoader: train_bs={batch_size}, val_bs={val_batch_size}, num_workers={num_workers}\n")
+    print(f"     edge features: external_dim={external_edge_attr_dim}, "
+          f"arrival_feat={'on' if actual_use_edge_feat else 'off'}")
+    print(f"     readout_beta={readout_beta}, params={n_params:,}")
+    print(f"     loss={w_mse}*Huber + {w_rank}*Rank + {w_list}*ListMLE + {w_scale}*Scale")
+    print("     train data: "
+          + (f"only N={train_filter_n}" if train_filter_n else "all N")
+          + (" + stratified batches" if use_stratified_batch else ""))
+    print(f"     eval selection: "
+          + (f"fix-N={eval_filter_n} R@10" if eval_filter_n else "mixed-N R@10"))
+    print(f"     DataLoader: train_bs={batch_size}, val_bs={val_batch_size}, workers={num_workers}\n")
 
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
     fold_taus = []
     fold_test_metrics = []
     best_overall_tau = -1.0
@@ -127,13 +152,13 @@ def train_onehot_gin(
         if fold_id < start_fold:
             continue
         if max_folds is not None and fold_id >= max_folds:
-            print(f"\n  ⏭  达到 max_folds={max_folds}，提前结束")
+            print(f"\n  Reached max_folds={max_folds}, stopping")
             break
 
         train_idx_full = train_idx
         if train_filter_n is not None:
             train_idx = train_idx[sample_ns[train_idx] == train_filter_n]
-            print(f"  📌 train_filter_n={train_filter_n}: 训练样本 {len(train_idx_full)} → {len(train_idx)}")
+            print(f"  train_filter_n={train_filter_n}: {len(train_idx_full)} -> {len(train_idx)}")
 
         print(f"  {'=' * 60}")
         print(f"  Fold {fold_id}: train={len(train_idx)}, val={len(val_idx)}")
@@ -144,7 +169,7 @@ def train_onehot_gin(
         half = len(val_idx) // 2
         sel_idx = val_idx[perm[:half]]
         test_idx = val_idx[perm[half:]]
-        print(f"     val 拆分: 选择集={len(sel_idx)}, test集(无偏)={len(test_idx)}")
+        print(f"     val split: selection={len(sel_idx)}, held-out test={len(test_idx)}")
 
         train_subset = Subset(dataset, train_idx)
         val_subset = Subset(dataset, sel_idx)
@@ -155,7 +180,7 @@ def train_onehot_gin(
         if use_stratified_batch:
             train_batch_sampler = StratifiedNBatchSampler(
                 train_subset, batch_size=actual_bs, drop_last=True,
-                shuffle=True, seed=42 + fold_id,
+                shuffle=True, seed=seed + fold_id,
             )
             train_loader = DataLoader(
                 train_subset, batch_sampler=train_batch_sampler,
@@ -180,20 +205,12 @@ def train_onehot_gin(
             pin_memory=True, persistent_workers=(num_workers > 0),
         )
 
-        model = OneHotGIN(
-            node_feature_dim=actual_dim,
-            hidden_dim=hidden_dim,
-            num_gnn_layers=num_gnn_layers,
-            dropout=dropout,
-            onehot_start=onehot_start,
-            onehot_dim=onehot_dim,
-        ).to(device)
-
+        model = DAGTimingGNN(**model_kwargs).to(device)
         tau, state, test_metrics = train_one_fold(
             model, train_loader, val_loader,
             device, epochs, lr, weight_decay,
             w_mse, w_rank, w_list, w_scale,
-            power_mean, power_std, fold_id,
+            target_mean, target_std, fold_id,
             eval_filter_n=eval_filter_n,
             w_node=0.0, node_warmup_epochs=0,
             use_multitask=False, w_area=0.0, w_delay=0.0,
@@ -203,35 +220,13 @@ def train_onehot_gin(
             fold_test_metrics.append(test_metrics)
 
         if state is None:
-            print(f"       ⚠️ Fold {fold_id} 没有产生 best_state，跳过保存")
+            print(f"       Fold {fold_id}: no best_state, skip checkpoint")
             continue
 
         fold_ckpt_path = save_path.replace(".pth", f"_fold{fold_id}.pth")
-        torch.save({
-            "model_state_dict": state,
-            "model_class": "OneHotGIN",
-            "target": target,
-            "node_feature_dim": actual_dim,
-            "hidden_dim": hidden_dim,
-            "num_gnn_layers": num_gnn_layers,
-            "dropout": dropout,
-            "onehot_start": onehot_start,
-            "onehot_dim": onehot_dim,
-            "use_onehot_only": True,
-            "use_mean_agg": False,
-            "use_edge_feat": False,
-            "external_edge_attr_dim": 0,
-            "use_typed_edges": False,
-            "use_multitask": False,
-            "use_jk_pool": False,
-            "use_gin": True,
-            "use_pure_gin": False,
-            "power_mean": dataset.power_mean.item(),
-            "power_std": dataset.power_std.item(),
-            "fold_id": fold_id,
-            "best_tau": tau,
-        }, fold_ckpt_path)
-        print(f"       💾 Fold {fold_id} ckpt 已保存: {fold_ckpt_path}")
+        _save_ckpt(fold_ckpt_path, state, dataset, model_kwargs, target,
+                   fold_id=fold_id, best_tau=tau)
+        print(f"       Fold checkpoint saved: {fold_ckpt_path}")
 
         fold_taus.append((fold_id, tau))
         if tau > best_overall_tau:
@@ -239,53 +234,37 @@ def train_onehot_gin(
             best_overall_state = state
 
     print(f"\n  {'=' * 60}")
-    print("  📊 K-Fold 结果 (val 选择集峰值, 乐观上界):")
+    print("  K-Fold results (validation selection peak):")
     for fold_id, tau in fold_taus:
-        print(f"     Fold {fold_id}: τ = {tau:+.4f}")
+        print(f"     Fold {fold_id}: tau={tau:+.4f}")
     if fold_taus:
-        vals = np.array([t for _, t in fold_taus], dtype=float)
-        print(f"     平均 τ = {vals.mean():+.4f} ± {vals.std():.4f}")
-        print(f"     最佳 τ = {best_overall_tau:+.4f}")
+        vals = np.array([tau for _, tau in fold_taus], dtype=float)
+        print(f"     mean tau={vals.mean():+.4f} +/- {vals.std():.4f}")
+        print(f"     best tau={best_overall_tau:+.4f}")
     print(f"  {'=' * 60}")
 
     _aggregate_test_metrics(fold_test_metrics, eval_filter_n)
 
     if skip_aggregate_save:
-        print("\n  ℹ  --only_fold 模式: 跳过聚合 save, per-fold ckpt 已保存")
+        print("\n  only_fold mode: skip aggregate save, per-fold checkpoints are saved")
     elif best_overall_state is not None:
-        torch.save({
-            "model_state_dict": best_overall_state,
-            "model_class": "OneHotGIN",
-            "target": target,
-            "node_feature_dim": actual_dim,
-            "hidden_dim": hidden_dim,
-            "num_gnn_layers": num_gnn_layers,
-            "dropout": dropout,
-            "onehot_start": onehot_start,
-            "onehot_dim": onehot_dim,
-            "use_onehot_only": True,
-            "use_mean_agg": False,
-            "use_edge_feat": False,
-            "external_edge_attr_dim": 0,
-            "use_typed_edges": False,
-            "use_multitask": False,
-            "use_jk_pool": False,
-            "use_gin": True,
-            "use_pure_gin": False,
-            "power_mean": dataset.power_mean.item(),
-            "power_std": dataset.power_std.item(),
-        }, save_path)
-        print(f"\n  ✅ 最佳模型已保存至: {save_path}")
+        _save_ckpt(save_path, best_overall_state, dataset, model_kwargs, target,
+                   best_tau=best_overall_tau)
+        print(f"\n  Best model saved to: {save_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pure one-hot GIN target proxy")
+    # 行缓冲：重定向到文件时也实时刷新日志，避免 epoch 进度被块缓冲“卡住”的假象
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+    parser = argparse.ArgumentParser(description="DAG-GNN delay proxy trainer")
     parser.add_argument("--mode", choices=["B", "C", "default"], default="B",
-                        help="B=stratified batch 全集, C=只训练 N=730, default=普通全集")
-    parser.add_argument("--data", default="dataset/glitch_power_data_16bit_v2.pt")
+                        help="B=stratified batch all data, C=only train N=eval_filter_n, default=plain all data")
+    parser.add_argument("--data", default="dataset/glitch_power_data_16bit_v2_13k_edge10.pt")
     parser.add_argument("--save_suffix", default="")
-    parser.add_argument("--folds", type=int, default=1,
-                        help="max_folds: 5 表示跑完整 5-fold")
+    parser.add_argument("--folds", type=int, default=1)
     parser.add_argument("--start_fold", type=int, default=0)
     parser.add_argument("--only_fold", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=300)
@@ -293,35 +272,39 @@ def main():
     parser.add_argument("--val_batch_size", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=96)
     parser.add_argument("--num_gnn_layers", type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.10)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=5e-3)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--eval_filter_n", type=int, default=730,
-                        help="fixed-N 评估子集; <=0 表示关闭。target=area 时会自动关闭")
-    parser.add_argument("--target", choices=["power", "area", "delay"], default="power")
-    parser.add_argument("--w_mse", type=float, default=0.5)
+    parser.add_argument("--eval_filter_n", type=int, default=730)
+    parser.add_argument("--target", choices=["delay", "area", "power"], default="delay")
+    parser.add_argument("--w_mse", type=float, default=0.7)
     parser.add_argument("--w_rank", type=float, default=0.2)
-    parser.add_argument("--w_list", type=float, default=0.5)
-    parser.add_argument("--w_scale", type=float, default=0.5)
-    parser.add_argument("--onehot_start", type=int, default=3)
-    parser.add_argument("--onehot_dim", type=int, default=4)
+    parser.add_argument("--w_list", type=float, default=0.3)
+    parser.add_argument("--w_scale", type=float, default=0.3)
+    parser.add_argument("--topo_idx", type=int, default=0)
+    parser.add_argument("--arrival_idx", type=int, default=7)
+    parser.add_argument("--no_edge_feat", action="store_true")
+    parser.add_argument("--sum_agg", action="store_true",
+                        help="Use sum aggregation instead of degree-normalized mean")
+    parser.add_argument("--readout_beta", type=float, default=8.0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out_dir", default=None,
                         help="权重输出目录; 不填则自动用日志(stdout重定向)所在目录, 否则 dataset/")
     args = parser.parse_args()
 
+    target_tag = "" if args.target == "delay" else f"_{args.target}"
     suffix = args.save_suffix or ""
-    tgt_tag = "" if args.target == "power" else f"_{args.target}"
     if args.mode == "B":
-        save_path = f"dataset/glitch_power_onehot_gin_B{tgt_tag}{suffix}.pth"
+        save_path = f"dataset/glitch_power_dag_gnn_delay_B{target_tag}{suffix}.pth"
         train_filter_n = None
         use_stratified_batch = True
     elif args.mode == "C":
-        save_path = f"dataset/glitch_power_onehot_gin_C{tgt_tag}{suffix}.pth"
-        train_filter_n = 730
+        save_path = f"dataset/glitch_power_dag_gnn_delay_C{target_tag}{suffix}.pth"
+        train_filter_n = args.eval_filter_n if args.eval_filter_n > 0 else None
         use_stratified_batch = False
     else:
-        save_path = f"dataset/glitch_power_onehot_gin{tgt_tag}{suffix}.pth"
+        save_path = f"dataset/glitch_power_dag_gnn_delay{target_tag}{suffix}.pth"
         train_filter_n = None
         use_stratified_batch = False
 
@@ -338,9 +321,7 @@ def main():
         max_folds = args.folds
         skip_aggregate_save = False
 
-    eval_filter_n = None if args.eval_filter_n <= 0 else args.eval_filter_n
-
-    train_onehot_gin(
+    train_dag_gnn_delay(
         data_path=args.data,
         save_path=save_path,
         max_folds=max_folds,
@@ -358,13 +339,17 @@ def main():
         w_list=args.w_list,
         w_scale=args.w_scale,
         num_workers=args.num_workers,
-        eval_filter_n=eval_filter_n,
+        eval_filter_n=None if args.eval_filter_n <= 0 else args.eval_filter_n,
         train_filter_n=train_filter_n,
         use_stratified_batch=use_stratified_batch,
         target=args.target,
-        onehot_start=args.onehot_start,
-        onehot_dim=args.onehot_dim,
+        topo_idx=args.topo_idx,
+        arrival_idx=args.arrival_idx,
+        use_edge_feat=not args.no_edge_feat,
+        use_mean_agg=not args.sum_agg,
+        readout_beta=args.readout_beta,
         skip_aggregate_save=skip_aggregate_save,
+        seed=args.seed,
     )
 
 
