@@ -1595,6 +1595,28 @@ class CompressorRouting:
             self.tb_logger.add_scalar(f"found_best/{ppa_key}", ppa_value, episode_idx)
         self.tb_logger.add_scalar("lr", self.scheduler.get_last_lr()[0], episode_idx)
 
+        # ── real-time console progress ──────────────────────────────────────
+        cur  = self._summarize_result(info["simulated_result"])
+        best = self._best_info_metadata()
+        vio_str = (
+            f"  area_vio={cur['area_violation']:.1f}({'OK' if cur['area_feasible'] else 'X'})"
+            if self.area_budget is not None else ""
+        )
+        proxy_str = (
+            f"  eda_pwr={cur.get('eda_power', 0) * 1000:.4f}mW"
+            if self.power_source == "proxy" and cur.get("eda_power") is not None
+            else ""
+        )
+        logging.info(
+            "[ep %4d/%d]  obj=%.6f  area=%.1f  delay=%.4fns"
+            "  pwr=%.4fmW[%s]%s%s"
+            "  || best: obj=%.6f  area=%.1f  pwr=%.4fmW",
+            episode_idx, self.num_episodes, info["objective"],
+            cur["area"], cur["delay"], cur["power"] * 1000,
+            self.power_source, vio_str, proxy_str,
+            best["objective"], best["area"], best["power"] * 1000,
+        )
+
     def run_episode(self, episode_idx):
         logging.info(f"Episode {episode_idx} start")
 
