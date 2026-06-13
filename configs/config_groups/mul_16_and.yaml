@@ -31,7 +31,7 @@ trainer:
     disc_loss_weight: 1e-2
     disc_loss_weight_incr: 1e-3
     # training scale
-    num_episodes: 2000
+    num_episodes: 1000
     num_samples: 2
     num_epochs: 1 # ppo epochs
     save_freq: 100
@@ -42,7 +42,7 @@ trainer:
       lr: 1e-4
     scheduler_name: CosineAnnealingLR
     scheduler_kwargs:
-      T_max: 5000
+      T_max: 1000
       eta_min: 1e-5
     clip_range: 0.2
     max_grad_norm: 0.5
@@ -70,12 +70,12 @@ trainer:
     # checkpoint labels are mW; arith_das.py objective uses OpenROAD W.
     power_proxy_output_scale: 1e-3
     # fixed-delay area-budget sweep params
-    fixed_target_delay: 2000
-    area_budgets: [1160, 1200, 1240, 1280, 1320]
+    # fixed_target_delay: 2000
+    # area_budgets: none
     area_violation_weight: 1.0
     delay_violation_weight: 1.0
     power_source: proxy
-    reference_point: [2.0, 2500]
+    reference_point: [2.0, 3000]
     pareto_target: ["delay", "area"]
     pool_size: 20
     gomil_path: null

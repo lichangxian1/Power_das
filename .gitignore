@@ -42,3 +42,4 @@ get_*
 sandbox_base
 library
 library/t28_official/*.lib
+logs

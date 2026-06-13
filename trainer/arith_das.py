@@ -652,11 +652,15 @@ class CompressorRouting:
         pareto_value_1 = [point[1] for point in pareto_points]
         hv = hypervolume(pareto_points)
         try:
-            # Ensure reference point strictly dominates all pareto points
-            ref = [
-                max(self.reference_point[i], max(p[i] for p in pareto_points) * 1.1)
-                for i in range(len(self.reference_point))
-            ]
+            if self.area_budget is None:
+                # Unconstrained (EDA) mode mirrors Arith-DAS: fixed reference point.
+                ref = list(self.reference_point)
+            else:
+                # Ensure reference point strictly dominates all pareto points
+                ref = [
+                    max(self.reference_point[i], max(p[i] for p in pareto_points) * 1.1)
+                    for i in range(len(self.reference_point))
+                ]
             hv_value = hv.compute(ref)
             self.tb_logger.add_scalar("hv_value", hv_value, episode_idx)
         except Exception as e:
@@ -1428,6 +1432,11 @@ class CompressorRouting:
     def _candidate_rank(self, sample_info):
         result = sample_info.get("result", sample_info.get("simulated_result"))
         summary = self._summarize_result(result)
+        # Unconstrained (EDA) mode mirrors Arith-DAS exactly: rank purely by the
+        # scalar objective so the exported "best" design matches the baseline.
+        # The feasibility/power ranking below only applies to area-budget runs.
+        if self.area_budget is None:
+            return (0, 0.0, sample_info["objective"])
         feasible = summary["area_feasible"] and summary["delay_feasible"]
         violation = summary["area_violation"] + summary["delay_violation"]
         return (0 if feasible else 1, violation, summary["power"])
