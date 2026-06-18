@@ -28,7 +28,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 复用 generate_dataset.py 的辅助函数
-from scripts.generate_dataset import compute_graph_hash, extract_X_edge
+from scripts.generate_dataset import (
+    NODE_TIMING_FEATURES,
+    compute_graph_hash,
+    extract_X_edge,
+    node_power_dict_to_tensor,
+    node_timing_dict_to_tensor,
+    node_toggle_dict_to_tensor,
+)
 from send_eda import _evaluate_single_design_full
 from trainer.arith_das import CompressorRouting
 from utils import CompressorTree, Mul
@@ -148,16 +155,15 @@ def main(total_samples, rate_per_min, save_path, save_every_n,
             info = res["sample_info"]
             if res.get("power") != float("inf") and res.get("delay") != float("inf"):
                 num_nodes = info["X"].shape[0]
-                node_powers_arr = torch.zeros(num_nodes, dtype=torch.float32)
-                node_power_mask = torch.zeros(num_nodes, dtype=torch.bool)
-                for inst_name, p_w in (res.get("node_powers") or {}).items():
-                    try:
-                        idx = int(inst_name.split("_")[1])
-                        if 0 <= idx < num_nodes:
-                            node_powers_arr[idx] = float(p_w)
-                            node_power_mask[idx] = True
-                    except (ValueError, IndexError):
-                        pass
+                node_powers_arr, node_power_mask = node_power_dict_to_tensor(
+                    res.get("node_powers"), num_nodes,
+                )
+                node_timing_arr, node_timing_mask = node_timing_dict_to_tensor(
+                    res.get("node_timing"), num_nodes,
+                )
+                node_toggles_arr, node_toggle_mask = node_toggle_dict_to_tensor(
+                    res.get("node_toggles"), num_nodes,
+                )
                 dataset.append({
                     "X": info["X"].clone(),
                     "edge_index": info["edge_index"].clone(),
@@ -165,6 +171,12 @@ def main(total_samples, rate_per_min, save_path, save_every_n,
                     "area": res["area"], "delay": res["delay"], "power": res["power"],
                     "node_powers": node_powers_arr,
                     "node_power_mask": node_power_mask,
+                    "node_timing": node_timing_arr,
+                    "node_timing_mask": node_timing_mask,
+                    "node_timing_features": list(NODE_TIMING_FEATURES),
+                    "node_toggles": node_toggles_arr,
+                    "node_toggle_mask": node_toggle_mask,
+                    "vec_cnt": res.get("vec_cnt"),
                 })
                 succeeded += 1
                 # 周期 save

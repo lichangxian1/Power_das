@@ -15,6 +15,7 @@
     python trainer/evaluate_proxy.py --ckpt ... --kfold 5 --fold_id 0
 """
 import os
+import re
 import sys
 import argparse
 import glob
@@ -30,7 +31,7 @@ from sklearn.model_selection import KFold
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from train_proxy import ArithDataset, custom_collate
-from proxy_mlp import ArithProxyGNN, PureGIN, PureGCN, OneHotGIN
+from proxy_mlp import ArithProxyGNN, DAGTimingGNN, PureGIN, PureGCN, OneHotGIN
 
 
 def _topk_recall(pred, true, k_ratios=(0.05, 0.10, 0.20)):
@@ -77,6 +78,19 @@ def _build_model_from_ckpt(ckpt, device):
             dropout=ckpt.get("dropout", 0.0),
             onehot_start=ckpt.get("onehot_start", 3),
             onehot_dim=ckpt.get("onehot_dim", 4),
+        ).to(device)
+    elif model_class == "DAGTimingGNN":
+        model = DAGTimingGNN(
+            node_feature_dim=ckpt.get("node_feature_dim", 13),
+            hidden_dim=ckpt.get("hidden_dim", 96),
+            num_gnn_layers=ckpt.get("num_gnn_layers", 4),
+            dropout=ckpt.get("dropout", 0.1),
+            topo_idx=ckpt.get("topo_idx", 0),
+            arrival_idx=ckpt.get("arrival_idx", 7),
+            use_edge_feat=ckpt.get("use_edge_feat", True),
+            external_edge_attr_dim=ckpt.get("external_edge_attr_dim", 0),
+            use_mean_agg=ckpt.get("use_mean_agg", True),
+            readout_beta=ckpt.get("readout_beta", 8.0),
         ).to(device)
     elif ckpt.get("use_pure_gcn", False):
         model = PureGCN(
@@ -127,6 +141,9 @@ def _print_ckpt_config(ckpt):
     print(f"     use_multitask     = {ckpt.get('use_multitask', False)}  (方案 2)")
     print(f"     use_jk_pool       = {ckpt.get('use_jk_pool', False)}  (方案 4)")
     print(f"     use_gin           = {ckpt.get('use_gin', False)}  (GIN backbone)")
+    if ckpt.get("model_class") == "DAGTimingGNN":
+        print(f"     topo_idx          = {ckpt.get('topo_idx', 0)}")
+        print(f"     readout_beta      = {ckpt.get('readout_beta', 8.0)}")
     if ckpt.get("model_class") == "OneHotGIN" or ckpt.get("use_onehot_only", False):
         print(f"     onehot slice      = X[:, {ckpt.get('onehot_start', 3)}:{ckpt.get('onehot_start', 3) + ckpt.get('onehot_dim', 4)}]")
     print(f"     train best_tau    = {ckpt.get('best_tau', '?')}")
@@ -362,15 +379,56 @@ def evaluate_kfold_glob(ckpt_glob, data_path, kfold=5,
     return results
 
 
+_DATA_DIR = "dataset"
+# ckpt 文件名里的数据集变体标记, 如 v2_16k_phys / v2_11k_edge10 / v2_13k_enriched
+_DATA_VARIANT_RE = re.compile(r"(v2_\d+k_(?:phys|edge10|enriched|onehot))")
+
+
+def resolve_data_path(ckpt_path, explicit=None):
+    """自动确定某个 ckpt 对应的数据集 .pt 路径。
+
+    优先级: 显式 --data > ckpt 内嵌 data_path > 从 ckpt 文件名推断。
+    推断失败则报错, 提示用 --data 指定。
+    """
+    if explicit:
+        return explicit
+
+    # 1. ckpt 里记录的 data_path (新版训练脚本会写入)
+    try:
+        ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        dp = ck.get("data_path") if isinstance(ck, dict) else None
+        if dp and os.path.exists(dp):
+            print(f"  ℹ  data 来自 ckpt 记录: {dp}")
+            return dp
+    except Exception:
+        pass
+
+    # 2. 从 ckpt 文件名推断 (如 ..._v2_16k_phys_... → glitch_power_data_16bit_v2_16k_phys.pt)
+    m = _DATA_VARIANT_RE.search(os.path.basename(ckpt_path))
+    if m:
+        cand = os.path.join(_DATA_DIR, f"glitch_power_data_16bit_{m.group(1)}.pt")
+        if os.path.exists(cand):
+            print(f"  ℹ  data 由 ckpt 文件名推断: {cand}")
+            return cand
+
+    raise FileNotFoundError(
+        f"无法自动确定数据集 (ckpt={ckpt_path})；请用 --data 显式指定 .pt 路径"
+    )
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="评估功耗代理 ckpt。便捷用法: python evaluate_proxy.py <文件夹> "
+        "→ 自动评估该文件夹下所有 *.pth, 图片输出到同一文件夹。"
+    )
+    parser.add_argument("folder", type=str, nargs="?", default=None,
+                        help="便捷模式: 文件夹路径, 自动取其下所有 *.pth 并把图片存到该文件夹")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="单个 ckpt 路径")
     parser.add_argument("--ckpt_glob", type=str, default=None,
                         help="glob 匹配多个 fold ckpt (汇总评估), 与 --ckpt 二选一")
-    parser.add_argument("--data", type=str,
-                        default="dataset/glitch_power_data_16bit_v2_7k_edge10.pt",
-                        help="数据集 .pt 路径")
+    parser.add_argument("--data", type=str, default=None,
+                        help="数据集 .pt 路径 (不填则自动从 ckpt 记录/文件名推断)")
     parser.add_argument("--kfold", type=int, default=5,
                         help="K-Fold 切分数 (与训练时一致, seed=42 复现 val 子集)")
     parser.add_argument("--fold_id", type=int, default=None,
@@ -382,27 +440,44 @@ if __name__ == "__main__":
     parser.add_argument("--eval_filter_n", type=int, default=730,
                         help="fix-N 子集大小; 设 0 关闭 fix-N")
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--fig_dir", type=str, default="outputs",
-                        help="散点图保存目录")
+    parser.add_argument("--fig_dir", type=str, default=None,
+                        help="散点图保存目录 (便捷模式默认存到目标文件夹, 否则 outputs)")
     args = parser.parse_args()
 
     kfold_arg = None if args.no_kfold else args.kfold
     filter_n = None if args.eval_filter_n <= 0 else args.eval_filter_n
 
-    if args.ckpt_glob is not None:
+    # 便捷模式: 位置参数给一个文件夹 → glob 其下所有 *.pth, 图片默认存回该文件夹
+    ckpt_glob = args.ckpt_glob
+    fig_dir = args.fig_dir
+    if args.folder is not None:
+        if not os.path.isdir(args.folder):
+            parser.error(f"文件夹不存在: {args.folder}")
+        ckpt_glob = os.path.join(args.folder, "*.pth")
+        if fig_dir is None:
+            fig_dir = args.folder
+    if fig_dir is None:
+        fig_dir = "outputs"
+
+    if ckpt_glob is not None:
+        matched = sorted(glob.glob(ckpt_glob))
+        if not matched:
+            parser.error(f"没找到 ckpt 匹配 {ckpt_glob}")
+        data_path = resolve_data_path(matched[0], args.data)
         evaluate_kfold_glob(
-            args.ckpt_glob, args.data, kfold=kfold_arg,
+            ckpt_glob, data_path, kfold=kfold_arg,
             eval_filter_n=filter_n, batch_size=args.batch_size,
-            fig_dir=args.fig_dir,
+            fig_dir=fig_dir,
         )
     elif args.ckpt is not None:
+        data_path = resolve_data_path(args.ckpt, args.data)
         evaluate_single_ckpt(
-            args.ckpt, args.data,
+            args.ckpt, data_path,
             val_ratio=args.val_ratio,
             kfold=kfold_arg, fold_id=args.fold_id,
             eval_filter_n=filter_n,
             batch_size=args.batch_size,
-            fig_dir=args.fig_dir,
+            fig_dir=fig_dir,
         )
     else:
-        parser.error("--ckpt 或 --ckpt_glob 至少提供一个")
+        parser.error("请给一个文件夹位置参数, 或用 --ckpt / --ckpt_glob")

@@ -991,4 +991,5 @@ if __name__ == "__main__":
             save_path=save_path, **kw,
         )
     else:
-        train_proxy(**kw)
+        save_path = place(f"glitch_power_proxy_gnn{tgt_tag}{args.save_suffix or ''}.pth", out_dir)
+        train_proxy(save_path=save_path, **kw)

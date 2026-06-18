@@ -8,6 +8,18 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from run_power_sweep import evaluate_single_routing
 
 
+def _empty_full_result():
+    return {
+        "area": float('inf'),
+        "delay": float('inf'),
+        "power": float('inf'),
+        "node_powers": {},
+        "node_timing": {},
+        "node_toggles": {},
+        "vec_cnt": None,
+    }
+
+
 def evaluate_single_design(verilog_file_path, target_delay, bit_width=16):
     """
     EDA 桥梁包装器：读取 Verilog → 调用沙盒评估 → 返回 area, delay, power (mW)
@@ -67,12 +79,12 @@ def evaluate_single_design_with_noise(verilog_file_path, target_delay, bit_width
 def _evaluate_single_design_full(verilog_file_path, target_delay, bit_width=16):
     """完整版评估: 返回 dict 含 area/delay/power/node_powers (POC: per-node power)"""
     if not os.path.exists(verilog_file_path) or os.path.getsize(verilog_file_path) == 0:
-        return {"area": float('inf'), "delay": float('inf'), "power": float('inf'), "node_powers": {}}
+        return _empty_full_result()
     try:
         with open(verilog_file_path, "r", encoding="utf-8") as f:
             verilog_content = f.read()
     except Exception:
-        return {"area": float('inf'), "delay": float('inf'), "power": float('inf'), "node_powers": {}}
+        return _empty_full_result()
 
     dummy_idx = random.randint(1, 9999)
     result = evaluate_single_routing(
@@ -85,8 +97,11 @@ def _evaluate_single_design_full(verilog_file_path, target_delay, bit_width=16):
             "delay": abs(result.get("delay", float('inf'))),
             "power": result.get("power_mw", float('inf')),
             "node_powers": result.get("node_powers", {}),
+            "node_timing": result.get("node_timing", {}),
+            "node_toggles": result.get("node_toggles", {}),
+            "vec_cnt": result.get("vec_cnt"),
         }
-    return {"area": float('inf'), "delay": float('inf'), "power": float('inf'), "node_powers": {}}
+    return _empty_full_result()
 
 
 def evaluate_batch_parallel(verilog_files, target_delay, bit_width=16, max_workers=8,
@@ -133,7 +148,7 @@ def evaluate_batch_parallel(verilog_files, target_delay, bit_width=16, max_worke
                 res = future.result(timeout=1800)
             except Exception as e:
                 print(f"❌ 评估超时/异常: {vf} → {e}")
-                res = {"area": float('inf'), "delay": float('inf'), "power": float('inf'), "node_powers": {}}
+                res = _empty_full_result()
             res["file"] = vf
             results.append(res)
 

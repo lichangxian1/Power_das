@@ -4,6 +4,7 @@ import time
 import uuid
 import random
 import subprocess
+import shlex
 import concurrent.futures
 import torch
 import numpy as np
@@ -133,20 +134,65 @@ def generate_legal_random_routing(comp_graph):
 # ==============================================================================
 # 2. 跨服安全沙盒评估引擎
 # ==============================================================================
-EDA_USER = "lchangxian"
-EDA_HOST = "202.120.39.27"
-EDA_PORT = "16822"
-EDA_BASE_DIR = "/home/lchangxian/sandbox/sandbox_base" 
-SSH_SETUP_TIMEOUT = 120
-RSYNC_TIMEOUT = 120
-EDA_RUN_TIMEOUT = 1200
-SSH_CLEANUP_TIMEOUT = 60
+EDA_USER = os.environ.get("EDA_USER", "lchangxian")
+EDA_HOST = os.environ.get("EDA_HOST", "202.120.39.27")
+EDA_PORT = str(os.environ.get("EDA_PORT", "16822"))
+EDA_BASE_DIR = os.environ.get("EDA_BASE_DIR", "/home/lchangxian/sandbox/sandbox_base")
+EDA_WORK_ROOT = os.environ.get("EDA_WORK_ROOT", f"/home/{EDA_USER}/sandbox/sandbox_sets")
+SSH_SETUP_TIMEOUT = int(os.environ.get("SSH_SETUP_TIMEOUT", "120"))
+RSYNC_TIMEOUT = int(os.environ.get("RSYNC_TIMEOUT", "120"))
+EDA_RUN_TIMEOUT = int(os.environ.get("EDA_RUN_TIMEOUT", "1200"))
+SSH_CLEANUP_TIMEOUT = int(os.environ.get("SSH_CLEANUP_TIMEOUT", "60"))
+
+
+def _shq(value):
+    return shlex.quote(str(value))
+
+
+def _env_flag(name, default="0"):
+    value = str(os.environ.get(name, default)).strip().lower()
+    return "1" if value in {"1", "true", "yes", "on"} else "0"
+
+
+def _env_int(name, default, min_value=1, max_value=1000000):
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(min_value, min(max_value, value))
+
+
+def _parse_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_key_value_payload(tokens, fallback_key=None):
+    parsed = {}
+    for token in tokens:
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        key = key.strip()
+        val = _parse_float(value.strip().rstrip(","))
+        if key and val is not None:
+            parsed[key] = val
+
+    if not parsed and fallback_key:
+        for token in tokens:
+            val = _parse_float(token.strip().rstrip(","))
+            if val is not None:
+                parsed[fallback_key] = val
+                break
+    return parsed
 
 
 def _cleanup_remote_sandbox(remote_sandbox):
     try:
         subprocess.run(
-            ["ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}", f"rm -rf {remote_sandbox}"],
+            ["ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}", f"rm -rf {_shq(remote_sandbox)}"],
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=SSH_CLEANUP_TIMEOUT,
         )
@@ -168,18 +214,23 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
     with open(local_v_path, "w") as f:
         f.write(verilog_content)
 
-    remote_sandbox = f"/home/{EDA_USER}/sandbox/sandbox_sets/sandbox_{uid}"
+    remote_sandbox = f"{EDA_WORK_ROOT.rstrip('/')}/sandbox_{uid}"
     
     MAX_RETRIES = 3 # License 重试机制
     
     for attempt in range(MAX_RETRIES):
         try:
             time.sleep(random.uniform(0.1, 10.0))
+            q_base = _shq(EDA_BASE_DIR)
+            q_work_root = _shq(EDA_WORK_ROOT)
+            q_remote = _shq(remote_sandbox)
             ssh_setup_cmd = [
                 "ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}",
-                f"cp -r {EDA_BASE_DIR} {remote_sandbox} && "
-                f"sed -i 's#> /dev/null 2>&1##g' {remote_sandbox}/scripts/run_xa_vcs.sh && "
-                f"rm -rf {remote_sandbox}/results/* {remote_sandbox}/reports/* {remote_sandbox}/src/rtl/* {remote_sandbox}/src/tb/file_* || true"
+                f"mkdir -p {q_work_root} && "
+                f"rm -rf {q_remote} && "
+                f"cp -r {q_base} {q_remote} && "
+                f"sed -i 's#> /dev/null 2>&1##g' {q_remote}/scripts/run_xa_vcs.sh && "
+                f"rm -rf {q_remote}/results/* {q_remote}/reports/* {q_remote}/src/rtl/* {q_remote}/src/tb/file_* || true"
             ]
             subprocess.run(
                 ssh_setup_cmd, check=True, stdout=subprocess.DEVNULL,
@@ -197,7 +248,7 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
 
             ssh_run_cmd = [
                 "ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}",
-                f"cd {remote_sandbox} && bash scripts/run_all.sh {top_module} {bit_width} {target_delay}"
+                f"cd {remote_sandbox} && LC_ALL=C LANG=C DUMP_SAIF={_env_flag('DUMP_SAIF')} MAX_LIMIT={_env_int('MAX_LIMIT', 4096)} bash scripts/run_all.sh {top_module} {bit_width} {target_delay}"
             ]
             result = subprocess.run(
                 ssh_run_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -207,7 +258,7 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
 
             # [License 挤兑保护机制]
             if "FATAL" in stdout:
-                log_cmd = ["ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}", f"tail -n 100 {remote_sandbox}/dc_synth*.log 2>/dev/null; tail -n 50 {remote_sandbox}/*.log 2>/dev/null"]
+                log_cmd = ["ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}", f"tail -n 100 {q_remote}/dc_synth*.log 2>/dev/null; tail -n 50 {q_remote}/*.log 2>/dev/null"]
                 log_res = subprocess.run(
                     log_cmd, capture_output=True, text=True, check=False,
                     timeout=SSH_SETUP_TIMEOUT,
@@ -229,7 +280,12 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
             power, area, delay = None, None, None
             logic_failed = False
             node_powers = {}            # POC: per-node power dict (inst_name → avg_W)
-            in_node_block = False
+            node_timing = {}            # per-node real STA features from DC
+            node_toggles = {}           # per-node SAIF toggle counts from VCS
+            saif_status = []
+            saif_head = []
+            vec_cnt = None
+            node_block = None
 
             for line in stdout.split('\n'):
                 if "总功耗" in line and "W" in line:
@@ -241,12 +297,27 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
                     delay = float(line.split(':')[1].strip().split()[0])
                 elif "FAILED:" in line:
                     logic_failed = True
-                # POC: per-node power 段解析
+                elif "GENERATED_VECTORS=" in line:
+                    match_vec = re.search(r"GENERATED_VECTORS=(\d+)", line)
+                    if match_vec:
+                        vec_cnt = int(match_vec.group(1))
+                elif line.startswith("SAIF_STATUS:"):
+                    saif_status.append(line)
+                elif line.startswith("SAIF_HEAD:"):
+                    saif_head.append(line)
                 elif "--- BEGIN_NODE_POWER" in line:
-                    in_node_block = True
+                    node_block = "power"
                 elif "--- END_NODE_POWER" in line:
-                    in_node_block = False
-                elif in_node_block and line.startswith("NODE_POWER:"):
+                    node_block = None
+                elif "--- BEGIN_NODE_TIMING" in line:
+                    node_block = "timing"
+                elif "--- END_NODE_TIMING" in line:
+                    node_block = None
+                elif "--- BEGIN_NODE_TOGGLE" in line:
+                    node_block = "toggle"
+                elif "--- END_NODE_TOGGLE" in line:
+                    node_block = None
+                elif node_block == "power" and line.startswith("NODE_POWER:"):
                     parts = line.split()
                     if len(parts) >= 3:
                         inst_name = parts[1]
@@ -254,14 +325,34 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
                             node_powers[inst_name] = float(parts[2])
                         except ValueError:
                             pass
+                elif node_block == "timing" and line.startswith("NODE_TIMING:"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        payload = _parse_key_value_payload(parts[2:])
+                        if payload:
+                            node_timing[parts[1]] = payload
+                elif node_block == "toggle" and line.startswith("NODE_TOGGLE:"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        payload = _parse_key_value_payload(parts[2:], fallback_key="toggle_count")
+                        if payload:
+                            node_toggles[parts[1]] = payload
 
             if power is not None:
-                return {
+                success_res = {
                     "id": idx, "power_mw": power * 1000,
                     "area": area, "delay": delay,
                     "success": True, "logic_failed": logic_failed,
                     "node_powers": node_powers,   # POC: 空 dict 表示旧版 sandbox
+                    "node_timing": node_timing,
+                    "node_toggles": node_toggles,
+                    "saif_status": saif_status,
+                    "saif_head": saif_head,
+                    "vec_cnt": vec_cnt,
                 }
+                if _env_flag("EDA_RETURN_STDOUT") == "1":
+                    success_res["stdout_tail"] = stdout[-8000:]
+                return success_res
             else:
                 return {"id": idx, "success": False, "log": stdout}
 

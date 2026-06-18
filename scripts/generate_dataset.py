@@ -2,6 +2,7 @@ import os
 import sys
 import torch
 import hashlib
+import math
 import traceback
 from tqdm import tqdm
 
@@ -78,6 +79,89 @@ def compute_graph_hash(X, edge_index, edge_attr):
     else:
         data = X.flatten().numpy().tobytes()
     return hashlib.md5(data).hexdigest()
+
+
+NODE_TIMING_FEATURES = [
+    "in_arr_min",
+    "in_arr_max",
+    "in_arr_mean",
+    "in_skew",
+    "in_trans_max",
+    "out_arr_max",
+    "out_slack_min",
+    "out_trans_max",
+]
+
+TOGGLE_FEATURE_KEYS = ("toggle_count", "tc", "toggles", "toggle")
+
+
+def _node_index_from_inst(inst_name):
+    try:
+        prefix, idx_s = str(inst_name).split("_", 1)
+        if prefix not in {"ct32", "ct22"}:
+            return None
+        return int(idx_s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _finite_float(value):
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    return val if math.isfinite(val) else None
+
+
+def node_power_dict_to_tensor(node_powers, num_nodes):
+    arr = torch.zeros(num_nodes, dtype=torch.float32)
+    mask = torch.zeros(num_nodes, dtype=torch.bool)
+    for inst_name, p_w in (node_powers or {}).items():
+        idx = _node_index_from_inst(inst_name)
+        val = _finite_float(p_w)
+        if idx is not None and val is not None and 0 <= idx < num_nodes:
+            arr[idx] = val
+            mask[idx] = True
+    return arr, mask
+
+
+def node_toggle_dict_to_tensor(node_toggles, num_nodes):
+    arr = torch.zeros(num_nodes, dtype=torch.float32)
+    mask = torch.zeros(num_nodes, dtype=torch.bool)
+    for inst_name, payload in (node_toggles or {}).items():
+        idx = _node_index_from_inst(inst_name)
+        if idx is None or not (0 <= idx < num_nodes):
+            continue
+        if isinstance(payload, dict):
+            val = None
+            for key in TOGGLE_FEATURE_KEYS:
+                val = _finite_float(payload.get(key))
+                if val is not None:
+                    break
+        else:
+            val = _finite_float(payload)
+        if val is not None:
+            arr[idx] = val
+            mask[idx] = True
+    return arr, mask
+
+
+def node_timing_dict_to_tensor(node_timing, num_nodes, feature_names=NODE_TIMING_FEATURES):
+    arr = torch.zeros((num_nodes, len(feature_names)), dtype=torch.float32)
+    mask = torch.zeros(num_nodes, dtype=torch.bool)
+    for inst_name, payload in (node_timing or {}).items():
+        idx = _node_index_from_inst(inst_name)
+        if idx is None or not isinstance(payload, dict) or not (0 <= idx < num_nodes):
+            continue
+        any_feature = False
+        for feat_idx, feat_name in enumerate(feature_names):
+            val = _finite_float(payload.get(feat_name))
+            if val is not None:
+                arr[idx, feat_idx] = val
+                any_feature = True
+        if any_feature:
+            mask[idx] = True
+    return arr, mask
 
 
 # ========================== 主函数 ==========================
@@ -213,20 +297,16 @@ def collect_dataset(
         for info in sample_info_list:
             res = result_dict.get(info["rtl_path"])
             if res and res["power"] != float('inf') and res["delay"] != float('inf'):
-                # POC: 把 node_powers dict { "ct32_X": power_W } 转成 [N] tensor
-                #      节点身份: ct32_X 对应 vertex_idx=X (FA), ct22_X 对应 vertex_idx=X (HA)
                 num_nodes = info["X"].shape[0]
-                node_powers_arr = torch.zeros(num_nodes, dtype=torch.float32)
-                node_power_mask = torch.zeros(num_nodes, dtype=torch.bool)
-                for inst_name, p_w in (res.get("node_powers") or {}).items():
-                    try:
-                        # inst_name like "ct32_45" or "ct22_27"
-                        idx = int(inst_name.split("_")[1])
-                        if 0 <= idx < num_nodes:
-                            node_powers_arr[idx] = float(p_w)
-                            node_power_mask[idx] = True
-                    except (ValueError, IndexError):
-                        pass
+                node_powers_arr, node_power_mask = node_power_dict_to_tensor(
+                    res.get("node_powers"), num_nodes,
+                )
+                node_timing_arr, node_timing_mask = node_timing_dict_to_tensor(
+                    res.get("node_timing"), num_nodes,
+                )
+                node_toggles_arr, node_toggle_mask = node_toggle_dict_to_tensor(
+                    res.get("node_toggles"), num_nodes,
+                )
 
                 dataset.append({
                     "X": info["X"].clone(),
@@ -237,6 +317,12 @@ def collect_dataset(
                     "power": res["power"],
                     "node_powers": node_powers_arr,        # [N] W (PP/output 节点为 0)
                     "node_power_mask": node_power_mask,    # [N] bool (FA/HA 节点为 True)
+                    "node_timing": node_timing_arr,        # [N, K] real STA features
+                    "node_timing_mask": node_timing_mask,  # [N] bool
+                    "node_timing_features": list(NODE_TIMING_FEATURES),
+                    "node_toggles": node_toggles_arr,      # [N] SAIF toggle count
+                    "node_toggle_mask": node_toggle_mask,  # [N] bool
+                    "vec_cnt": res.get("vec_cnt"),
                 })
                 success_count += 1
                 batch_success += 1
@@ -295,7 +381,7 @@ def collect_dataset(
         print(f"     edges: sum={int(is_sum)} ({is_sum/edge_n*100:.1f}%), "
               f"carry={int(is_carry)} ({is_carry/edge_n*100:.1f}%)")
 
-        # POC: node_powers 统计
+        # POC: node-level observables 统计
         n_with_np = sum(1 for d in dataset if d.get("node_power_mask") is not None
                         and bool(d["node_power_mask"].any()))
         if n_with_np > 0:
@@ -307,6 +393,13 @@ def collect_dataset(
             print(f"     node_powers 覆盖: {n_with_np}/{len(dataset)} 样本含 per-node power")
             print(f"     sample[0] FA+HA 数: {int(mask.sum())} / {len(mask)}, "
                   f"node power 范围 [{valid_np.min():.2e}, {valid_np.max():.2e}] W")
+
+        n_with_sta = sum(1 for d in dataset if d.get("node_timing_mask") is not None
+                         and bool(d["node_timing_mask"].any()))
+        n_with_toggle = sum(1 for d in dataset if d.get("node_toggle_mask") is not None
+                            and bool(d["node_toggle_mask"].any()))
+        print(f"     node_timing 覆盖: {n_with_sta}/{len(dataset)} 样本含真实 STA")
+        print(f"     node_toggles 覆盖: {n_with_toggle}/{len(dataset)} 样本含 SAIF toggle")
     print(f"  {'='*60}")
 
 
