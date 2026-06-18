@@ -1,0 +1,178 @@
+{
+  "meta": {
+    "static_prob": 0.25,
+    "toggle_rate": 0.125
+  },
+  "cells": {
+    "comp22_94": {
+      "type": "22",
+      "canon_key": "0112",
+      "class_size": 1,
+      "is_exact": true,
+      "group": "exact",
+      "weighted_signed_error": 0.0,
+      "weighted_absolute_error": 0.0,
+      "error_rate": 0,
+      "max_error": 0,
+      "positive_error_prob": 0,
+      "negative_error_prob": 0,
+      "sum_lut": [
+        0,
+        1,
+        1,
+        0
+      ],
+      "carry_lut": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "v_approx": [
+        0,
+        1,
+        1,
+        2
+      ],
+      "ports": [
+        "a",
+        "cin",
+        "sum",
+        "cout"
+      ],
+      "area": 12.096,
+      "dyn_w": 0.0003769613,
+      "leak_w": 2.12255e-08,
+      "delay_arcs": {
+        "Tas": 0.5,
+        "Tac": 0.46,
+        "Tbs": null,
+        "Tbc": null,
+        "Tcs": 0.5,
+        "Tcc": 0.46
+      }
+    },
+    "comp32_e994": {
+      "type": "32",
+      "canon_key": "01121223",
+      "class_size": 1,
+      "is_exact": true,
+      "group": "exact",
+      "weighted_signed_error": 0.0,
+      "weighted_absolute_error": 0.0,
+      "error_rate": 0,
+      "max_error": 0,
+      "positive_error_prob": 0,
+      "negative_error_prob": 0,
+      "sum_lut": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        0,
+        0,
+        1
+      ],
+      "carry_lut": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      "v_approx": [
+        0,
+        1,
+        1,
+        2,
+        1,
+        2,
+        2,
+        3
+      ],
+      "ports": [
+        "a",
+        "b",
+        "cin",
+        "sum",
+        "cout"
+      ],
+      "area": 15.456,
+      "dyn_w": 0.0005721249,
+      "leak_w": 2.4208200000000002e-08,
+      "delay_arcs": {
+        "Tas": 0.52,
+        "Tac": 0.47,
+        "Tbs": 0.52,
+        "Tbc": 0.47,
+        "Tcs": 0.52,
+        "Tcc": 0.47
+      }
+    },
+    "comp32_9440": {
+      "type": "32",
+      "canon_key": "00010112",
+      "class_size": 1,
+      "is_exact": false,
+      "group": "N",
+      "weighted_signed_error": -0.578125,
+      "weighted_absolute_error": 0.578125,
+      "error_rate": 0.578125,
+      "max_error": 1,
+      "positive_error_prob": 0,
+      "negative_error_prob": 0.578125,
+      "sum_lut": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "carry_lut": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "v_approx": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        1,
+        2
+      ],
+      "ports": [
+        "a",
+        "b",
+        "cin",
+        "sum",
+        "cout"
+      ],
+      "area": 12.936,
+      "dyn_w": 0.0002084762,
+      "leak_w": 2.15292e-08,
+      "delay_arcs": {
+        "Tas": 0.51,
+        "Tac": 0.47,
+        "Tbs": 0.51,
+        "Tbc": 0.47,
+        "Tcs": 0.51,
+        "Tcc": 0.47
+      }
+    }
+  }
+}
