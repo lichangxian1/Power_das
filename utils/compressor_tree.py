@@ -1234,8 +1234,9 @@ class CompressorTree(ABC):
     def declare_wire(self, wire_name):
         return f"    wire {wire_name};\n"
 
-    def declare_fa(self, fa_name, input_list, sum_name, carry_name):
-        v_src = f"    FA {fa_name} (\n"
+    def declare_fa(self, fa_name, input_list, sum_name, carry_name, cell=None):
+        # cell=None -> 精确 "FA"；传近似 3:2 cell 名(端口同 FA: a,b,cin,sum,cout)即可替换
+        v_src = f"    {cell or 'FA'} {fa_name} (\n"
         v_src += f"        .a ({input_list[0]}),\n"
         v_src += f"        .b({input_list[1]}),\n"
         v_src += f"        .cin({input_list[2]}),\n"
@@ -1244,8 +1245,9 @@ class CompressorTree(ABC):
         v_src += "    );\n"
         return v_src
 
-    def declare_ha(self, ha_name, input_list, sum_name, carry_name):
-        v_src = f"    HA {ha_name} (\n"
+    def declare_ha(self, ha_name, input_list, sum_name, carry_name, cell=None):
+        # cell=None -> 精确 "HA"；传近似 2:2 cell 名(端口同 HA: a,cin,sum,cout)即可替换
+        v_src = f"    {cell or 'HA'} {ha_name} (\n"
         v_src += f"        .a ({input_list[0]}),\n"
         v_src += f"        .cin({input_list[1]}),\n"
         v_src += f"        .sum({sum_name}),\n"
@@ -1528,7 +1530,10 @@ class CompressorTree(ABC):
         file_path: str = None,
         assignment: List[List[List[Tuple]]] = None,
         prefix_adder: str = None,
+        cell_policy: Callable = None,
     ):
+        # cell_policy(s, c, t, idx) -> 该压缩器槽要实例化的 cell 名 (None=精确 FA/HA)。
+        # 用于近似压缩器替换；不传则与原行为完全一致。
         column_num = len(self.pp)
 
         comment = ""
@@ -1580,7 +1585,8 @@ class CompressorTree(ABC):
                     v_src += self.declare_wire(sum_name)
                     v_src += self.declare_wire(carry_name)
 
-                    v_src += declare_ct(ct_name, input_wires, sum_name, carry_name)
+                    cell = cell_policy(s, c, t, idx) if cell_policy is not None else None
+                    v_src += declare_ct(ct_name, input_wires, sum_name, carry_name, cell=cell)
 
                     output_wire_list[column_index].appendleft(sum_name)
                     if column_index + 1 < column_num:

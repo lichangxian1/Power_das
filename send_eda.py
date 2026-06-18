@@ -8,6 +8,15 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from run_power_sweep import evaluate_single_routing
 
 
+def _approx_eval():
+    """近似乘法器评测模式：开启后不再因 logic_failed 判废，照常返回 PPA。
+
+    近似设计「故意」不等于 a*b，误差由 Python 精确算（见 Appr_Comp/approx_mul.py），
+    EDA 这边只取 area/delay/power。默认关闭 -> 精确流程行为完全不变。
+    """
+    return str(os.environ.get("APPROX_EVAL", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _empty_full_result():
     return {
         "area": float('inf'),
@@ -48,7 +57,7 @@ def evaluate_single_design(verilog_file_path, target_delay, bit_width=16):
     )
 
     if result.get("success"):
-        if result.get("logic_failed"):
+        if result.get("logic_failed") and not _approx_eval():
             print(f"⚠️ [ID: {dummy_idx:04d}] 综合通过，但逻辑测试 FAILED！(废弃)")
             return float('inf'), float('inf'), float('inf')
 
@@ -91,7 +100,7 @@ def _evaluate_single_design_full(verilog_file_path, target_delay, bit_width=16):
         idx=dummy_idx, verilog_content=verilog_content,
         bit_width=bit_width, target_delay=target_delay,
     )
-    if result.get("success") and not result.get("logic_failed"):
+    if result.get("success") and (not result.get("logic_failed") or _approx_eval()):
         return {
             "area":  result.get("area",  float('inf')),
             "delay": abs(result.get("delay", float('inf'))),

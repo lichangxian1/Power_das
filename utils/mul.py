@@ -224,8 +224,12 @@ class Mul:
         router=None,
         assignment=None,
         prefix_adder=None,
+        cell_policy=None,
+        extra_modules_src="",
         **kwargs,
     ):
+        # cell_policy(s,c,t,idx)->近似 cell 名 (None=精确)，仅 fused-assignment 路径支持；
+        # extra_modules_src 追加近似压缩器 module 定义（端口须同 FA/HA）。
         verilog_src = ""
         verilog_src += f"module MUL(\n"
         verilog_src += f"    input wire clk,\n"
@@ -256,7 +260,8 @@ class Mul:
                 )
             else:
                 verilog_src += self.ct.emit_verilog_fused_assignment(
-                    assignment=assignment, prefix_adder=prefix_adder
+                    assignment=assignment, prefix_adder=prefix_adder,
+                    cell_policy=cell_policy,
                 )
         else:
             verilog_src += self.ct.emit_verilog(
@@ -271,6 +276,7 @@ class Mul:
         verilog_src += HA_verilog_src
         verilog_src += FA_no_carry_verilog_src
         verilog_src += HA_no_carry_verilog_src
+        verilog_src += extra_modules_src
 
         if rtl_path is not None:
             os.makedirs(os.path.dirname(rtl_path), exist_ok=True)

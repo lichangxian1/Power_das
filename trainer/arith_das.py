@@ -1,4 +1,5 @@
 import os
+import sys
 from typing import Dict, List, Tuple, Set, Any, Tuple, Optional, Callable
 import random
 import copy
@@ -181,6 +182,9 @@ class MultiChannelResGCN(nn.Module):
             self.blocks.append(block)
             in_dim = out_dim
 
+        # 主干输出维度（最后一个 block 的 out_dim），近似类型头会挂在这上面
+        self.embedding_dim = in_dim
+
         self.fc_a = nn.Linear(in_dim, output_dim)
         self.fc_b = nn.Linear(in_dim, output_dim)
         self.fc_c = nn.Linear(in_dim, output_dim)
@@ -188,17 +192,25 @@ class MultiChannelResGCN(nn.Module):
         self.fc_sum = nn.Linear(in_dim, output_dim)
         self.fc_carry = nn.Linear(in_dim, output_dim)
 
-    def forward(
-        self, x, edge_index_a, edge_index_b, edge_index_c
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def embed(self, x, edge_index_a, edge_index_b, edge_index_c) -> torch.Tensor:
+        """跑完主干 block，返回逐节点嵌入（不含 5 个投影头）。"""
         for block in self.blocks:
             x = block(x, edge_index_a, edge_index_b, edge_index_c)
+        return x
+
+    def forward(
+        self, x, edge_index_a, edge_index_b, edge_index_c, return_embedding=False
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # return_embedding 默认 False -> 返回值与改前完全一致（零回归）
+        x = self.embed(x, edge_index_a, edge_index_b, edge_index_c)
         out_a = self.fc_a(x)
         out_b = self.fc_b(x)
         out_c = self.fc_c(x)
 
         out_sum = self.fc_sum(x)
         out_carry = self.fc_carry(x)
+        if return_embedding:
+            return out_a, out_b, out_c, out_sum, out_carry, x
         return out_a, out_b, out_c, out_sum, out_carry
 
 
@@ -473,6 +485,20 @@ class CompressorRouting:
         power_source=None,
         gomil_path=None,
         synth="openroad",
+        # ===== 阶段3 Phase B：近似压缩器类型搜索（全部默认关，关时行为不变）=====
+        use_approx_types=False,
+        approx_lib_path="Appr_Comp/selected_compressors.json",
+        approx_library_path="Appr_Comp/library.json",
+        approx_max_col=6,
+        # 误差 reward（约束式 A）。med/bias 用 LSB 绝对单位（跨位宽稳定、梯度 O(1)）；
+        # NMED=med/maxprod 仅用于上报。budget/weight 都以 LSB 计。
+        med_budget=None,
+        med_violation_weight=0.1,
+        bias_weight=0.0,
+        # 可微误差 surrogate（D2 开关）
+        use_error_loss=False,
+        error_loss_weight=0.0,
+        bias_loss_weight=0.0,
         **kwargs,
     ):
         self.bit_width = bit_width
@@ -556,8 +582,54 @@ class CompressorRouting:
         self.gcn = MultiChannelResGCN(**gcn_kwargs)
         self.gcn.to(device)
 
+        # ===== Phase B：近似类型搜索状态 =====
+        self.use_approx_types = use_approx_types
+        self.approx_max_col = approx_max_col
+        self.med_budget = med_budget
+        self.med_violation_weight = med_violation_weight
+        self.bias_weight = bias_weight
+        self.use_error_loss = use_error_loss
+        self.error_loss_weight = error_loss_weight
+        self.bias_loss_weight = bias_loss_weight
+        self.type_table_32 = None
+        self.type_table_22 = None
+        self.type_head_32 = None
+        self.type_head_22 = None
+        self.approx_module_src_by_name = {}
+        self._node_emb = None  # get_Z_mat 设置：逐节点嵌入（类型头 + ppo 复用）
+        if self.use_approx_types:
+            self._load_approx_types(approx_lib_path, approx_library_path)
+            self.type_head_32 = nn.Linear(
+                self.gcn.embedding_dim, len(self.type_table_32)
+            ).to(device)
+            self.type_head_22 = nn.Linear(
+                self.gcn.embedding_dim, len(self.type_table_22)
+            ).to(device)
+            self._bias32 = torch.tensor(
+                [e["bias"] for e in self.type_table_32], device=device
+            )
+            self._wae32 = torch.tensor(
+                [e["wae"] for e in self.type_table_32], device=device
+            )
+            self._bias22 = torch.tensor(
+                [e["bias"] for e in self.type_table_22], device=device
+            )
+            self._wae22 = torch.tensor(
+                [e["wae"] for e in self.type_table_22], device=device
+            )
+            logging.info(
+                "[approx] type heads on: T32=%d T22=%d, max_col=%d, "
+                "med_budget(LSB)=%s, use_error_loss=%s",
+                len(self.type_table_32), len(self.type_table_22),
+                self.approx_max_col, self.med_budget, self.use_error_loss,
+            )
+
+        opt_params = list(self.gcn.parameters())
+        if self.use_approx_types:
+            opt_params += list(self.type_head_32.parameters())
+            opt_params += list(self.type_head_22.parameters())
         self.optim: optim.Optimizer = getattr(optim, optim_name)(
-            self.gcn.parameters(), **optim_kwargs
+            opt_params, **optim_kwargs
         )
         self.scheduler: optim.lr_scheduler.LRScheduler = getattr(
             optim.lr_scheduler, scheduler_name
@@ -573,6 +645,7 @@ class CompressorRouting:
             "connection": None,
             "assignment": None,
             "ct": None,
+            "cell_types": None,  # Phase B：最优设计的每槽 cell 类型，导出时复原近似 cell
         }
 
         self.total_epoch_num = 0
@@ -585,6 +658,132 @@ class CompressorRouting:
             self.pool = None
 
         self._start_reset()
+
+    # ===================== Phase B：近似类型搜索辅助 =====================
+    _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _resolve_path(self, p):
+        """相对路径按仓库根解析（pipeline 会 chdir 到 output 目录）。"""
+        return p if os.path.isabs(p) else os.path.join(self._REPO_ROOT, p)
+
+    def _load_approx_types(self, sel_path, lib_path):
+        """从 selected_compressors.json + library.json 构建类型表（index 0 = exact）。"""
+        import itertools
+
+        sel = json.load(open(self._resolve_path(sel_path)))["selected"]
+        lib = json.load(open(self._resolve_path(lib_path)))["cells"]
+        order32 = [
+            "comp32_exact", "comp32_apx_pos_1", "comp32_apx_pos_2", "comp32_apx_pos_3",
+            "comp32_apx_neg_1", "comp32_apx_neg_2", "comp32_apx_neg_3",
+        ]
+        order22 = [
+            "comp22_exact", "comp22_apx_pos_1", "comp22_apx_pos_2",
+            "comp22_apx_neg_1", "comp22_apx_neg_2",
+        ]
+        self.type_table_32 = [dict(sel[k]) for k in order32 if k in sel]
+        self.type_table_22 = [dict(sel[k]) for k in order22 if k in sel]
+        assert self.type_table_32[0]["group"] == "exact", "T32[0] 必须是 exact"
+        assert self.type_table_22[0]["group"] == "exact", "T22[0] 必须是 exact"
+
+        # 预生成每个近似 cell 的可综合 SOP module（LUT 取自 library.json）
+        APPR = os.path.join(self._REPO_ROOT, "Appr_Comp")
+        if APPR not in sys.path:
+            sys.path.insert(0, APPR)
+        from gen_verilog import emit_module
+
+        pat3 = ["".join(p) for p in itertools.product("01", repeat=3)]
+        pat2 = ["".join(p) for p in itertools.product("01", repeat=2)]
+        for entry in self.type_table_32 + self.type_table_22:
+            name = entry["name"]
+            if entry["group"] == "exact":
+                continue  # exact 用内置 FA/HA，无需追加 module
+            cell = lib[name]
+            if entry["type"] == "32":
+                src = emit_module(name, ["a", "b", "cin"], pat3,
+                                  cell["sum_lut"], cell["carry_lut"],
+                                  f"{name} bias={entry['bias']:+.3f}")
+            else:
+                src = emit_module(name, ["a", "cin"], pat2,
+                                  cell["sum_lut"], cell["carry_lut"],
+                                  f"{name} bias={entry['bias']:+.3f}")
+            self.approx_module_src_by_name[name] = src
+
+    def sample_cell_types(self):
+        """对每个压缩器节点采样 cell 类型。返回 (cell_map, type_choices, type_log_prob)。
+
+        cell_map: {node_idx -> module名}（仅非 exact）；type_choices: {node_idx -> (t,k)}。
+        col >= approx_max_col 的节点强制 exact。需 self._node_emb（get_Z_mat 已设）。
+        """
+        cell_map, type_choices = {}, {}
+        total_log_prob = 0.0
+        if not self.use_approx_types:
+            return cell_map, type_choices, total_log_prob
+        emb = self._node_emb
+        for node_idx, info in enumerate(self.comp_graph.vertex_list):
+            _, c, t, _ = info
+            if t == 0:
+                head, table = self.type_head_32, self.type_table_32
+            elif t == 1:
+                head, table = self.type_head_22, self.type_table_22
+            else:
+                continue
+            logits = self._masked_type_logits(head(emb[node_idx]), c)
+            dist = torch.distributions.Categorical(logits=logits)
+            sample = dist.sample()
+            total_log_prob += dist.log_prob(sample).item()
+            k = sample.item()
+            type_choices[node_idx] = (t, k)
+            if k != 0:
+                cell_map[node_idx] = table[k]["name"]
+        return cell_map, type_choices, total_log_prob
+
+    def _approx_modules_src(self, cell_map):
+        if not cell_map:
+            return ""
+        used = sorted(set(cell_map.values()))
+        body = "".join(self.approx_module_src_by_name[n] for n in used)
+        return "\n// ===== approximate compressor cells =====\n" + body
+
+    def _cell_map_from_types(self, cell_types):
+        """从 {node_idx:(t,k)} 复原 {node_idx:module名}（k=0/exact 不收）。
+        要求 comp_graph 与采样时同序（同一 assignment 重建即一致）。"""
+        cell_map = {}
+        for node_idx, tk in (cell_types or {}).items():
+            t, k = tk
+            if k != 0:
+                table = self.type_table_32 if t == 0 else self.type_table_22
+                cell_map[int(node_idx)] = table[k]["name"]
+        return cell_map
+
+    def _masked_type_logits(self, logits, col):
+        """col >= approx_max_col 时只留 exact(index 0)，其余置 -1e9。
+        用 masked_fill（非 in-place，autograd 安全）。"""
+        if col >= self.approx_max_col:
+            mask = torch.ones_like(logits, dtype=torch.bool)
+            mask[0] = False
+            logits = logits.masked_fill(mask, -1e9)
+        return logits
+
+    def _analytic_error(self, type_choices):
+        """从采样类型闭式估计 (med_lsb, abs_bias_lsb, nmed)。
+
+        med_lsb = Σ wae·2^col   —— MED 的保守上界（输出 LSB 绝对单位，跨位宽稳定）
+        abs_bias_lsb = |Σ bias·2^col|  —— 带符号误差的绝对值（抓正负抵消）
+        nmed = med_lsb / maxprod  —— 标准 NMED，仅用于上报
+        bias/wae 为 P=1/4 一阶估计。"""
+        bias_total = 0.0
+        wae_total = 0.0
+        for node_idx, (t, k) in type_choices.items():
+            if k == 0:
+                continue
+            table = self.type_table_32 if t == 0 else self.type_table_22
+            entry = table[k]
+            col = self.comp_graph.vertex_list[node_idx][1]
+            w = float(1 << col)
+            bias_total += entry["bias"] * w
+            wae_total += entry["wae"] * w
+        maxprod = float((2 ** self.bit_width - 1) ** 2)
+        return wae_total, abs(bias_total), wae_total / maxprod
 
     def get_full_target_delay_result(self):
         build_dir = self.build_dir + "_full_ppa"
@@ -604,8 +803,16 @@ class CompressorRouting:
         ct = CompressorTree(self.initial_pp, self.state["ct32"], self.state["ct22"])
         mul = Mul(self.bit_width, self.encode_type, ct)
 
-        assignment = self.emit_assignment(self.found_best_info["connection"])
-        mul.emit_verilog(rtl_path, assignment=assignment)
+        # Phase B：用最优设计的近似 cell 评 full-target-delay PPA（否则退化成精确）
+        cell_map = self._cell_map_from_types(self.found_best_info.get("cell_types"))
+        assignment = self.emit_assignment(
+            self.found_best_info["connection"], cell_map=cell_map
+        )
+        mul.emit_verilog(
+            rtl_path,
+            assignment=assignment,
+            extra_modules_src=self._approx_modules_src(cell_map),
+        )
         simulated_result = mul.simulate(
             build_dir,
             rtl_path,
@@ -633,6 +840,15 @@ class CompressorRouting:
         os.makedirs(save_dir, exist_ok=True)
         gcn_save_path = os.path.join(save_dir, "gcn.pth")
         torch.save(self.gcn.state_dict(), gcn_save_path)
+        # Phase B：类型头不在 gcn 内，单独存，否则 resume/重载会丢失已学的类型策略
+        if self.use_approx_types:
+            torch.save(
+                {
+                    "type_head_32": self.type_head_32.state_dict(),
+                    "type_head_22": self.type_head_22.state_dict(),
+                },
+                os.path.join(save_dir, "type_heads.pth"),
+            )
         with open(os.path.join(save_dir, "best_info.json"), "w") as f:
             json.dump(
                 self.found_best_info, f, indent=4, default=convert_to_serializable
@@ -886,6 +1102,32 @@ class CompressorRouting:
         time_end = time.time()
         return l
 
+    def get_error_loss(self) -> torch.Tensor:
+        """D2（可微误差 surrogate，由 use_error_loss 开关）：每个压缩器节点用 softmax
+        类型分布算期望 bias/wae，按列权重 2^col 求和（LSB 绝对单位），返回
+        bias_loss_weight·|Σ bias·2^col| + error_loss_weight·relu(Σ wae·2^col − med_budget)。
+        用 LSB 单位（非 /maxprod）保证梯度 O(1)、不随位宽消失。需 self._node_emb（含梯度）。"""
+        emb = self._node_emb
+        bias_total = torch.zeros((), device=self.device)
+        med_total = torch.zeros((), device=self.device)
+        for node_idx, info in enumerate(self.comp_graph.vertex_list):
+            _, c, t, _ = info
+            if t == 0:
+                head, biases, waes = self.type_head_32, self._bias32, self._wae32
+            elif t == 1:
+                head, biases, waes = self.type_head_22, self._bias22, self._wae22
+            else:
+                continue
+            logits = self._masked_type_logits(head(emb[node_idx]), c)
+            p = torch.softmax(logits, dim=0)
+            w = float(1 << c)
+            bias_total = bias_total + (p @ biases) * w
+            med_total = med_total + (p @ waes) * w
+        l = self.bias_loss_weight * bias_total.abs()
+        budget = 0.0 if self.med_budget is None else self.med_budget
+        l = l + self.error_loss_weight * torch.relu(med_total - budget)
+        return l
+
     def get_cache(
         self,
         Z_mat_dict: Dict[Tuple, torch.Tensor],
@@ -1084,11 +1326,12 @@ class CompressorRouting:
             v_src += f"    assign {sum_wire} = {instance_name};\n"
         return v_src, wire_set
 
-    def _declare_ct32(self, node_idx, wire_set: Set, node_wires: Dict):
+    def _declare_ct32(self, node_idx, wire_set: Set, node_wires: Dict, cell_map=None):
         stage_idx, col_idx, type_idx, idx = self.comp_graph.vertex_list[node_idx]
         assert type_idx == 0
         v_src = ""
         instance_name = f"ct32_{node_idx}"
+        cell = (cell_map or {}).get(node_idx) or "FA"
 
         a_wire = f"from_{node_wires[node_idx]['from']['a']}_to_{node_idx}"
         b_wire = f"from_{node_wires[node_idx]['from']['b']}_to_{node_idx}"
@@ -1106,17 +1349,19 @@ class CompressorRouting:
             v_src += v
         v_src += f"// ct32 node {(stage_idx, col_idx, type_idx, idx)}\n"
         if carry_wire is not None:
-            v_src += f"    FA {instance_name} (.a({a_wire}), .b({b_wire}), .cin({c_wire}), .sum({sum_wire}), .cout({carry_wire}));\n"
+            v_src += f"    {cell} {instance_name} (.a({a_wire}), .b({b_wire}), .cin({c_wire}), .sum({sum_wire}), .cout({carry_wire}));\n"
         else:
+            # 末列无 carry：近似区不会到此（approx_max_col 远小于列数），仍用精确 FA
             v_src += f"    FA_no_carry {instance_name} (.a({a_wire}), .b({b_wire}), .cin({c_wire}), .sum({sum_wire}));\n"
 
         return v_src, wire_set
 
-    def _declare_ct22(self, node_idx, wire_set: Set, node_wires: Dict):
+    def _declare_ct22(self, node_idx, wire_set: Set, node_wires: Dict, cell_map=None):
         stage_idx, col_idx, type_idx, idx = self.comp_graph.vertex_list[node_idx]
         assert type_idx == 1
         v_src = ""
         instance_name = f"ct22_{node_idx}"
+        cell = (cell_map or {}).get(node_idx) or "HA"
 
         a_wire = f"from_{node_wires[node_idx]['from']['a']}_to_{node_idx}"
         b_wire = f"from_{node_wires[node_idx]['from']['b']}_to_{node_idx}"
@@ -1131,12 +1376,13 @@ class CompressorRouting:
             v_src += v
         v_src += f"// ct22 node {(stage_idx, col_idx, type_idx, idx)}\n"
         if carry_wire is not None:
-            v_src += f"    HA {instance_name} (.a({a_wire}), .cin({b_wire}), .sum({sum_wire}), .cout({carry_wire}));\n"
+            v_src += f"    {cell} {instance_name} (.a({a_wire}), .cin({b_wire}), .sum({sum_wire}), .cout({carry_wire}));\n"
         else:
+            # 末列无 carry：近似区不会到此，仍用精确 HA
             v_src += f"    HA_no_carry {instance_name} (.a({a_wire}), .cin({b_wire}), .sum({sum_wire}));\n"
         return v_src, wire_set
 
-    def emit_assignment(self, samples_connection):
+    def emit_assignment(self, samples_connection, cell_map=None):
         node_wires = {}
         INPUT_PORTS = ["a", "b", "c"]
 
@@ -1176,9 +1422,9 @@ class CompressorRouting:
             elif type_idx == 3:
                 v, wire_set = self._declare_visual(node_idx, wire_set, node_wires)
             elif type_idx == 0:
-                v, wire_set = self._declare_ct32(node_idx, wire_set, node_wires)
+                v, wire_set = self._declare_ct32(node_idx, wire_set, node_wires, cell_map)
             elif type_idx == 1:
-                v, wire_set = self._declare_ct22(node_idx, wire_set, node_wires)
+                v, wire_set = self._declare_ct22(node_idx, wire_set, node_wires, cell_map)
             else:
                 raise ValueError("Invalid node type")
             v_src += v
@@ -1204,9 +1450,14 @@ class CompressorRouting:
         edge_index_c = edge_index_c.to(self.device)
         time_end = time.time()
         time_start = time.time()
-        out_a, out_b, out_c, out_sum, out_carry = self.gcn.forward(
-            x, edge_index_a, edge_index_b, edge_index_c
-        )
+        if self.use_approx_types:
+            out_a, out_b, out_c, out_sum, out_carry, self._node_emb = self.gcn.forward(
+                x, edge_index_a, edge_index_b, edge_index_c, return_embedding=True
+            )
+        else:
+            out_a, out_b, out_c, out_sum, out_carry = self.gcn.forward(
+                x, edge_index_a, edge_index_b, edge_index_c
+            )
         time_end = time.time()
         stage_num, col_num = self.comp_graph.stage_num, self.comp_graph.col_num
         Z_mat_dict = {}
@@ -1303,19 +1554,27 @@ class CompressorRouting:
                 samples_connection, overall_log_prob = self.sample_from_logits(
                     Z_mat_dict
                 )
-                assignment = self.emit_assignment(samples_connection)
+                # Phase B：采样每个压缩器槽的 cell 类型（关时返回空，行为不变）
+                cell_map, type_choices, type_log_prob = self.sample_cell_types()
+                overall_log_prob += type_log_prob
+                assignment = self.emit_assignment(samples_connection, cell_map=cell_map)
 
                 ct = CompressorTree(
                     self.initial_pp, self.state["ct32"], self.state["ct22"]
                 )
                 mul = Mul(self.bit_width, self.encode_type, ct)
                 rtl_path = os.path.join(self.build_dir, f"MUL-{sample_idx}.v")
-                mul.emit_verilog(rtl_path, assignment=assignment)
+                mul.emit_verilog(
+                    rtl_path,
+                    assignment=assignment,
+                    extra_modules_src=self._approx_modules_src(cell_map),
+                )
                 sample_info.append(
                     {
                         "rtl_path": rtl_path,
                         "connection": samples_connection,
                         "overall_log_prob": overall_log_prob,
+                        "cell_types": type_choices,
                     }
                 )
 
@@ -1362,7 +1621,9 @@ class CompressorRouting:
                     sample_info[i]["connection"],
                 )
                 sample_info[i]["result"] = result_list
-                sample_info[i]["objective"] = self.get_objective(result_list)
+                sample_info[i]["objective"] = self.get_objective(
+                    result_list, cell_types=sample_info[i].get("cell_types")
+                )
         return sample_info
 
     def _summarize_result(self, simulated_result):
@@ -1405,8 +1666,17 @@ class CompressorRouting:
             "power_source": self.power_source,
         }
 
-    def get_objective(self, simulated_result):
+    def get_objective(self, simulated_result, cell_types=None):
         summary = self._summarize_result(simulated_result)
+
+        # Phase B：近似误差成本（约束式 A，LSB 单位）。关时 / 无 cell_types 时为 0，不影响。
+        err_term = 0.0
+        if self.use_approx_types and cell_types:
+            med, abs_bias, _nmed = self._analytic_error(cell_types)
+            if self.med_budget is not None:
+                err_term += self.med_violation_weight * max(0.0, med - self.med_budget)
+            err_term += self.bias_weight * abs_bias
+
         if self.area_budget is not None:
             objective = summary["power"] / self.power_scale
             objective += (
@@ -1420,14 +1690,14 @@ class CompressorRouting:
                     * summary["delay_violation"]
                     / self.delay_scale
                 )
-            return objective
+            return objective + err_term
 
         objective = (
             self.delay_weight * summary["delay"] / self.delay_scale
             + self.area_weight * summary["area"] / self.area_scale
             + self.power_weight * summary["power"] / self.power_scale
         )
-        return objective
+        return objective + err_term
 
     def _candidate_rank(self, sample_info):
         result = sample_info.get("result", sample_info.get("simulated_result"))
@@ -1460,17 +1730,28 @@ class CompressorRouting:
             self.state = copy.deepcopy(self.found_best_info["ct"])
             self.assignment = copy.deepcopy(self.found_best_info["assignment"])
             self.comp_graph = CompressorGraph(self.initial_pp, self.assignment)
-            routing_assignment = self.emit_assignment(self.found_best_info["connection"])
+            # Phase B：从最优设计的 cell_types 复原近似 cell（comp_graph 同序，node_idx 一致）
+            cell_types = self.found_best_info.get("cell_types") or {}
+            cell_map = self._cell_map_from_types(cell_types)
+            routing_assignment = self.emit_assignment(
+                self.found_best_info["connection"], cell_map=cell_map
+            )
             ct = CompressorTree(self.initial_pp, self.state["ct32"], self.state["ct22"])
             mul = Mul(self.bit_width, self.encode_type, ct)
             rtl_path = os.path.join(export_dir, "MUL.v")
-            mul.emit_verilog(rtl_path, assignment=routing_assignment)
+            mul.emit_verilog(
+                rtl_path,
+                assignment=routing_assignment,
+                extra_modules_src=self._approx_modules_src(cell_map),
+            )
 
             best_info = {
                 **self._best_info_metadata(),
                 "connection": self.found_best_info["connection"],
                 "ct": self.found_best_info["ct"],
                 "assignment": self.found_best_info["assignment"],
+                "cell_types": cell_types,
+                "approx_cells": {str(k): v for k, v in cell_map.items()},
                 "routing_assignment": routing_assignment,
                 "rtl_path": rtl_path,
                 "simulated_result": self.found_best_info["simulated_result"],
@@ -1533,6 +1814,19 @@ class CompressorRouting:
                         )
                         new_log_prob += log_prob
                         M[:, sample["sample"]] = False
+
+            # Phase B：重算类型头 log_prob，与采样口径一致（同 approx_max_col 掩码）
+            if self.use_approx_types and sample_info.get("cell_types"):
+                emb = self._node_emb
+                for node_idx, (t, k) in sample_info["cell_types"].items():
+                    head = self.type_head_32 if t == 0 else self.type_head_22
+                    c = self.comp_graph.vertex_list[node_idx][1]
+                    logits = self._masked_type_logits(head(emb[node_idx]), c)
+                    dist = torch.distributions.Categorical(logits=logits)
+                    new_log_prob = new_log_prob + dist.log_prob(
+                        torch.tensor([k], device=self.device)
+                    )
+
             A = -sample_info["objective"]
             ratio = torch.exp(new_log_prob - old_log_prob)
             loss_1 = A * ratio
@@ -1555,6 +1849,9 @@ class CompressorRouting:
                 self.found_best_info["ct"] = copy.deepcopy(self.state)
                 self.found_best_info["assignment"] = copy.deepcopy(self.assignment)
                 self.found_best_info["simulated_result"] = sample_info["result"]
+                self.found_best_info["cell_types"] = copy.deepcopy(
+                    sample_info.get("cell_types")
+                )
                 self.found_best_info.update(self._best_info_metadata())
 
     def log_episode(self, episode_idx, info):
@@ -1666,6 +1963,11 @@ class CompressorRouting:
                 l_delay = self.get_delay_loss(Z_mat_dict)
                 l += self.delay_loss_weight * l_delay
                 loss_info["l_delay"] = l_delay.item()
+            if self.use_error_loss and self.use_approx_types:
+                # D2 可微误差 surrogate（权重已在 get_error_loss 内部乘好）
+                l_error = self.get_error_loss()
+                l += l_error
+                loss_info["l_error"] = l_error.item()
 
             self.optim.zero_grad()
             l.backward()

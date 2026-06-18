@@ -206,8 +206,11 @@ R = −wA·Â − wD·D̂ − wP·P̂ − λ_abs·NMED − λ_bias·|bias|
   负误差大幅增多(comp32 N 176→828)更利于正负抵消。教训：扩样表征 ~6.4/min 空载、2124 cell ~5.5h，仍 contention/license bound，须先腾空远端。
 - [x] 阶段2：P/N/Z 分组 + Pareto front + 代表选取 —— `pareto_select.py`，12 代表 + 2 张图，记录 bias 配对（已在 2820 全库上重跑）
 - [x] 阶段2：12 个选中 cell 补 6-arc 延迟（`char_driver.py --arcs --selected`）→ `delay_constants.py`（含 UFO_MAC_CONSTANT 的 FA/HA + APX_COMPRESSOR_DELAY），并 merge 回 `selected_compressors.json`
-- [ ] 阶段3：netlist 追加近似模块 + `declare_fa/ha` 加 `cell=` 参数
-- [ ] 阶段3：拆 `logic_failed` 判废 + 近似模式 testbench（**拦路石**）
-- [ ] 阶段3 Phase A：手工低位替换 baseline
-- [ ] 阶段4：误差指标 testbench（ER/MED/NMED/WCE/bias）+ 三件套对比
-- [ ] 阶段3 Phase B：类型头 + 闭式误差 reward（`λ_abs·NMED + λ_bias·|bias|` / 约束式）
+- [x] 阶段3：`declare_fa/ha` 加 `cell=`（compressor_tree.py）+ `emit_verilog_fused_assignment` 加 `cell_policy` + `Mul.emit_verilog` 加 `cell_policy/extra_modules_src`（mul.py）。**全增量、exact 路径字节级不变（已验证 35FA+7HA+0近似）**。
+- [x] 阶段3 Phase A：手工低位替换 baseline `Appr_Comp/approx_mul.py` + **EDA-free 位精确验证器**：
+  穷举 8-bit 验证 exact 树 out==a*b(65536/65536) 与恒等式 out-a*b==Σe·2^col(65536/65536)；
+  实测 ER/MED/NMED/WCE/mean-bias；正/负 cell 翻转净偏置(+2.875/−2.75)，演示正负抵消杠杆。
+- [x] 阶段3 拦路石：`send_eda.py` 加 `APPROX_EVAL` 环境开关（默认关→精确流程不变）；开启后 `logic_failed` 不再判废、照常返回 PPA。
+  关键发现：判废纯属本地——`run_power_sweep` 解析到 power 即返回含 PPA 的 success_res；远端 TB(`mult_TB2.v`)只打印 `FAILED:` 不 abort（`$finish` 在循环后）且已容忍 MSB 截断，**无需改远端**。
+- [x] 阶段4 误差指标：`approx_mul.py` 已用 Python 位精确穷举给出 ER/MED/NMED/WCE/mean-bias（值域，比 VCS 更准更快）。三件套 PPA 对比已被 `APPROX_EVAL` 解锁。
+- [ ] 阶段3 Phase B：CompressorGraph 加「类型头」+ 闭式误差 reward（`λ_abs·NMED + λ_bias·|bias|` / 约束式）——**唯一剩余大块，改 arith_das 搜索，建议专门一轮**。
