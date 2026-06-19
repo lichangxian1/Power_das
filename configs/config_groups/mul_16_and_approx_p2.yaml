@@ -1,0 +1,91 @@
+experiment:
+  kwargs:
+    seed: 42
+    log_level: INFO
+    experiment_prefix: mul_16_and_approx_p2_routing_gene
+    device: &device cuda:0
+    log_dir: logs
+    build_dir: build
+    rtl_file: MUL.v
+    n_processing: 12
+    n_full_target_delay_processing: 12
+    bit_width: 16
+    encode_type: and
+    ct_arch: dadda
+
+trainer:
+  name: CompressorRoutingGeneArch
+  kwargs:
+    # loss params
+    use_ppo_loss: true
+    ppo_loss_weight: 1.0
+    use_delay_loss: false
+    delay_loss_weight: 0.1
+    use_glitch_loss: false
+    glitch_loss_weight: 0.1
+    lse_gamma_val: 0.01
+    use_rule_loss: true
+    rule_loss_weight: 1e-2
+    rule_loss_wight_incr: 1e-3
+    use_disc_loss: true
+    disc_loss_weight: 1e-2
+    disc_loss_weight_incr: 1e-3
+    # training scale —— 消融用短跑，趋势 ~200ep 即可见
+    num_episodes: 300
+    num_samples: 2
+    num_epochs: 1 # ppo epochs
+    save_freq: 100
+    log_freq: 1
+    # learning params
+    optim_name: Adam
+    optim_kwargs:
+      lr: 1e-4
+    scheduler_name: CosineAnnealingLR
+    scheduler_kwargs:
+      T_max: 300
+      eta_min: 1e-5
+    clip_range: 0.2
+    max_grad_norm: 0.5
+    # model params
+    gcn_kwargs:
+      input_dim: 7
+      hidden_dims_list: [[512, 512], [256, 256], [128, 128]]
+      output_dim: 64
+      activation: tanh
+      use_layernorm: true
+      dropout: 0.0
+    # eda params
+    delay_weight: 2.0
+    area_weight: 2.0
+    power_weight: 1.0
+    delay_scale: 1.394475
+    area_scale: 2026.5
+    power_scale: 0.0035775
+    # power source: 近似搜索用真实 EDA（proxy 用 FA/HA cell 训练，不认近似 cell）
+    use_power_proxy: false
+    power_source: eda
+    # area_violation/delay_violation 仅在设了 area_budget/fixed_target_delay 时生效
+    area_violation_weight: 1.0
+    delay_violation_weight: 1.0
+    reference_point: [2.0, 3000]
+    pareto_target: ["delay", "area"]
+    pool_size: 20
+    gomil_path: null
+
+    # ===== 阶段3 Phase B：近似压缩器类型搜索 =====
+    use_approx_types: true
+    approx_lib_path: Appr_Comp/selected_compressors.json
+    approx_library_path: Appr_Comp/library.json
+    approx_max_col: 16
+    med_budget: 4096.0
+    # ===== 点2（误差项归一）：err_term = w·max(0,med-budget)/error_scale + w·|bias|/error_scale =====
+    # error_scale≈典型 MED 量级(LSB)，使 err_term 落到和 PPA(~2.5) 同量级；权重抬到 O(1)。
+    error_scale: 1.0e5
+    med_violation_weight: 1.0          # 0.1→1.0（配合 /error_scale）
+    bias_weight: 0.5                   # 0.05→0.5
+    # 可微误差 surrogate（D2），同样 /error_scale
+    use_error_loss: true
+    error_loss_weight: 1.0             # 0.1→1.0
+    bias_loss_weight: 0.5             # 0.05→0.5
+    # ===== 点1（advantage 归一）：run A 关闭 =====
+    normalize_advantage: false

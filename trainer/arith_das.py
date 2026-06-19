@@ -495,10 +495,15 @@ class CompressorRouting:
         med_budget=None,
         med_violation_weight=0.1,
         bias_weight=0.0,
+        # 误差项归一尺度（点2）：把 med/bias 的 LSB 绝对值除以 error_scale，使 err_term
+        # 落到和 PPA(~O(1)) 同量级。默认 1.0 = 不归一（旧行为，向后兼容）。
+        error_scale=1.0,
         # 可微误差 surrogate（D2 开关）
         use_error_loss=False,
         error_loss_weight=0.0,
         bias_loss_weight=0.0,
+        # advantage 归一（点1）：A=-(obj-mean)/(std+eps)。默认 False = 旧行为 A=-obj。
+        normalize_advantage=False,
         **kwargs,
     ):
         self.bit_width = bit_width
@@ -588,9 +593,11 @@ class CompressorRouting:
         self.med_budget = med_budget
         self.med_violation_weight = med_violation_weight
         self.bias_weight = bias_weight
+        self.error_scale = error_scale
         self.use_error_loss = use_error_loss
         self.error_loss_weight = error_loss_weight
         self.bias_loss_weight = bias_loss_weight
+        self.normalize_advantage = normalize_advantage
         self.type_table_32 = None
         self.type_table_22 = None
         self.type_head_32 = None
@@ -1123,9 +1130,10 @@ class CompressorRouting:
             w = float(1 << c)
             bias_total = bias_total + (p @ biases) * w
             med_total = med_total + (p @ waes) * w
-        l = self.bias_loss_weight * bias_total.abs()
+        # 点2：与 get_objective 同尺度，除 error_scale 落到 O(1)。
+        l = self.bias_loss_weight * bias_total.abs() / self.error_scale
         budget = 0.0 if self.med_budget is None else self.med_budget
-        l = l + self.error_loss_weight * torch.relu(med_total - budget)
+        l = l + self.error_loss_weight * torch.relu(med_total - budget) / self.error_scale
         return l
 
     def get_cache(
@@ -1673,9 +1681,14 @@ class CompressorRouting:
         err_term = 0.0
         if self.use_approx_types and cell_types:
             med, abs_bias, _nmed = self._analytic_error(cell_types)
+            # 点2：除 error_scale 把 LSB 绝对值压到和 PPA 同量级。
             if self.med_budget is not None:
-                err_term += self.med_violation_weight * max(0.0, med - self.med_budget)
-            err_term += self.bias_weight * abs_bias
+                err_term += (
+                    self.med_violation_weight
+                    * max(0.0, med - self.med_budget)
+                    / self.error_scale
+                )
+            err_term += self.bias_weight * abs_bias / self.error_scale
 
         if self.area_budget is not None:
             objective = summary["power"] / self.power_scale
@@ -1770,6 +1783,15 @@ class CompressorRouting:
         sample_info_list: List[Dict],
     ):
         l = torch.tensor([0.0], device=self.device)
+        # 点1：advantage 归一。把 A 从原始 -obj 改成 -(obj-mean)/(std+eps)，
+        # 减均值给出"比本批平均好/差多少"的相对信号，除标准差把量纲压到 O(1)，
+        # 使学习信号不再被 obj 绝对大小（误差尺度）主导。normalize_advantage=False 时为旧行为。
+        if self.normalize_advantage:
+            _objs = np.array(
+                [si["objective"] for si in sample_info_list], dtype=np.float64
+            )
+            _adv_mean = float(_objs.mean())
+            _adv_std = float(_objs.std()) + 1e-8
         for sample_info in sample_info_list:
             old_log_prob = sample_info["overall_log_prob"]
             new_log_prob = 0.0
@@ -1827,7 +1849,10 @@ class CompressorRouting:
                         torch.tensor([k], device=self.device)
                     )
 
-            A = -sample_info["objective"]
+            if self.normalize_advantage:
+                A = -(sample_info["objective"] - _adv_mean) / _adv_std
+            else:
+                A = -sample_info["objective"]
             ratio = torch.exp(new_log_prob - old_log_prob)
             loss_1 = A * ratio
             loss_2 = A * torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range)
