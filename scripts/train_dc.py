@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""用远端 DC 直出 PPA 训练 ARITH-DAS（PPA 源 = 远端 DC，功耗取 DC report_power，
+不走 VCS/XA）。沿用 unconstrained 加权和目标（含 err_term/bias），但固定单一 DC
+时钟周期（fixed_target_delay, ns）以保证每个样本只跑 1 次 DC。
+
+依赖：远端独立 base 副本 sandbox_base_dcpwr（默认 POWER_MODE=dc）。
+用法（务必带上环境）：
+  source ~/OpenROAD-flow-scripts/env.sh && \
+  /home/lee/anaconda3/envs/arith_das/bin/python scripts/train_dc.py \
+      --config configs/config_groups/mul_16_and_approx_p2p1.yaml \
+      --episodes 2 --samples 2 --med_budget 65536 --target_delay 2.0 \
+      --out outputs/dc_train_smoke
+
+DC 量级远小于 ABC，故 *_scale 默认按 DC 重标定（可 CLI 覆盖）。
+"""
+import argparse
+import copy
+import logging
+import os
+import random
+import sys
+
+import numpy as np
+import torch
+from omegaconf import OmegaConf
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+import trainer  # noqa: E402
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default="configs/config_groups/mul_16_and_approx_p2p1.yaml")
+    p.add_argument("--out", required=True, help="run 目录（含 build/ logs/ best_info.json）")
+    p.add_argument("--episodes", type=int, default=None)
+    p.add_argument("--samples", type=int, default=None)
+    p.add_argument("--n_processing", type=int, default=None)
+    p.add_argument("--med_budget", type=float, default=None)
+    p.add_argument("--target_delay", type=float, default=2.0, help="DC 时钟周期 (ns)")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--device", default=None)
+    # DC 重标定（按烟雾实测：DC-direct area~800µm², delay~1.44ns,
+    # power~10.7mW＝0.0107W（默认 0.5 翻转率，比 XA/SAIF 高约 20×））
+    p.add_argument("--delay_scale", type=float, default=1.44)
+    p.add_argument("--area_scale", type=float, default=800.0)
+    p.add_argument("--power_scale", type=float, default=1.07e-2)
+    p.add_argument("--base_dir_dc", default="/home/lchangxian/sandbox/sandbox_base_dcpwr")
+    args = p.parse_args()
+
+    os.environ.setdefault("EDA_BASE_DIR_DC", args.base_dir_dc)
+
+    cfg = OmegaConf.to_container(OmegaConf.load(args.config), resolve=True)
+    exp_kwargs = cfg["experiment"]["kwargs"]
+    base = cfg["trainer"]["kwargs"]
+
+    tk = copy.deepcopy(base)
+    tk.pop("area_budgets", None)
+    tk.update(copy.deepcopy(exp_kwargs))
+
+    run_dir = os.path.abspath(args.out)
+    os.makedirs(run_dir, exist_ok=True)
+    tk.update(
+        {
+            # ── DC-in-the-loop 核心开关 ──
+            "synth": "dc",
+            "power_source": "eda",
+            "use_power_proxy": False,
+            # unconstrained 加权和目标（含 err_term/bias）：area_budget=None；
+            # 但固定单一 DC 周期，保证每样本只 1 次 DC。
+            "area_budget": None,
+            "fixed_target_delay": float(args.target_delay),
+            # DC 量级重标定
+            "delay_scale": float(args.delay_scale),
+            "area_scale": float(args.area_scale),
+            "power_scale": float(args.power_scale),
+            # IO
+            "log_dir": os.path.join(run_dir, "logs"),
+            "build_dir": os.path.join(run_dir, "build"),
+            "experiment_prefix": "dc_" + str(exp_kwargs.get("experiment_prefix", "mul16")),
+        }
+    )
+    if args.episodes is not None:
+        tk["num_episodes"] = args.episodes
+        tk.setdefault("scheduler_kwargs", {})["T_max"] = args.episodes  # T_max 必须 == episodes
+    if args.samples is not None:
+        tk["num_samples"] = args.samples
+    if args.n_processing is not None:
+        tk["n_processing"] = args.n_processing
+        tk["n_full_target_delay_processing"] = args.n_processing
+    if args.med_budget is not None:
+        tk["med_budget"] = args.med_budget
+    if args.device is not None:
+        tk["device"] = args.device
+    seed = args.seed if args.seed is not None else exp_kwargs.get("seed", 42)
+    tk["seed"] = seed
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(os.path.join(run_dir, "train_dc.log")),
+        ],
+    )
+    logging.info("EDA_BASE_DIR_DC=%s", os.environ["EDA_BASE_DIR_DC"])
+    logging.info(
+        "DC train: synth=dc episodes=%s samples=%s n_proc=%s med_budget=%s td=%sns "
+        "scales(delay/area/power)=%s/%s/%s",
+        tk.get("num_episodes"), tk.get("num_samples"), tk.get("n_processing"),
+        tk.get("med_budget"), tk.get("fixed_target_delay"),
+        tk["delay_scale"], tk["area_scale"], tk["power_scale"],
+    )
+
+    set_seed(seed)
+    trainer_cls = getattr(trainer, cfg["trainer"]["name"])
+    exp = trainer_cls(**tk)
+    exp.run_experiment()
+    rtl = exp.export_best_candidate(run_dir)
+    logging.info("done. best RTL -> %s", rtl)
+
+
+if __name__ == "__main__":
+    main()

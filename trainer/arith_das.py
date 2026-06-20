@@ -795,7 +795,7 @@ class CompressorRouting:
     def get_full_target_delay_result(self):
         build_dir = self.build_dir + "_full_ppa"
         rtl_path = os.path.join(build_dir, "MUL.v")
-        if self.synth == "openroad":
+        if self.synth in ("openroad", "dc"):
             if self.fixed_target_delay is not None:
                 full_target_delay = [self.fixed_target_delay]
             else:
@@ -820,12 +820,25 @@ class CompressorRouting:
             assignment=assignment,
             extra_modules_src=self._approx_modules_src(cell_map),
         )
-        simulated_result = mul.simulate(
-            build_dir,
-            rtl_path,
-            full_target_delay,
-            n_processing=n_full_target_delay_processing,
-        )
+        if self.synth == "dc":
+            # 与训练奖励同源：full-target-delay 诊断也走远端 DC 直出
+            simulated_result = []
+            for td in full_target_delay:
+                one = CompressorRouting._dc_simulate_one(
+                    self.bit_width, rtl_path, build_dir, td, 0
+                )
+                if one is None:
+                    one = mul.simulate(
+                        build_dir, rtl_path, [td], synth="openroad"
+                    )[0]
+                simulated_result.append(one)
+        else:
+            simulated_result = mul.simulate(
+                build_dir,
+                rtl_path,
+                full_target_delay,
+                n_processing=n_full_target_delay_processing,
+            )
         simulated_result = self._apply_power_proxy_to_results(
             simulated_result,
             self.found_best_info["connection"],
@@ -1522,18 +1535,79 @@ class CompressorRouting:
         target_delay_id,
         synth,
     ):
-        mul = Mul(bit_width, encode_type, ct)
-        simulated_result = mul.simulate(
-            build_path,
-            rtl_path,
-            [target_delay],
-            synth=synth,
-        )
+        if synth == "dc":
+            # 远端 DC 直出 PPA（功耗取 DC report_power，不走 VCS/XA）
+            one = CompressorRouting._dc_simulate_one(
+                bit_width, rtl_path, build_path, target_delay, id
+            )
+            if one is not None:
+                simulated_result = [one]
+            else:
+                # 远端 DC 多次重试后仍失败 → 回退本地 ABC，保证训练不停摆
+                logging.warning(
+                    f"[dc] worker {id} remote DC failed, fallback to local ABC: {rtl_path}"
+                )
+                mul = Mul(bit_width, encode_type, ct)
+                simulated_result = mul.simulate(
+                    build_path, rtl_path, [target_delay], synth="openroad"
+                )
+        else:
+            mul = Mul(bit_width, encode_type, ct)
+            simulated_result = mul.simulate(
+                build_path,
+                rtl_path,
+                [target_delay],
+                synth=synth,
+            )
         return {
             "result": simulated_result,
             "id": id,
             "target_delay_id": target_delay_id,
             "target_delay": target_delay,
+        }
+
+    @staticmethod
+    def _dc_simulate_one(bit_width, rtl_path, build_path, target_delay, worker_id):
+        """远端 DC 直出 PPA，返回与本地 simulate_worker 同构的 dict（power 转为 W），
+        失败返回 None。使用专用 base 副本 sandbox_base_dcpwr（默认 POWER_MODE=dc，
+        跳过 v2lvs/SPICE/VCS/XA，area/delay/power 全部取自 DC 综合）。"""
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        import run_power_sweep as rps
+
+        # 指向 DC 直出专用 base 副本；原 sandbox_base 不受影响。
+        rps.EDA_BASE_DIR = os.environ.get(
+            "EDA_BASE_DIR_DC", "/home/lchangxian/sandbox/sandbox_base_dcpwr"
+        )
+        # evaluate_single_routing 在 cwd 下写 build/ 临时文件；切到可写目录避开 build 符号链接坑
+        os.makedirs(build_path, exist_ok=True)
+        try:
+            os.chdir(build_path)
+        except OSError:
+            pass
+        with open(rtl_path) as f:
+            rtl_src = f.read()
+        r = rps.evaluate_single_routing(
+            worker_id, rtl_src, bit_width=bit_width, target_delay=target_delay
+        )
+        if (
+            not r
+            or not r.get("success")
+            or r.get("area") is None
+            or r.get("power_mw") is None
+        ):
+            return None
+        delay = r.get("delay")
+        if delay is None:
+            delay = target_delay
+        # evaluate_single_routing 的 delay 约定为负（关键路径到达时间），取绝对值得正向延时
+        return {
+            "delay": abs(float(delay)),
+            "area": float(r["area"]),
+            "power": float(r["power_mw"]) / 1000.0,  # mW → W，对齐本地 simulate_worker
+            "target_delay": target_delay,
+            "worker_id": worker_id,
         }
 
     def _apply_power_proxy_to_results(self, simulated_result, samples_connection):
@@ -1586,7 +1660,7 @@ class CompressorRouting:
                     }
                 )
 
-            if self.synth == "openroad":
+            if self.synth in ("openroad", "dc"):
                 if self.fixed_target_delay is not None:
                     target_delay_list = [self.fixed_target_delay]
                 else:
