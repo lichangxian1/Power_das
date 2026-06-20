@@ -502,6 +502,12 @@ class CompressorRouting:
         use_error_loss=False,
         error_loss_weight=0.0,
         bias_loss_weight=0.0,
+        # ④ 尾部/WCE 约束（默认关）：wce_bound = Σ maxe·2^col（误差可加上界，LSB），
+        # 控制最坏情况误差、治重尾(RMSE/MAE≫1)。budget/weight 同 med 口径（LSB, /error_scale）。
+        # wce_budget=None 或两个 weight=0 时该项不生效（回归字节级一致）。
+        wce_budget=None,
+        wce_violation_weight=0.0,
+        wce_loss_weight=0.0,
         # advantage 归一（点1）：A=-(obj-mean)/(std+eps)。默认 False = 旧行为 A=-obj。
         normalize_advantage=False,
         **kwargs,
@@ -597,6 +603,10 @@ class CompressorRouting:
         self.use_error_loss = use_error_loss
         self.error_loss_weight = error_loss_weight
         self.bias_loss_weight = bias_loss_weight
+        # ④ 尾部/WCE 约束
+        self.wce_budget = wce_budget
+        self.wce_violation_weight = wce_violation_weight
+        self.wce_loss_weight = wce_loss_weight
         self.normalize_advantage = normalize_advantage
         self.type_table_32 = None
         self.type_table_22 = None
@@ -624,11 +634,19 @@ class CompressorRouting:
             self._wae22 = torch.tensor(
                 [e["wae"] for e in self.type_table_22], device=device
             )
+            # ④ 每 cell 最坏误差 maxe（exact=0），供 WCE 上界 Σ maxe·2^col
+            self._maxe32 = torch.tensor(
+                [e.get("maxe", 0.0) for e in self.type_table_32], device=device
+            )
+            self._maxe22 = torch.tensor(
+                [e.get("maxe", 0.0) for e in self.type_table_22], device=device
+            )
             logging.info(
                 "[approx] type heads on: T32=%d T22=%d, max_col=%d, "
-                "med_budget(LSB)=%s, use_error_loss=%s",
+                "med_budget(LSB)=%s, use_error_loss=%s, wce_budget(LSB)=%s",
                 len(self.type_table_32), len(self.type_table_22),
                 self.approx_max_col, self.med_budget, self.use_error_loss,
+                self.wce_budget,
             )
 
         opt_params = list(self.gcn.parameters())
@@ -772,14 +790,16 @@ class CompressorRouting:
         return logits
 
     def _analytic_error(self, type_choices):
-        """从采样类型闭式估计 (med_lsb, abs_bias_lsb, nmed)。
+        """从采样类型闭式估计 (med_lsb, abs_bias_lsb, nmed, wce_lsb)。
 
         med_lsb = Σ wae·2^col   —— MED 的保守上界（输出 LSB 绝对单位，跨位宽稳定）
         abs_bias_lsb = |Σ bias·2^col|  —— 带符号误差的绝对值（抓正负抵消）
         nmed = med_lsb / maxprod  —— 标准 NMED，仅用于上报
-        bias/wae 为 P=1/4 一阶估计。"""
+        wce_lsb = Σ maxe·2^col  —— ④ WCE 可加上界（最坏情况输出误差，LSB；与传播无关恒成立）
+        bias/wae 为 P=1/4 一阶估计；maxe 与概率无关（逐 cell 最坏），故 WCE 上界精确。"""
         bias_total = 0.0
         wae_total = 0.0
+        wce_total = 0.0
         for node_idx, (t, k) in type_choices.items():
             if k == 0:
                 continue
@@ -789,8 +809,9 @@ class CompressorRouting:
             w = float(1 << col)
             bias_total += entry["bias"] * w
             wae_total += entry["wae"] * w
+            wce_total += entry.get("maxe", 0.0) * w
         maxprod = float((2 ** self.bit_width - 1) ** 2)
-        return wae_total, abs(bias_total), wae_total / maxprod
+        return wae_total, abs(bias_total), wae_total / maxprod, wce_total
 
     def get_full_target_delay_result(self):
         build_dir = self.build_dir + "_full_ppa"
@@ -1130,12 +1151,17 @@ class CompressorRouting:
         emb = self._node_emb
         bias_total = torch.zeros((), device=self.device)
         med_total = torch.zeros((), device=self.device)
+        wce_total = torch.zeros((), device=self.device)  # ④ 期望 WCE 上界
         for node_idx, info in enumerate(self.comp_graph.vertex_list):
             _, c, t, _ = info
             if t == 0:
-                head, biases, waes = self.type_head_32, self._bias32, self._wae32
+                head, biases, waes, maxes = (
+                    self.type_head_32, self._bias32, self._wae32, self._maxe32
+                )
             elif t == 1:
-                head, biases, waes = self.type_head_22, self._bias22, self._wae22
+                head, biases, waes, maxes = (
+                    self.type_head_22, self._bias22, self._wae22, self._maxe22
+                )
             else:
                 continue
             logits = self._masked_type_logits(head(emb[node_idx]), c)
@@ -1143,10 +1169,16 @@ class CompressorRouting:
             w = float(1 << c)
             bias_total = bias_total + (p @ biases) * w
             med_total = med_total + (p @ waes) * w
+            wce_total = wce_total + (p @ maxes) * w
         # 点2：与 get_objective 同尺度，除 error_scale 落到 O(1)。
         l = self.bias_loss_weight * bias_total.abs() / self.error_scale
         budget = 0.0 if self.med_budget is None else self.med_budget
         l = l + self.error_loss_weight * torch.relu(med_total - budget) / self.error_scale
+        # ④ 尾部/WCE 可微 surrogate（默认关）：塑形类型分布远离大 maxe cell。
+        if self.wce_loss_weight and self.wce_budget is not None:
+            l = l + self.wce_loss_weight * torch.relu(
+                wce_total - self.wce_budget
+            ) / self.error_scale
         return l
 
     def get_cache(
@@ -1754,7 +1786,7 @@ class CompressorRouting:
         # Phase B：近似误差成本（约束式 A，LSB 单位）。关时 / 无 cell_types 时为 0，不影响。
         err_term = 0.0
         if self.use_approx_types and cell_types:
-            med, abs_bias, _nmed = self._analytic_error(cell_types)
+            med, abs_bias, _nmed, wce = self._analytic_error(cell_types)
             # 点2：除 error_scale 把 LSB 绝对值压到和 PPA 同量级。
             if self.med_budget is not None:
                 err_term += (
@@ -1763,6 +1795,13 @@ class CompressorRouting:
                     / self.error_scale
                 )
             err_term += self.bias_weight * abs_bias / self.error_scale
+            # ④ 尾部/WCE 约束（默认关）：超出 wce_budget 才罚，压重尾/最坏情况误差。
+            if self.wce_budget is not None:
+                err_term += (
+                    self.wce_violation_weight
+                    * max(0.0, wce - self.wce_budget)
+                    / self.error_scale
+                )
 
         if self.area_budget is not None:
             objective = summary["power"] / self.power_scale
