@@ -59,6 +59,40 @@
 
 **验证**：解析 bias 必须与 `Appr_Comp/approx_mul.py` 的 8-bit 穷举实测吻合（同 Phase A 验恒等式口径）。
 
+#### ① 机制已 EDA-free 穷举验证（2026-06-20，`approx_mul.py --trunc k --correct bias`）
+
+把截断+校正接进 bit-exact 参考器并 **8-bit 穷举（65536 输入对）** 验证。新增恒等式
+`out − a*b == −Δ(a,b) + Σ_cells e·2^col`，**全场景 65536/65536 通过**；`--trunc 0` 与原 Phase A 输出逐字一致（回归）。
+
+k=4（E[Δ]=12.25 → C=round=12，正偏置 cell）穷举结果：
+
+| 场景 | 恒等式 | ER | MED | WCE | bias |
+|---|:--:|--:|--:|--:|--:|
+| 截断 only (C=0) | OK | 0.81 | 12.25 | 49 | **−12.25** |
+| 截断 + 常数校正 (C=12) | OK | 0.91 | 7.85 | 37 | **−0.25** |
+| 截断 + cell抵消 (C=0, 正cell) | OK | 0.90 | 25.4 | 130 | **+8.50** |
+| 截断 + 常数 + cell | OK | 0.97 | 30.2 | 127 | +20.5 |
+
+**证明的结论**：
+1. 截断 = **确定性负偏置 −E[Δ]**（穷举精确吻合）。
+2. **常数 C=round(E[Δ]) 把 bias 归零**（−12.25→−0.25），MED 同时减半——这是主抵消杠杆。
+3. **正偏置 cell 是第二杠杆**（−12.25→+8.50，部分抵消 + 省面积）；**符号选错则更糟**（负 cell：−12.25→−50）→ 必须 RL 选符号，正是 bias reward 的活。
+4. **WCE 随 k 增大**（k=4→37，k=6→241）→ 正是 ④ WCE 项要压的尾巴。**①②④ 必须合用**：截断吃 PPA、常数+cell 归零偏置、WCE 项控尾。
+
+#### ① 剩余工程：接进搜索（Layer 2，需本机 openroad 冒烟）
+
+参考器证明了数学，但**搜索 loop 的 RTL 发射尚未截断**（本机 yosys+openroad 可验证，故低风险但工作量实）。精确改点：
+
+| 改动 | 位置 | 说明 |
+|---|---|---|
+| `self.initial_pp[:k]=0` 后再建 `CompressorGraph` | `CompressorRouting.__init__/reset` | 低列 height=0 → 无 PP 节点/压缩器；需查 `get_action_mask/transition/to_graph` 容忍零高列 |
+| `emit_pp_encoder` 尊重截断 | `utils/mul.py:131`（**现在硬重算满 pp，忽略截断**） | 跳过 col<k 的 `wire/assign`（否则零高列 emit 出非法 `wire[-1:0]`） |
+| `out[<k]` 与常数注入 | 末级 prefix adder / 输出装配（`routed_wire_list` → out） | 截断列无 routed 线 → `out[<k]` 接 0；C 拆成 col≥k 的常数 `1'b1` PP 位注入树 |
+| reward 加 `−Δ(k)+C` | `_analytic_error`（`bias_total/wce_total`） | 与参考器同公式；gated by `trunc_cols`（默认 0=回归） |
+| `trunc_cols` 当扫描超参（v1）/ 策略头（v2） | 配置 / 新动作头 | v1 先像 med_budget 一样扫 k；v2 再加可学截断深度头（仿类型头） |
+
+**注意**：reward 项与 RTL 截断**必须同时落地**（否则搜索奖励了不存在的截断）。故 Layer 2 一次性做完 + 本机 openroad 冒烟（emit→yosys 综合通过→`approx_mul.py` 对导出 RTL 穷举校验 ER/MED/WCE）再开。
+
 ### ② 近似部分积（截断的兄弟，次优先）
 
 把某列两行 PP 的相加用 **OR 压缩**（省一个压缩器），或丢偶数行 PP 位。机制/误差建模与 ① 同构，作为 ① 跑通后的增量。
@@ -126,4 +160,6 @@ wce_loss_weight: 0.0      # 可微 surrogate 权重（建议起步 1.0）
 | 项 | 状态 |
 |---|---|
 | ④ WCE 约束式（`get_objective`）+ 可微（`get_error_loss`）+ 配置键 + maxe 张量 | ✅ 2026-06-20，默认关＝字节级一致 |
-| ①②③⑤⑥ | ⏭ 待办（顺序见上） |
+| ① 机制：截断+校正+抵消，`approx_mul.py --trunc/--correct` 8-bit 穷举验证（恒等式 65536/65536，回归一致） | ✅ 2026-06-20 |
+| ① Layer 2：搜索 loop RTL 发射截断 + reward `−Δ+C` + `trunc_cols` 超参（需本机 openroad 冒烟） | ⏭ 下一轮（spec 见上） |
+| ②③⑤⑥ | ⏭ 待办（顺序见上） |
