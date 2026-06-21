@@ -1,0 +1,102 @@
+experiment:
+  kwargs:
+    seed: 42
+    log_level: INFO
+    experiment_prefix: mul_16_and_approx_trunc_routing_gene
+    device: &device cuda:0
+    log_dir: logs
+    build_dir: build
+    rtl_file: MUL.v
+    n_processing: 12
+    n_full_target_delay_processing: 12
+    bit_width: 16
+    encode_type: and
+    ct_arch: dadda
+
+trainer:
+  name: CompressorRoutingGeneArch
+  kwargs:
+    # loss params
+    use_ppo_loss: true
+    ppo_loss_weight: 1.0
+    use_delay_loss: false
+    delay_loss_weight: 0.1
+    use_glitch_loss: false
+    glitch_loss_weight: 0.1
+    lse_gamma_val: 0.01
+    use_rule_loss: true
+    rule_loss_weight: 1e-2
+    rule_loss_wight_incr: 1e-3
+    use_disc_loss: true
+    disc_loss_weight: 1e-2
+    disc_loss_weight_incr: 1e-3
+    # training scale —— 消融用短跑，趋势 ~200ep 即可见
+    num_episodes: 300
+    num_samples: 2
+    num_epochs: 1 # ppo epochs
+    save_freq: 100
+    log_freq: 1
+    # learning params
+    optim_name: Adam
+    optim_kwargs:
+      lr: 1e-4
+    scheduler_name: CosineAnnealingLR
+    scheduler_kwargs:
+      T_max: 300
+      eta_min: 1e-5
+    clip_range: 0.2
+    max_grad_norm: 0.5
+    # model params
+    gcn_kwargs:
+      input_dim: 7
+      hidden_dims_list: [[512, 512], [256, 256], [128, 128]]
+      output_dim: 64
+      activation: tanh
+      use_layernorm: true
+      dropout: 0.0
+    # eda params
+    delay_weight: 2.0
+    area_weight: 2.0
+    power_weight: 1.0
+    delay_scale: 1.394475
+    area_scale: 2026.5
+    power_scale: 0.0035775
+    use_power_proxy: false
+    power_source: eda
+    area_violation_weight: 1.0
+    delay_violation_weight: 1.0
+    reference_point: [2.0, 3000]
+    pareto_target: ["delay", "area"]
+    pool_size: 20
+    gomil_path: null
+
+    # ===== 阶段3 Phase B：近似压缩器类型搜索 =====
+    use_approx_types: true
+    approx_lib_path: Appr_Comp/selected_compressors.json
+    approx_library_path: Appr_Comp/library.json
+    approx_max_col: 16
+    med_budget: 4096.0
+    error_scale: 1.0e5
+    med_violation_weight: 1.0
+    bias_weight: 0.5
+    use_error_loss: true
+    error_loss_weight: 1.0
+    bias_loss_weight: 0.5
+    normalize_advantage: true
+
+    # ===== 阶段C ④：尾部/WCE 约束 =====
+    # wce_bound = Σ maxe·2^col（近似 cell 的最坏情况输出误差上界，LSB；不含被掩码的 bit31 结构误差）。
+    # 目的：把重尾(RMSE/MAE≈100)压下来——逼搜索别把大 maxe cell 放到高权重列。
+    # 起步 budget=65536(2^16)；首跑后看 approx_mul.py 实测 WCE/RMSE 再调（太松→不咬，太紧→退回精确）。
+    wce_budget: 65536.0
+    wce_violation_weight: 1.0      # 约束式（进 objective / PPO advantage）
+    wce_loss_weight: 1.0           # 可微 surrogate（塑形类型分布，降方差）
+
+    # ===== 阶段C ①：低列截断 + 学习校正（Layer 2）=====
+    # trunc_cols=k：最低 k 列用常数（校正常数 C=round(E[Δ]) 拆成低列常数位）驱动而非 a&b。
+    # 压缩树/布线/动作空间不变，DC compile_ultra 常数传播删低列逻辑＝截断 PPA 收益。
+    # 截断列强制 exact（不放近似 cell）；近似 cell 落在 [trunc_cols, approx_max_col)。
+    # 误差：−E[Δ]+C 进 bias 项（≈0，cell 抵消残差），WCE_trunc 进 ④ 尾部上界。
+    # 本机 openroad 实测 k=8 area −9.6%（无 cell，纯截断）。可扫 k∈{4,8,12} 看 PPA–误差前沿。
+    trunc_cols: 8
+    trunc_correct: bias

@@ -46,7 +46,9 @@ def main():
     p.add_argument("--samples", type=int, default=None)
     p.add_argument("--n_processing", type=int, default=None)
     p.add_argument("--med_budget", type=float, default=None)
-    p.add_argument("--target_delay", type=float, default=2.0, help="DC 时钟周期 (ns)")
+    p.add_argument("--trunc_cols", type=int, default=None, help="① 低列截断深度 k（0=无截断）")
+    p.add_argument("--wce_budget", type=float, default=None, help="④ WCE 上限（LSB）")
+    p.add_argument("--target_delay", type=float, default=1.5, help="DC 时钟周期 (ns)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default=None)
     # DC 重标定（按烟雾实测：DC-direct area~800µm², delay~1.44ns,
@@ -79,6 +81,14 @@ def main():
             # 但固定单一 DC 周期，保证每样本只 1 次 DC。
             "area_budget": None,
             "fixed_target_delay": float(args.target_delay),
+            # delay 约束化：固定单一 DC 周期后不再线性奖励"更快"（否则 RL 花面积
+            # 把延迟压到远低于 target，导致同误差下面积偏大、与 evo 1.8ns 比不公平）。
+            # delay_weight=0 ⇒ 目标只剩 (误差,面积,功耗)，delay 退化为综合时序约束。
+            "delay_weight": 0.0,
+            # 误差闸门用 verilator circular-wrap 真实 MED（16M 向量）取代解析 proxy（codex 审过）。
+            # 每候选 worker 内并行测（~3s vs DC ~200s）；verilator 失败回退解析、不丢样本。
+            "error_gate": "verilator",
+            "error_gate_vectors": 16_000_000,
             # DC 量级重标定
             "delay_scale": float(args.delay_scale),
             "area_scale": float(args.area_scale),
@@ -99,6 +109,10 @@ def main():
         tk["n_full_target_delay_processing"] = args.n_processing
     if args.med_budget is not None:
         tk["med_budget"] = args.med_budget
+    if args.trunc_cols is not None:
+        tk["trunc_cols"] = args.trunc_cols
+    if args.wce_budget is not None:
+        tk["wce_budget"] = args.wce_budget
     if args.device is not None:
         tk["device"] = args.device
     seed = args.seed if args.seed is not None else exp_kwargs.get("seed", 42)

@@ -79,19 +79,30 @@ k=4（E[Δ]=12.25 → C=round=12，正偏置 cell）穷举结果：
 3. **正偏置 cell 是第二杠杆**（−12.25→+8.50，部分抵消 + 省面积）；**符号选错则更糟**（负 cell：−12.25→−50）→ 必须 RL 选符号，正是 bias reward 的活。
 4. **WCE 随 k 增大**（k=4→37，k=6→241）→ 正是 ④ WCE 项要压的尾巴。**①②④ 必须合用**：截断吃 PPA、常数+cell 归零偏置、WCE 项控尾。
 
-#### ① 剩余工程：接进搜索（Layer 2，需本机 openroad 冒烟）
+#### ① Layer 2：接进搜索 ✅ 已实现（2026-06-20，比原 spec 更省）
 
-参考器证明了数学，但**搜索 loop 的 RTL 发射尚未截断**（本机 yosys+openroad 可验证，故低风险但工作量实）。精确改点：
+**关键简化（实现时发现）**：不必物理删列、不必动 `CompressorGraph`/动作掩码/输出装配。
+压缩树只是把驱动 `pp_*` 的东西求和——所以**截断 = 把低列 PP 线用常数（校正常数 C 的位）驱动而非 `a&b`**；
+树/布线/动作空间**全不变**，DC `compile_ultra` 常数传播自动删掉低列死逻辑（=截断 PPA 收益）。
+`out = a*b − Δ_actual + C` 位精确，零图改动、零输出装配改动。
 
 | 改动 | 位置 | 说明 |
 |---|---|---|
-| `self.initial_pp[:k]=0` 后再建 `CompressorGraph` | `CompressorRouting.__init__/reset` | 低列 height=0 → 无 PP 节点/压缩器；需查 `get_action_mask/transition/to_graph` 容忍零高列 |
-| `emit_pp_encoder` 尊重截断 | `utils/mul.py:131`（**现在硬重算满 pp，忽略截断**） | 跳过 col<k 的 `wire/assign`（否则零高列 emit 出非法 `wire[-1:0]`） |
-| `out[<k]` 与常数注入 | 末级 prefix adder / 输出装配（`routed_wire_list` → out） | 截断列无 routed 线 → `out[<k]` 接 0；C 拆成 col≥k 的常数 `1'b1` PP 位注入树 |
-| reward 加 `−Δ(k)+C` | `_analytic_error`（`bias_total/wce_total`） | 与参考器同公式；gated by `trunc_cols`（默认 0=回归） |
-| `trunc_cols` 当扫描超参（v1）/ 策略头（v2） | 配置 / 新动作头 | v1 先像 med_budget 一样扫 k；v2 再加可学截断深度头（仿类型头） |
+| 低列 PP 用常数位驱动（前 m_c 个 `1'b1` 表示 C，其余 `1'b0`） | `utils/mul.py` `emit_pp_encoder`（AND 分支） | 读 `self.ct.trunc_cols/trunc_bits`；col≥k 仍 `a&b`。trunc=0 逐字回归 |
+| `_setup_truncation`：算 E[Δ]、C=round(E[Δ])、贪心拆成低列常数位、Δmax、WCE_trunc | `CompressorRouting` | `_start_reset` 拿到 `initial_pp` 后调一次 |
+| reward 加 `−E[Δ]+C`（净偏置→cell 抵消残差）+ `WCE_trunc`（尾部上界） | `_analytic_error`（`bias_total/wce_total`） | gated by `trunc_cols`（默认 0=回归） |
+| 截断列强制 exact（cell 会被 DC 删，别浪费） | `_masked_type_logits`（`col < trunc_cols`） | 近似 cell 落在 `[trunc_cols, approx_max_col)` |
+| 把 `trunc_cols/trunc_bits` 挂到 `ct`（自动随 deepcopy/pickle 进 worker） | `get_samples` / `export_best_candidate` | 无需改 multiprocessing 签名 |
+| `trunc_cols`/`trunc_correct` 当超参（v1，像 med_budget 扫 k） | `configs/.../mul_16_and_approx_trunc.yaml` | v2 再加可学截断深度头（仿类型头） |
 
-**注意**：reward 项与 RTL 截断**必须同时落地**（否则搜索奖励了不存在的截断）。故 Layer 2 一次性做完 + 本机 openroad 冒烟（emit→yosys 综合通过→`approx_mul.py` 对导出 RTL 穷举校验 ER/MED/WCE）再开。
+**验证（全过）**：
+- **位精确**：构造同款常数驱动喂进项目自带树模型，`out==a*b−Δ+C` 全 65536 输入通过；`WCE_trunc` 与参考器一致（k=4→37）。
+- **常数可表示**：C=round(E[Δ]) 贪心拆进低列槽位，Σ m_c·2^c==C。
+- **本机 openroad 实测**：16-bit @2ns，**trunc=8 area 3752→3391（−9.6%）**、delay/power 同降 → 证明 DC 确实删低列（纯截断、无 cell）。
+- **回归**：trunc=0 发射零常数 PP、`_analytic_error`/掩码不变 → 字节级一致。
+
+**跑法**：`scripts/train_dc.py --config configs/config_groups/mul_16_and_approx_trunc.yaml ...`（同 WCE sweep）。
+建议扫 `trunc_cols∈{4,8,12}` × `wce_budget`，铺 PPA–误差前沿；导出最优解用 `approx_mul.py` 穷举校验真实 ER/MED/WCE。
 
 ### ② 近似部分积（截断的兄弟，次优先）
 
@@ -160,6 +171,32 @@ wce_loss_weight: 0.0      # 可微 surrogate 权重（建议起步 1.0）
 | 项 | 状态 |
 |---|---|
 | ④ WCE 约束式（`get_objective`）+ 可微（`get_error_loss`）+ 配置键 + maxe 张量 | ✅ 2026-06-20，默认关＝字节级一致 |
-| ① 机制：截断+校正+抵消，`approx_mul.py --trunc/--correct` 8-bit 穷举验证（恒等式 65536/65536，回归一致） | ✅ 2026-06-20 |
-| ① Layer 2：搜索 loop RTL 发射截断 + reward `−Δ+C` + `trunc_cols` 超参（需本机 openroad 冒烟） | ⏭ 下一轮（spec 见上） |
+| ④ 修 dtype bug：`maxe` JSON 里是 int → `p(Float)@maxes(Long)` 崩；强制 `float32` | ✅ 2026-06-20（WCE sweep 已可跑） |
+| ① 机制：截断+校正+抵消，`approx_mul.py --trunc/--correct` 8-bit 穷举验证（恒等式 65536/65536） | ✅ 2026-06-20 |
+| ① Layer 2：搜索 loop 常数注入截断 + reward `−Δ+C`/WCE_trunc + `trunc_cols` 超参；本机 openroad 实测 area −9.6% | ✅ 2026-06-20，默认关＝字节级一致 |
 | ②③⑤⑥ | ⏭ 待办（顺序见上） |
+
+---
+
+## 2026-06-21 过夜 DC 8 点扫描结果（codex 审过 + 修过 3 处误差核算后）
+
+**配置**：16×16，DC-in-loop，180 ep，8 samples，64 并发 DC。两轴：k-深度（k=0/4/8/12/16 @med65536）+ 误差预算（k8 @med=16384/65536/262144/1048576）。
+**真实误差**：verilator 2M MC（`scripts/plot_sweep.py` + `/tmp/mcsim/tb.cpp`），out 与 golden 都按 31 位、差值 wrap 到最小幅度 ⇒ 纯近似误差（与顶位约定无关），用 WCE_trunc 自校验通过（k16 实测 max|e|=574849 < 解析上界 737281，bias≈−75≈0 证明截断校正常数有效）。
+
+| run | k | obj | area | pwr(mW) | #近似cell | MED | NMED | bias |
+|---|---|---|---|---|---|---|---|---|
+| k0 | 0 | 5.386 | 895.4 | 12.37 | 26 | 9705 | 2.26e-6 | −9600 |
+| k4 | 4 | 5.358 | 893.6 | 11.81 | 17 | 17351 | 4.04e-6 | −17349 |
+| k8 | 8 | 5.083 | 821.4 | 11.60 | 9 | 6514 | 1.52e-6 | +3039 |
+| **k12** | 12 | **4.605** | **729.3** | **9.40** | **1** | **4578** | **1.07e-6** | −2050 |
+| k16 | 16 | 10.608 ⚠崩 | 556.1 | 7.36 | 0 | 76271 | 1.78e-5 | −75 |
+
+**核心结论**
+1. **k=12 全面最优**：面积 −18%、功耗 −24%（vs k0），且 NMED **也最低**。最优截断深度 ∈ (12,16]。
+2. **k=16 过度截断崩溃**：obj 10.6（惩罚主导），NMED ×10。
+3. **截断 > 近似 cell 作为误差杆**：k 增大时 RL 用的近似 cell 数 26→17→9→1，PPA 与精度同步改善——截断给的是确定性、可校正、有界的误差/单位面积，cell 给的是带偏置的散布。
+4. **误差预算在固定 k 下是钝刀**：k8 实测 MED 不随 med_budget 单调（16384→11848 但 65536→6514）⇒ in-loop 解析误差代理与真实误差失准 ⇒ 对应 ⑤（用 SAIF/实测列概率重标定）。
+5. **偏置部分可校正但非免费**：全局常数（均值）校正只削 MED ~40–50%，对部分设计反增（最小化 MED 的是中位数非均值）⇒ 可加"输出中位数常数校正"廉价层，但散布是地板。
+
+**图**：`outputs/2026-06-21_dc_sweep/fig_k_depth.png`、`fig_error_budget.png`。
+**下一步**：k=13/14 探针定最优深度；可学 k（policy head）；⑤ 重标定误差代理；输出中位数常数校正。

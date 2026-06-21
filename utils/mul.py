@@ -132,13 +132,26 @@ class Mul:
             self.bit_width, self.encode_type
         ).astype(int)
         if self.encode_type == "and":
+            # Phase C ①：低列截断。截断列 (col < trunc_cols) 的 pp 位用常数驱动
+            # （前 m_c 个 1'b1 注入校正常数 C，其余 1'b0），而非 a&b。压缩树/布线结构不变，
+            # DC compile_ultra 常数传播会删掉这些低列逻辑 → 等价于物理截断的 PPA 收益。
+            # out = a*b − Δ_actual + C，位精确。trunc_cols=0（默认）时与原行为逐字一致。
+            trunc_cols = int(getattr(self.ct, "trunc_cols", 0) or 0)
+            trunc_bits = getattr(self.ct, "trunc_bits", None) or {}
             for column_index in range(len(initial_pp)):
                 verilog_str += f"{f_str}wire [{int(initial_pp[column_index]) - 1}:0] pp_{column_index};\n"
             verilog_str += "\n"
             for column_index in range(len(initial_pp)):
-                for pp_index in range(int(initial_pp[column_index])):
-                    offset = max(0, column_index - self.bit_width + 1)
-                    verilog_str += f"{f_str}assign pp_{column_index}[{pp_index}] = a[{pp_index + offset}] & b[{column_index - pp_index - offset}];\n"
+                h = int(initial_pp[column_index])
+                if column_index < trunc_cols:
+                    m = int(trunc_bits.get(column_index, 0))
+                    for pp_index in range(h):
+                        bit = "1'b1" if pp_index < m else "1'b0"
+                        verilog_str += f"{f_str}assign pp_{column_index}[{pp_index}] = {bit};\n"
+                else:
+                    for pp_index in range(h):
+                        offset = max(0, column_index - self.bit_width + 1)
+                        verilog_str += f"{f_str}assign pp_{column_index}[{pp_index}] = a[{pp_index + offset}] & b[{column_index - pp_index - offset}];\n"
 
         elif self.encode_type == "booth":
             encoder_num = self.bit_width // 2 + 1

@@ -508,6 +508,23 @@ class CompressorRouting:
         wce_budget=None,
         wce_violation_weight=0.0,
         wce_loss_weight=0.0,
+        # 误差闸门来源（codex 审过）：
+        #   "analytic"  = 解析 proxy（三角不等式估计，实测系统性低估真实 MED 0–30%；默认，向后兼容）
+        #   "verilator" = 每个候选用 verilator MC（circular-wrap 真实 MED）测 med/bias 当软罚闸门。
+        # 只影响 get_objective 的离散打分（reward 闸门）；可微 error_loss 仍用解析（不可微分 verilator）。
+        # WCE 始终用解析上界（MC 尾部不收敛、随 N 单调增长，不可信）。
+        error_gate="analytic",
+        error_gate_vectors=16_000_000,
+        # Phase C ①：低列截断 + 学习校正（默认关）。trunc_cols=k → 最低 k 列的 PP 用常数
+        # （校正常数 C=round(E[Δ])，拆成低列槽位的常数 1 位）驱动而非 a&b；压缩树/布线不变，
+        # DC 常数传播删低列逻辑＝截断 PPA 收益。误差项 −E[Δ]+C 进 _analytic_error。
+        trunc_cols=0,
+        trunc_correct="bias",
+        # P0(codex)：delay 作为约束而非奖励项。开启后 delay≤delay_target_ns 不奖励也不罚，
+        # delay>target 才按 delay_violation_weight 罚 → 优化预算全给 area/power（释放 slack）。
+        # 默认关=旧线性奖励 delay_weight·delay。
+        delay_as_constraint=False,
+        delay_target_ns=None,   # None → 用 fixed_target_delay（DC 时钟周期）当阈值
         # advantage 归一（点1）：A=-(obj-mean)/(std+eps)。默认 False = 旧行为 A=-obj。
         normalize_advantage=False,
         **kwargs,
@@ -598,6 +615,8 @@ class CompressorRouting:
         self.approx_max_col = approx_max_col
         self.med_budget = med_budget
         self.med_violation_weight = med_violation_weight
+        self.error_gate = error_gate
+        self.error_gate_vectors = int(error_gate_vectors)
         self.bias_weight = bias_weight
         self.error_scale = error_scale
         self.use_error_loss = use_error_loss
@@ -607,6 +626,17 @@ class CompressorRouting:
         self.wce_budget = wce_budget
         self.wce_violation_weight = wce_violation_weight
         self.wce_loss_weight = wce_loss_weight
+        # Phase C ①：截断（_setup_truncation 在 _start_reset 拿到 initial_pp 后填充）
+        self.trunc_cols = int(trunc_cols or 0)
+        self.trunc_correct = trunc_correct
+        self._trunc_bits = {}      # {col: 该列常数 1 的个数}
+        self._trunc_const = 0      # 实际注入的校正常数 C
+        self._trunc_delta = 0.0    # E[Δ]（截断期望丢失值）
+        self._trunc_wce = 0.0      # 截断最坏情况误差 max(C, Δmax−C)
+        self._trunc_med = 0.0      # E[|C−Δ|]（截断残差 MED，P=1/4 一阶估计）
+        # P0：delay 约束化
+        self.delay_as_constraint = bool(delay_as_constraint)
+        self.delay_target_ns = delay_target_ns
         self.normalize_advantage = normalize_advantage
         self.type_table_32 = None
         self.type_table_22 = None
@@ -634,12 +664,15 @@ class CompressorRouting:
             self._wae22 = torch.tensor(
                 [e["wae"] for e in self.type_table_22], device=device
             )
-            # ④ 每 cell 最坏误差 maxe（exact=0），供 WCE 上界 Σ maxe·2^col
+            # ④ 每 cell 最坏误差 maxe（exact=0），供 WCE 上界 Σ maxe·2^col。
+            # 注意 JSON 里 maxe 是 int → 必须显式 float32，否则 p(Float)@maxes(Long) 报 dtype 错。
             self._maxe32 = torch.tensor(
-                [e.get("maxe", 0.0) for e in self.type_table_32], device=device
+                [float(e.get("maxe", 0.0)) for e in self.type_table_32],
+                device=device, dtype=torch.float32,
             )
             self._maxe22 = torch.tensor(
-                [e.get("maxe", 0.0) for e in self.type_table_22], device=device
+                [float(e.get("maxe", 0.0)) for e in self.type_table_22],
+                device=device, dtype=torch.float32,
             )
             logging.info(
                 "[approx] type heads on: T32=%d T22=%d, max_col=%d, "
@@ -781,13 +814,62 @@ class CompressorRouting:
         return cell_map
 
     def _masked_type_logits(self, logits, col):
-        """col >= approx_max_col 时只留 exact(index 0)，其余置 -1e9。
+        """col >= approx_max_col 或 col < trunc_cols 时只留 exact(index 0)，其余置 -1e9。
+        截断列被常数驱动、cell 会被 DC 删掉，故不在那放近似 cell。
         用 masked_fill（非 in-place，autograd 安全）。"""
-        if col >= self.approx_max_col:
+        if col >= self.approx_max_col or col < self.trunc_cols:
             mask = torch.ones_like(logits, dtype=torch.bool)
             mask[0] = False
             logits = logits.masked_fill(mask, -1e9)
         return logits
+
+    def _setup_truncation(self):
+        """Phase C ①：算截断 [0,k) 的校正常数 C（用低列槽位的常数 1 位表示）+ 误差量。
+
+        E[Δ] = Σ_{c<k} 0.25·pp[c]·2^c   （AND, P=1/4；截断丢失值期望，恒正→负偏置）
+        C = round(E[Δ])（trunc_correct='bias'），贪心用 col<k 的槽位表示（列 c 有 pp[c] 个槽、权重 2^c）
+        Δmax = Σ_{c<k} pp[c]·2^c，WCE_trunc = max(C, Δmax−C)。"""
+        k = self.trunc_cols
+        if not (0 <= k <= len(self.initial_pp)):
+            raise ValueError(
+                f"trunc_cols={k} 越界，应在 [0, {len(self.initial_pp)}]（截断列数）"
+            )
+        pp = [int(x) for x in self.initial_pp]
+        e_delta = sum(0.25 * pp[c] * (1 << c) for c in range(k))
+        delta_max = sum(pp[c] * (1 << c) for c in range(k))
+        c_target = int(round(e_delta)) if self.trunc_correct == "bias" else 0
+        bits, remaining = {}, c_target
+        for c in range(k - 1, -1, -1):          # 高列→低列贪心填常数 1
+            w = 1 << c
+            m = min(pp[c], remaining // w)
+            if m > 0:
+                bits[c] = m
+                remaining -= m * w
+        c_actual = c_target - remaining          # 实际可表示的 C（余量通常 0）
+        # 截断残差 MED = E[|C−Δ|]，Δ = Σ_{i+j<k} 2^(i+j)·a_i·b_j（被丢的低列加权值）。
+        # PP 共享 a/b 位 → 各列高度强相关，独立卷积会低估约 30%（codex review 指出，
+        # k=8 独立=142 vs 真实=200）。故用 MC 直接采 a,b 算 Δ，捕捉相关性。均匀输入口径，
+        # 仍是一阶估计（⑤ 接 SAIF 真实逐位概率后再精化）；零 bias≠零 MED 必须显式建模。
+        rng = np.random.default_rng(0)
+        N = 200000
+        av = rng.integers(0, 1 << k, size=N, dtype=np.int64)
+        bv = rng.integers(0, 1 << k, size=N, dtype=np.int64)
+        delta = np.zeros(N, dtype=np.int64)
+        for i in range(k):
+            ai = (av >> i) & 1
+            for j in range(k - i):
+                delta += (ai & ((bv >> j) & 1)) << (i + j)
+        trunc_med = float(np.abs(c_actual - delta).mean())
+        self._trunc_bits = bits
+        self._trunc_const = c_actual
+        self._trunc_delta = e_delta
+        self._trunc_wce = max(c_actual, delta_max - c_actual)
+        self._trunc_med = trunc_med
+        logging.info(
+            "[trunc] cols<%d const-driven; E[Δ]=%.2f C=%d(target %d) Δmax=%d "
+            "MED_trunc=%.2f WCE_trunc=%d bits=%s",
+            k, e_delta, c_actual, c_target, delta_max, trunc_med, self._trunc_wce, bits,
+        )
 
     def _analytic_error(self, type_choices):
         """从采样类型闭式估计 (med_lsb, abs_bias_lsb, nmed, wce_lsb)。
@@ -810,6 +892,13 @@ class CompressorRouting:
             bias_total += entry["bias"] * w
             wae_total += entry["wae"] * w
             wce_total += entry.get("maxe", 0.0) * w
+        # Phase C ①：截断的确定性误差。−E[Δ]+C 为净偏置（bias 项会驱动 cell 抵消残差）；
+        # MED_trunc=E[|C−Δ|] 进 MED 上界（三角不等式：MED_total ≤ MED_trunc + Σ wae·2^col，
+        # 否则纯截断设计解析 MED=0 会骗过 med_budget）；WCE_trunc 进尾部上界（与 ④ 同口径）。
+        if self.trunc_cols > 0:
+            bias_total += (-self._trunc_delta + self._trunc_const)
+            wae_total += self._trunc_med
+            wce_total += self._trunc_wce
         maxprod = float((2 ** self.bit_width - 1) ** 2)
         return wae_total, abs(bias_total), wae_total / maxprod, wce_total
 
@@ -829,6 +918,9 @@ class CompressorRouting:
         os.makedirs(build_dir, exist_ok=True)
 
         ct = CompressorTree(self.initial_pp, self.state["ct32"], self.state["ct22"])
+        if self.trunc_cols > 0:               # ① full-target-delay 诊断/导出也必须带截断
+            ct.trunc_cols = self.trunc_cols
+            ct.trunc_bits = self._trunc_bits
         mul = Mul(self.bit_width, self.encode_type, ct)
 
         # Phase B：用最优设计的近似 cell 评 full-target-delay PPA（否则退化成精确）
@@ -1170,6 +1262,13 @@ class CompressorRouting:
             bias_total = bias_total + (p @ biases) * w
             med_total = med_total + (p @ waes) * w
             wce_total = wce_total + (p @ maxes) * w
+        # Phase C ①：与 _analytic_error 同口径加入截断的确定性误差（对参数为常数偏移，但
+        # 改变 |bias| 的零点→驱动 cell bias 趋向 +Δ−C 抵消残差，而非自身趋零；MED/WCE 偏移
+        # 影响 relu 的越界判定）。漏掉会让可微 surrogate 与 reward 口径不一致、梯度方向相反。
+        if self.trunc_cols > 0:
+            bias_total = bias_total + (-self._trunc_delta + self._trunc_const)
+            med_total = med_total + self._trunc_med
+            wce_total = wce_total + self._trunc_wce
         # 点2：与 get_objective 同尺度，除 error_scale 落到 O(1)。
         l = self.bias_loss_weight * bias_total.abs() / self.error_scale
         budget = 0.0 if self.med_budget is None else self.med_budget
@@ -1566,6 +1665,8 @@ class CompressorRouting:
         id,
         target_delay_id,
         synth,
+        error_gate="analytic",
+        error_gate_vectors=16_000_000,
     ):
         if synth == "dc":
             # 远端 DC 直出 PPA（功耗取 DC report_power，不走 VCS/XA）
@@ -1575,14 +1676,18 @@ class CompressorRouting:
             if one is not None:
                 simulated_result = [one]
             else:
-                # 远端 DC 多次重试后仍失败 → 回退本地 ABC，保证训练不停摆
+                # P0(codex)：远端 DC 多次重试仍失败 → **不**回退本地 ABC（量纲差 ~20×，
+                # 混进同一 PPO batch 会污染梯度/best；正是断网那次的故障）。标记失败，上层踢出本批。
                 logging.warning(
-                    f"[dc] worker {id} remote DC failed, fallback to local ABC: {rtl_path}"
+                    f"[dc] worker {id} remote DC failed → 丢弃该样本(不混 ABC): {rtl_path}"
                 )
-                mul = Mul(bit_width, encode_type, ct)
-                simulated_result = mul.simulate(
-                    build_path, rtl_path, [target_delay], synth="openroad"
-                )
+                return {
+                    "result": None,
+                    "failed": True,
+                    "id": id,
+                    "target_delay_id": target_delay_id,
+                    "target_delay": target_delay,
+                }
         else:
             mul = Mul(bit_width, encode_type, ct)
             simulated_result = mul.simulate(
@@ -1591,8 +1696,15 @@ class CompressorRouting:
                 [target_delay],
                 synth=synth,
             )
+        # 误差闸门：DC/综合成功后，并行在本 worker 测 verilator 真实 MED（失败=None，不丢样本）。
+        measured_error = None
+        if error_gate == "verilator":
+            measured_error = CompressorRouting._measure_error_verilator(
+                rtl_path, build_path, error_gate_vectors
+            )
         return {
             "result": simulated_result,
+            "measured_error": measured_error,
             "id": id,
             "target_delay_id": target_delay_id,
             "target_delay": target_delay,
@@ -1642,6 +1754,53 @@ class CompressorRouting:
             "worker_id": worker_id,
         }
 
+    @staticmethod
+    def _measure_error_verilator(rtl_path, build_path, n_vectors):
+        """误差闸门：verilator MC 实测 circular-wrap 真实误差（codex 审过的接入）。
+        返回 dict(med, bias, wce_mc, source="verilator") 或 None（编译/运行/解析失败）。
+        - 每次用全新 obj 目录（绝对路径；_dc_simulate_one 改过 cwd 不恢复，故全部绝对化）。
+        - verilator --build -j1（8 worker 同跑时避免 make 多核过订阅）。
+        - 失败重试 1 次；仍失败返回 None → 上层回退解析闸门（不丢该样本，别浪费 DC）。
+        WCE 只上报不当闸门（MC 尾部不收敛）。"""
+        import shutil
+        import subprocess
+
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        harness = os.path.join(repo_root, "verilate", "mul_err_wrap.cpp")
+        rtl_abs = os.path.abspath(rtl_path)
+        for attempt in range(2):
+            verr = os.path.abspath(os.path.join(build_path, f"verr_{attempt}"))
+            try:
+                shutil.rmtree(verr, ignore_errors=True)
+                os.makedirs(verr, exist_ok=True)
+                obj = os.path.join(verr, "obj_dir")
+                exe = os.path.join(obj, "mul_err")
+                bcmd = ["verilator", "--cc", "--exe", "--build", "-j", "1", "-O3",
+                        "-Wno-fatal", "--top-module", "MUL", "--Mdir", obj,
+                        rtl_abs, harness, "-o", "mul_err"]
+                b = subprocess.run(bcmd, cwd=verr, capture_output=True, text=True, timeout=180)
+                if b.returncode != 0 or not os.path.exists(exe):
+                    raise RuntimeError(f"verilator build rc={b.returncode}")
+                r = subprocess.run([exe, str(int(n_vectors))], cwd=verr,
+                                   capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    raise RuntimeError(f"verilator run rc={r.returncode}")
+                med = bias = wce = None
+                for line in r.stdout.strip().splitlines():
+                    p = line.split(",")
+                    if p[0] == "masked":
+                        med, bias, wce = float(p[1]), float(p[2]), float(p[5])
+                        break
+                if med is None:
+                    raise RuntimeError("no masked line")
+                shutil.rmtree(verr, ignore_errors=True)
+                return {"med": med, "bias": bias, "wce_mc": wce, "source": "verilator"}
+            except Exception as e:  # noqa: BLE001
+                logging.warning("[errgate] verilator measure attempt %d failed (%s): %s",
+                                attempt, os.path.basename(rtl_path), e)
+                shutil.rmtree(verr, ignore_errors=True)
+        return None
+
     def _apply_power_proxy_to_results(self, simulated_result, samples_connection):
         for item in simulated_result:
             item["eda_power"] = item.get("power")
@@ -1676,6 +1835,9 @@ class CompressorRouting:
                 ct = CompressorTree(
                     self.initial_pp, self.state["ct32"], self.state["ct22"]
                 )
+                if self.trunc_cols > 0:           # ① 把截断信息挂到 ct，emit_pp_encoder 会读
+                    ct.trunc_cols = self.trunc_cols
+                    ct.trunc_bits = self._trunc_bits
                 mul = Mul(self.bit_width, self.encode_type, ct)
                 rtl_path = os.path.join(self.build_dir, f"MUL-{sample_idx}.v")
                 mul.emit_verilog(
@@ -1710,6 +1872,8 @@ class CompressorRouting:
                     i,
                     target_delay_id,
                     self.synth,
+                    self.error_gate,
+                    self.error_gate_vectors,
                 )
                 for i, sample in enumerate(sample_info)
                 for target_delay_id, target_delay in enumerate(target_delay_list)
@@ -1723,22 +1887,54 @@ class CompressorRouting:
                 with multiprocessing.Pool(self.n_processing) as pool:
                     results = pool.starmap(self.parallel_simulate_worker, params_list)
             processed_results = {}
+            measured_errors = {}      # rid -> verilator 实测误差 dict（误差闸门，与 PPA 分开聚合）
+            failed_ids = set()
             for result in results:
-                id = result["id"]
-                if id not in processed_results:
-                    processed_results[id] = []
-                processed_results[id].append(result["result"][0])
+                rid = result["id"]
+                if (
+                    result.get("failed")
+                    or not result.get("result")
+                    or result["result"][0] is None
+                ):
+                    failed_ids.add(rid)
+                    continue
+                processed_results.setdefault(rid, []).append(result["result"][0])
+                # verilator 失败 ≠ DC 失败：只在成功时记录，None 时上层回退解析（不丢样本）
+                me = result.get("measured_error")
+                if me is not None:
+                    measured_errors.setdefault(rid, me)
 
-            for i, result_list in processed_results.items():
+            # P0(codex)：远端 DC 失败的样本直接踢出本批（不回退 ABC），避免量纲污染 PPO/best。
+            kept_sample_info = []
+            for i in range(len(sample_info)):
+                if i not in processed_results:
+                    continue
                 result_list = self._apply_power_proxy_to_results(
-                    result_list,
+                    processed_results[i],
                     sample_info[i]["connection"],
                 )
                 sample_info[i]["result"] = result_list
+                sample_info[i]["measured_error"] = measured_errors.get(i)
                 sample_info[i]["objective"] = self.get_objective(
-                    result_list, cell_types=sample_info[i].get("cell_types")
+                    result_list,
+                    cell_types=sample_info[i].get("cell_types"),
+                    measured_error=sample_info[i]["measured_error"],
                 )
-        return sample_info
+                kept_sample_info.append(sample_info[i])
+            if failed_ids:
+                logging.warning(
+                    "[dc] %d/%d 样本远端 DC 失败已丢弃(不混 ABC); 本批保留 %d",
+                    len(failed_ids), len(sample_info), len(kept_sample_info),
+                )
+            # 误差闸门健康度：verilator 失败回退解析会给该样本虚假优势（解析低估），
+            # codex 建议监控回退率；过高(>50%)则本批 verilator 闸门失真，告警。
+            if self.error_gate == "verilator" and kept_sample_info:
+                n_fb = sum(1 for s in kept_sample_info if s.get("measured_error") is None)
+                if n_fb:
+                    lvl = logging.ERROR if n_fb * 2 > len(kept_sample_info) else logging.INFO
+                    logging.log(lvl, "[errgate] verilator 回退解析 %d/%d 样本",
+                                n_fb, len(kept_sample_info))
+        return kept_sample_info
 
     def _summarize_result(self, simulated_result):
         delay = float(np.mean([item["delay"] for item in simulated_result]))
@@ -1780,13 +1976,21 @@ class CompressorRouting:
             "power_source": self.power_source,
         }
 
-    def get_objective(self, simulated_result, cell_types=None):
+    def get_objective(self, simulated_result, cell_types=None, measured_error=None):
         summary = self._summarize_result(simulated_result)
 
-        # Phase B：近似误差成本（约束式 A，LSB 单位）。关时 / 无 cell_types 时为 0，不影响。
+        # Phase B/C：近似+截断误差成本（约束式 A，LSB 单位）。两者全关时为 0，不影响。
+        # codex review(medium)：截断误差不应被 use_approx_types/cell_types 门控——纯截断
+        # （trunc_cols>0 但无类型搜索）也要计入，否则误差预算骗不过。
         err_term = 0.0
-        if self.use_approx_types and cell_types:
-            med, abs_bias, _nmed, wce = self._analytic_error(cell_types)
+        if (self.use_approx_types and cell_types) or self.trunc_cols > 0:
+            med, abs_bias, _nmed, wce = self._analytic_error(cell_types or {})
+            # 误差闸门（codex 审过）：verilator 模式且实测可用 → med/bias 用 circular-wrap 真实值
+            # （解析 proxy 系统性低估 0–30%）；wce 始终用解析上界（MC 尾部不收敛、不可信）。
+            # verilator 失败(measured_error=None) → 回退解析 med/bias（不浪费已花的 DC）。
+            if self.error_gate == "verilator" and measured_error is not None:
+                med = measured_error["med"]
+                abs_bias = abs(measured_error["bias"])
             # 点2：除 error_scale 把 LSB 绝对值压到和 PPA 同量级。
             if self.med_budget is not None:
                 err_term += (
@@ -1818,11 +2022,31 @@ class CompressorRouting:
                 )
             return objective + err_term
 
-        objective = (
-            self.delay_weight * summary["delay"] / self.delay_scale
-            + self.area_weight * summary["area"] / self.area_scale
-            + self.power_weight * summary["power"] / self.power_scale
-        )
+        if self.delay_as_constraint:
+            # P0(codex)：delay≤target 不奖励也不罚（不再把预算花在压 delay）；超 target 才罚。
+            dtarget = (
+                self.delay_target_ns
+                if self.delay_target_ns is not None
+                else self.fixed_target_delay
+            )
+            delay_cost = 0.0
+            if dtarget is not None:
+                delay_cost = (
+                    self.delay_violation_weight
+                    * max(0.0, summary["delay"] - float(dtarget))
+                    / self.delay_scale
+                )
+            objective = (
+                delay_cost
+                + self.area_weight * summary["area"] / self.area_scale
+                + self.power_weight * summary["power"] / self.power_scale
+            )
+        else:
+            objective = (
+                self.delay_weight * summary["delay"] / self.delay_scale
+                + self.area_weight * summary["area"] / self.area_scale
+                + self.power_weight * summary["power"] / self.power_scale
+            )
         return objective + err_term
 
     def _candidate_rank(self, sample_info):
@@ -1863,6 +2087,9 @@ class CompressorRouting:
                 self.found_best_info["connection"], cell_map=cell_map
             )
             ct = CompressorTree(self.initial_pp, self.state["ct32"], self.state["ct22"])
+            if self.trunc_cols > 0:               # ① 导出也带截断
+                ct.trunc_cols = self.trunc_cols
+                ct.trunc_bits = self._trunc_bits
             mul = Mul(self.bit_width, self.encode_type, ct)
             rtl_path = os.path.join(export_dir, "MUL.v")
             mul.emit_verilog(
@@ -1990,6 +2217,13 @@ class CompressorRouting:
                 self.found_best_info["cell_types"] = copy.deepcopy(
                     sample_info.get("cell_types")
                 )
+                # 可审计：记录该最优点的误差闸门来源（verilator 实测 / analytic 回退）
+                me = sample_info.get("measured_error")
+                self.found_best_info["measured_error"] = copy.deepcopy(me)
+                self.found_best_info["error_source"] = (
+                    me["source"] if me else
+                    ("analytic_fallback" if self.error_gate == "verilator" else "analytic")
+                )
                 self.found_best_info.update(self._best_info_metadata())
 
     def log_episode(self, episode_idx, info):
@@ -2067,6 +2301,11 @@ class CompressorRouting:
         logging.info(f"sampling")
         self.reset()
         sample_info_list = self.get_samples()
+        if not sample_info_list:
+            # P0(codex)：整批远端 DC 都失败 → 跳过本 episode（不更新策略/best），保持 LR schedule 对齐。
+            logging.warning(f"Episode {episode_idx}: 全批远端 DC 失败, 跳过本轮更新")
+            self.scheduler.step()
+            return
         self.update_found_best_info(sample_info_list)
 
         min_idx = np.argmin([item["objective"] for item in sample_info_list])
@@ -2122,6 +2361,8 @@ class CompressorRouting:
         self.initial_pp = get_initial_partial_product(
             self.bit_width, self.encode_type
         ).astype(int)
+        if self.trunc_cols > 0 and not self._trunc_bits:
+            self._setup_truncation()
         if self.ct_arch == "wallace":
             ct = CompressorTree.wallace(self.initial_pp)
         elif self.ct_arch == "dadda":
@@ -2153,7 +2394,8 @@ class CompressorRouting:
                         "ct22": np.asarray(gomil_data["ct"]["ct22"], dtype=int),
                     }
                     gomil_objective = self.get_objective(
-                        gomil_data["simulated_result_list"]
+                        gomil_data["simulated_result_list"],
+                        cell_types=gomil_data.get("cell_types"),
                     )
                     self.pool.add(gomil_objective, gomil_state)
 
