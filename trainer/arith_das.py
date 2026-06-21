@@ -2108,6 +2108,9 @@ class CompressorRouting:
                 "routing_assignment": routing_assignment,
                 "rtl_path": rtl_path,
                 "simulated_result": self.found_best_info["simulated_result"],
+                # 误差闸门审计：该最优点用的是 verilator 实测还是解析回退
+                "error_source": self.found_best_info.get("error_source"),
+                "measured_error": self.found_best_info.get("measured_error"),
             }
             with open(os.path.join(export_dir, "best_info.json"), "w") as f:
                 json.dump(best_info, f, indent=4, default=convert_to_serializable)
