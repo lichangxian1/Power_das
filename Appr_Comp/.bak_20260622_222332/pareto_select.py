@@ -25,7 +25,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 GROUP_COLOR = {"P": "tab:red", "N": "tab:blue", "Z": "tab:gray", "exact": "black"}
-HI_COLOR = "tab:green"   # 放宽 cap 后在高误差带新选出的代表（区别于原 cap 内的 P/N 选点）
 
 
 def beijing_date():
@@ -87,28 +86,7 @@ def select_reps(cells, k, cap, exact_area):
     return reps
 
 
-def select_reps_band(cells, k, lo, hi, exact_area):
-    """在 (lo, hi] 的高误差带里，从 (wae, area) Pareto front 上取 k 个新代表。
-
-    与 select_reps 同口径（只保留 area<exact 的省面积点 + 取前沿），但只挑 wae 落在
-    (lo, hi] 的前沿点——即原 cap 之外、被放宽 cap 后新进入的那段前沿。按 wae 升序均匀取 k。
-    """
-    saving = [c for c in cells if c["area"] < exact_area - 1e-9] or cells
-    front = pareto_front(saving, "wae", "area")
-    band = [c for c in front if lo + 1e-12 < c["wae"] <= hi + 1e-12]
-    band = sorted(band, key=lambda c: c["wae"])
-    if len(band) <= k:
-        return band
-    idx = [round(i * (len(band) - 1) / (k - 1)) for i in range(k)]
-    seen, reps = set(), []
-    for i in idx:
-        if i not in seen:
-            seen.add(i)
-            reps.append(band[i])
-    return reps
-
-
-def plot_type(cells, ctype, reps_by_group, out_png, hi_reps_by_group=None):
+def plot_type(cells, ctype, reps_by_group, out_png):
     by_g = {g: [c for c in cells if c["group"] == g] for g in ("P", "N", "Z", "exact")}
     exact = by_g["exact"][0] if by_g["exact"] else None
 
@@ -140,17 +118,6 @@ def plot_type(cells, ctype, reps_by_group, out_png, hi_reps_by_group=None):
                            facecolors="none", edgecolors=GROUP_COLOR[g], linewidths=2, zorder=6)
                 ax.annotate(c["alias"].split("_")[-1], (c["wae"], c[ykey]),
                             fontsize=7, xytext=(3, 3), textcoords="offset points")
-        # 放宽 cap 后高误差带新选代表（绿色方块）
-        if hi_reps_by_group:
-            hi = [c for reps in hi_reps_by_group.values() for c in reps]
-            if hi:
-                ax.scatter([c["wae"] for c in hi], [c[ykey] for c in hi], marker="s",
-                           s=85, facecolors="none", edgecolors=HI_COLOR, linewidths=2,
-                           zorder=7, label=f"hi-cap sel (n={len(hi)})")
-                for c in hi:
-                    ax.annotate(c["alias"].split("_")[-1], (c["wae"], c[ykey]),
-                                fontsize=7, color=HI_COLOR, xytext=(3, -9),
-                                textcoords="offset points")
         ax.set_xlabel("weighted |error|  E[|e|]  (LSB)")
         ax.set_ylabel(ylabel)
         ax.set_title(f"comp{ctype}: error vs {ylabel}")
@@ -172,15 +139,6 @@ def plot_type(cells, ctype, reps_by_group, out_png, hi_reps_by_group=None):
                        edgecolors=GROUP_COLOR[g], linewidths=2, zorder=6)
             ax.annotate(c["alias"].split("_")[-1], (c["bias"], c["area"]),
                         fontsize=7, xytext=(3, 3), textcoords="offset points")
-    if hi_reps_by_group:
-        hi = [c for reps in hi_reps_by_group.values() for c in reps]
-        if hi:
-            ax.scatter([c["bias"] for c in hi], [c["area"] for c in hi], marker="s",
-                       s=85, facecolors="none", edgecolors=HI_COLOR, linewidths=2, zorder=7)
-            for c in hi:
-                ax.annotate(c["alias"].split("_")[-1], (c["bias"], c["area"]),
-                            fontsize=7, color=HI_COLOR, xytext=(3, -9),
-                            textcoords="offset points")
     ax.axvline(0, color="k", lw=0.8, ls="--", alpha=0.6)
     ax.set_xlabel("signed bias  E[e]  (LSB)    (neg <-- | --> pos)")
     ax.set_ylabel("area (um^2)")
@@ -194,7 +152,7 @@ def plot_type(cells, ctype, reps_by_group, out_png, hi_reps_by_group=None):
     plt.close(fig)
 
 
-def process_type(lib_path, ctype, k, cap, out_dir, cap2=None, k2=3):
+def process_type(lib_path, ctype, k, cap, out_dir):
     cells = load_cells(lib_path, ctype)
     by_g = {g: [c for c in cells if c["group"] == g] for g in ("P", "N", "Z", "exact")}
 
@@ -210,20 +168,8 @@ def process_type(lib_path, ctype, k, cap, out_dir, cap2=None, k2=3):
     if by_g["exact"]:
         by_g["exact"][0]["alias"] = f"comp{ctype}_exact"
 
-    # 放宽 cap 到 cap2：在 (cap, cap2] 高误差带额外选 k2 个/组新代表（原 cap 内的不动）
-    hi_reps_by_group = None
-    if cap2 is not None and cap2 > cap:
-        hi_reps_by_group = {}
-        for g in ("P", "N"):
-            hi = select_reps_band(by_g[g], k2, cap, cap2, exact_area)
-            hi = sorted(hi, key=lambda c: c["wae"])
-            tag = "pos" if g == "P" else "neg"
-            for i, c in enumerate(hi, 1):
-                c["alias"] = f"comp{ctype}_apx_{tag}_h{i}"
-            hi_reps_by_group[g] = hi
-
     out_png = os.path.join(out_dir, f"pareto_comp{ctype}.png")
-    plot_type(cells, ctype, reps_by_group, out_png, hi_reps_by_group)
+    plot_type(cells, ctype, reps_by_group, out_png)
 
     selected = {}
     if by_g["exact"]:
@@ -232,13 +178,7 @@ def process_type(lib_path, ctype, k, cap, out_dir, cap2=None, k2=3):
     for g in ("P", "N"):
         for c in reps_by_group[g]:
             selected[c["alias"]] = c
-    if hi_reps_by_group:
-        for g in ("P", "N"):
-            for c in hi_reps_by_group[g]:
-                selected[c["alias"]] = c
-    counts = {g: len(by_g[g]) for g in by_g}
-    counts["hi"] = sum(len(v) for v in hi_reps_by_group.values()) if hi_reps_by_group else 0
-    return selected, out_png, counts
+    return selected, out_png, {g: len(by_g[g]) for g in by_g}
 
 
 def main():
@@ -247,9 +187,6 @@ def main():
     ap.add_argument("--lib", default=os.path.join(HERE, "library.json"))
     ap.add_argument("--k", type=int, default=3, help="每组(P/N)选几个代表")
     ap.add_argument("--cap", type=float, default=0.5, help="代表的 wae 上限")
-    ap.add_argument("--cap2", type=float, default=1.0,
-                    help="放宽上限：comp32 在 (cap, cap2] 高误差带再选 k2 个/组新代表（绿色方块）")
-    ap.add_argument("--k2", type=int, default=3, help="高误差带每组(P/N)新选几个（仅 comp32）")
     args = ap.parse_args()
 
     out_dir = os.path.join(ROOT, "outputs", f"{beijing_date()}_appr_comp_pareto")
@@ -257,9 +194,7 @@ def main():
 
     all_selected = {}
     for ctype in ("32", "22"):
-        c2 = args.cap2 if ctype == "32" else None   # 高误差带二次选点只针对 3:2
-        selected, png, counts = process_type(args.lib, ctype, args.k, args.cap, out_dir,
-                                             cap2=c2, k2=args.k2)
+        selected, png, counts = process_type(args.lib, ctype, args.k, args.cap, out_dir)
         all_selected.update(selected)
         print(f"\n=== comp{ctype}  组规模 {counts}  -> {png}")
         print(f"  {'alias':22s} {'module':13s} {'bias':>7s} {'wae':>6s} {'ER':>5s} "

@@ -46,6 +46,10 @@ def main():
     p.add_argument("--samples", type=int, default=None)
     p.add_argument("--n_processing", type=int, default=None)
     p.add_argument("--med_budget", type=float, default=None)
+    p.add_argument("--error_scale", type=float, default=None,
+                   help="MED 软罚归一化分母；低误差段需调小（默认 1e5 在低 MED 下罚项可忽略）")
+    p.add_argument("--med_violation_weight", type=float, default=None,
+                   help="MED 超预算软罚权重")
     p.add_argument("--trunc_cols", type=int, default=None, help="① 低列截断深度 k（0=无截断）")
     p.add_argument("--wce_budget", type=float, default=None, help="④ WCE 上限（LSB）")
     p.add_argument("--target_delay", type=float, default=1.5, help="DC 时钟周期 (ns)")
@@ -109,6 +113,10 @@ def main():
         tk["n_full_target_delay_processing"] = args.n_processing
     if args.med_budget is not None:
         tk["med_budget"] = args.med_budget
+    if args.error_scale is not None:
+        tk["error_scale"] = args.error_scale
+    if args.med_violation_weight is not None:
+        tk["med_violation_weight"] = args.med_violation_weight
     if args.trunc_cols is not None:
         tk["trunc_cols"] = args.trunc_cols
     if args.wce_budget is not None:

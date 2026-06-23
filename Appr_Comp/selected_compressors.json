@@ -2,7 +2,7 @@
   "meta": {
     "k": 3,
     "cap": 0.5,
-    "out_dir": "/home/lichangxian/Arith-DAS-CUSTOM/outputs/2026-06-18_appr_comp_pareto"
+    "out_dir": "/home/lee/Power_das/outputs/2026-06-23_appr_comp_pareto"
   },
   "selected": {
     "comp32_exact": {
@@ -16,16 +16,7 @@
       "area": 10.92,
       "power_mw": 0.5680668999999999,
       "delay_ns": 0.5,
-      "alias": "comp32_exact",
-      "delay_arcs": {
-        "Tas": 0.49,
-        "Tac": 0.48,
-        "Tbs": 0.5,
-        "Tbc": 0.48,
-        "Tcs": 0.46,
-        "Tcc": 0.45
-      },
-      "tmax": 0.5
+      "alias": "comp32_exact"
     },
     "comp32_apx_pos_1": {
       "name": "comp32_b994",
@@ -38,16 +29,7 @@
       "area": 10.416,
       "power_mw": 0.5132371000000001,
       "delay_ns": 0.47,
-      "alias": "comp32_apx_pos_1",
-      "delay_arcs": {
-        "Tas": 0.47,
-        "Tac": 0.47,
-        "Tbs": 0.47,
-        "Tbc": 0.47,
-        "Tcs": 0.46,
-        "Tcc": 0.45
-      },
-      "tmax": 0.47
+      "alias": "comp32_apx_pos_1"
     },
     "comp32_apx_pos_2": {
       "name": "comp32_aa54",
@@ -60,16 +42,7 @@
       "area": 4.872,
       "power_mw": 0.23557060000000002,
       "delay_ns": 0.46,
-      "alias": "comp32_apx_pos_2",
-      "delay_arcs": {
-        "Tas": 0.45,
-        "Tac": 0.0,
-        "Tbs": 0.46,
-        "Tbc": null,
-        "Tcs": 0.46,
-        "Tcc": null
-      },
-      "tmax": 0.46
+      "alias": "comp32_apx_pos_2"
     },
     "comp32_apx_pos_3": {
       "name": "comp32_fe54",
@@ -82,16 +55,7 @@
       "area": 4.2,
       "power_mw": 0.2272437,
       "delay_ns": 0.44,
-      "alias": "comp32_apx_pos_3",
-      "delay_arcs": {
-        "Tas": null,
-        "Tac": 0.0,
-        "Tbs": 0.44,
-        "Tbc": null,
-        "Tcs": 0.44,
-        "Tcc": null
-      },
-      "tmax": 0.44
+      "alias": "comp32_apx_pos_3"
     },
     "comp32_apx_neg_1": {
       "name": "comp32_a994",
@@ -104,16 +68,7 @@
       "area": 9.912,
       "power_mw": 0.5472904999999999,
       "delay_ns": 0.47,
-      "alias": "comp32_apx_neg_1",
-      "delay_arcs": {
-        "Tas": 0.46,
-        "Tac": 0.47,
-        "Tbs": 0.46,
-        "Tbc": 0.47,
-        "Tcs": 0.46,
-        "Tcc": 0.47
-      },
-      "tmax": 0.47
+      "alias": "comp32_apx_neg_1"
     },
     "comp32_apx_neg_2": {
       "name": "comp32_5550",
@@ -126,16 +81,7 @@
       "area": 4.536,
       "power_mw": 0.2272437,
       "delay_ns": 0.44,
-      "alias": "comp32_apx_neg_2",
-      "delay_arcs": {
-        "Tas": 0.44,
-        "Tac": null,
-        "Tbs": 0.44,
-        "Tbc": null,
-        "Tcs": null,
-        "Tcc": null
-      },
-      "tmax": 0.44
+      "alias": "comp32_apx_neg_2"
     },
     "comp32_apx_neg_3": {
       "name": "comp32_5500",
@@ -148,16 +94,46 @@
       "area": 0.336,
       "power_mw": 0.0,
       "delay_ns": 0.0,
-      "alias": "comp32_apx_neg_3",
-      "delay_arcs": {
-        "Tas": 0.0,
-        "Tac": null,
-        "Tbs": null,
-        "Tbc": null,
-        "Tcs": null,
-        "Tcc": null
-      },
-      "tmax": 0.0
+      "alias": "comp32_apx_neg_3"
+    },
+    "comp32_apx_pos_h1": {
+      "name": "comp32_f555",
+      "type": "32",
+      "group": "P",
+      "bias": 0.375,
+      "wae": 0.5625,
+      "er": 0.5625,
+      "maxe": 1,
+      "area": 4.032,
+      "power_mw": 0.0791519,
+      "delay_ns": 0.43,
+      "alias": "comp32_apx_pos_h1"
+    },
+    "comp32_apx_pos_h2": {
+      "name": "comp32_5555",
+      "type": "32",
+      "group": "P",
+      "bias": 0.25,
+      "wae": 0.59375,
+      "er": 0.578125,
+      "maxe": 2,
+      "area": 0.672,
+      "power_mw": 0.0,
+      "delay_ns": 0.0,
+      "alias": "comp32_apx_pos_h2"
+    },
+    "comp32_apx_pos_h3": {
+      "name": "comp32_ff55",
+      "type": "32",
+      "group": "P",
+      "bias": 0.75,
+      "wae": 0.84375,
+      "er": 0.703125,
+      "maxe": 2,
+      "area": 0.336,
+      "power_mw": 0.0,
+      "delay_ns": 0.0,
+      "alias": "comp32_apx_pos_h3"
     },
     "comp22_exact": {
       "name": "comp22_94",
@@ -170,16 +146,7 @@
       "area": 8.736,
       "power_mw": 0.3743626,
       "delay_ns": 0.46,
-      "alias": "comp22_exact",
-      "delay_arcs": {
-        "Tas": 0.46,
-        "Tac": 0.43,
-        "Tbs": null,
-        "Tbc": null,
-        "Tcs": 0.46,
-        "Tcc": 0.43
-      },
-      "tmax": 0.46
+      "alias": "comp22_exact"
     },
     "comp22_apx_pos_1": {
       "name": "comp22_a4",
@@ -192,16 +159,7 @@
       "area": 4.704,
       "power_mw": 0.15217779999999997,
       "delay_ns": 0.46,
-      "alias": "comp22_apx_pos_1",
-      "delay_arcs": {
-        "Tas": 0.44,
-        "Tac": 0.0,
-        "Tbs": null,
-        "Tbc": null,
-        "Tcs": 0.46,
-        "Tcc": null
-      },
-      "tmax": 0.46
+      "alias": "comp22_apx_pos_1"
     },
     "comp22_apx_pos_2": {
       "name": "comp22_e4",
@@ -214,16 +172,7 @@
       "area": 0.0,
       "power_mw": 0.0,
       "delay_ns": 0.0,
-      "alias": "comp22_apx_pos_2",
-      "delay_arcs": {
-        "Tas": null,
-        "Tac": 0.0,
-        "Tbs": null,
-        "Tbc": null,
-        "Tcs": 0.0,
-        "Tcc": null
-      },
-      "tmax": 0.0
+      "alias": "comp22_apx_pos_2"
     },
     "comp22_apx_neg_1": {
       "name": "comp22_54",
@@ -236,16 +185,7 @@
       "area": 4.536,
       "power_mw": 0.2272437,
       "delay_ns": 0.44,
-      "alias": "comp22_apx_neg_1",
-      "delay_arcs": {
-        "Tas": 0.44,
-        "Tac": null,
-        "Tbs": null,
-        "Tbc": null,
-        "Tcs": 0.44,
-        "Tcc": null
-      },
-      "tmax": 0.44
+      "alias": "comp22_apx_neg_1"
     },
     "comp22_apx_neg_2": {
       "name": "comp22_50",
@@ -258,16 +198,7 @@
       "area": 0.336,
       "power_mw": 0.0,
       "delay_ns": 0.0,
-      "alias": "comp22_apx_neg_2",
-      "delay_arcs": {
-        "Tas": 0.0,
-        "Tac": null,
-        "Tbs": null,
-        "Tbc": null,
-        "Tcs": null,
-        "Tcc": null
-      },
-      "tmax": 0.0
+      "alias": "comp22_apx_neg_2"
     }
   }
 }

@@ -14,8 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from enumerate_compressors import enumerate_compressors
 
-N_NEW_32 = 2000          # comp32 新增的 lowest-wae rep 数（MAXWAE_32=None 时生效）
-MAXWAE_32 = 1.0          # comp32 只补到 wae<=该上限（配 pareto cap=1.0；None=退回用 N_NEW_32）
+N_NEW_32 = 2000          # comp32 新增的 lowest-wae rep 数
 MAXE_32 = 2              # comp32 放宽到 |e|<=2
 MAXE_22 = 3              # comp22 max_e=3 即覆盖全部 256
 
@@ -44,16 +43,11 @@ def main():
     reps32 = reps_by_canon(enumerate_compressors(3, MAXE_32, [0.25, 0.25, 0.25]))
     new32 = sorted((r for k, r in reps32.items() if k not in done32),
                    key=lambda x: x["weighted_absolute_error"])
-    if MAXWAE_32 is not None:
-        take32 = [r for r in new32 if r["weighted_absolute_error"] <= MAXWAE_32]
-        take_note = f"new wae<={MAXWAE_32}"
-    else:
-        take32 = new32[:N_NEW_32]
-        take_note = f"lowest-wae {len(take32)} new"
+    take32 = new32[:N_NEW_32]
     sel32_keys = set(done32) | {r["canon_key"] for r in take32}
     sel32 = [reps32[k] for k in sel32_keys if k in reps32]
     json.dump({"meta": {"max_e": MAXE_32,
-                        "note": f"done {len(done32)} + {take_note} ({len(take32)})",
+                        "note": f"done {len(done32)} + lowest-wae {len(take32)} new",
                         "n": len(sel32)},
                "candidates": sel32}, open(os.path.join(HERE, "cand_32.json"), "w"))
     wae_lo = take32[0]["weighted_absolute_error"] if take32 else None
