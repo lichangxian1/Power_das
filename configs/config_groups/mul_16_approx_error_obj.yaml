@@ -1,0 +1,104 @@
+# 正常训练（含近似 cell）但把误差当普通目标项的变体。相对 mul_16_and_approx_p2p1.yaml：
+#   error_as_metric: true   —— get_objective 用 error_weight*med/error_scale 线性计入目标
+#                              （和 area_weight*area/area_scale、power_weight*power/power_scale
+#                               完全同评估方式），不再用 med_budget 铰链 max(0,med-budget)。
+#   use_error_loss:  false  —— 关掉"可微误差 surrogate"（get_error_loss 不再进 loss）。
+#   med_budget:      null   —— 误差当目标后不需要预算；CLI 传 --med_budget 在本模式也忽略。
+# area/power 权重沿用 2.0/1.0；如要按斜率配平 power 可改 1.84（area:power per-decade 等权）。
+experiment:
+  kwargs:
+    seed: 42
+    log_level: INFO
+    experiment_prefix: mul_16_approx_error_obj_routing_gene
+    device: &device cuda:0
+    log_dir: logs
+    build_dir: build
+    rtl_file: MUL.v
+    n_processing: 12
+    n_full_target_delay_processing: 12
+    bit_width: 16
+    encode_type: and
+    ct_arch: dadda
+
+trainer:
+  name: CompressorRoutingGeneArch
+  kwargs:
+    # loss params
+    use_ppo_loss: true
+    ppo_loss_weight: 1.0
+    use_delay_loss: false
+    delay_loss_weight: 0.1
+    use_glitch_loss: false
+    glitch_loss_weight: 0.1
+    lse_gamma_val: 0.01
+    use_rule_loss: true
+    rule_loss_weight: 1e-2
+    rule_loss_wight_incr: 1e-3
+    use_disc_loss: true
+    disc_loss_weight: 1e-2
+    disc_loss_weight_incr: 1e-3
+    # training scale
+    num_episodes: 300
+    num_samples: 2
+    num_epochs: 1 # ppo epochs
+    save_freq: 100
+    log_freq: 1
+    # learning params
+    optim_name: Adam
+    optim_kwargs:
+      lr: 1e-4
+    scheduler_name: CosineAnnealingLR
+    scheduler_kwargs:
+      T_max: 300
+      eta_min: 1e-5
+    clip_range: 0.2
+    max_grad_norm: 0.5
+    # model params
+    gcn_kwargs:
+      input_dim: 7
+      hidden_dims_list: [[512, 512], [256, 256], [128, 128]]
+      output_dim: 64
+      activation: tanh
+      use_layernorm: true
+      dropout: 0.0
+    # eda params  —— area/power 与误差三项同评估: weight*value/scale
+    delay_weight: 2.0          # train_dc.py 会强制置 0（delay 当时序约束）
+    # 按拟合前沿(area/power vs log10 MED)每-decade配平: |s_a|/Sa=0.1435 ≈ |s_p|/Sp=0.1562
+    area_weight: 2.0
+    power_weight: 1.84         # = 2.0 * 0.1435/0.1562，area/power 等权
+    delay_scale: 1.394475
+    area_scale: 2026.5
+    power_scale: 0.0035775
+    use_power_proxy: false
+    power_source: eda
+    area_violation_weight: 1.0
+    delay_violation_weight: 1.0
+    reference_point: [2.0, 3000]
+    pareto_target: ["delay", "area"]
+    pool_size: 20
+    gomil_path: null
+
+    # ===== 近似压缩器类型搜索（保持开启）=====
+    use_approx_types: true
+    approx_lib_path: Appr_Comp/selected_compressors.json
+    approx_library_path: Appr_Comp/library.json
+    approx_max_col: 16
+
+    # ===== 误差作为普通目标项（核心改动）=====
+    error_as_metric: true       # med 线性计入 obj: error_weight*med/error_scale
+    error_scale_mode: pow2k     # error_scale=2^(trunc_cols-1) 跨-k 归一 → 单一 error_weight 通吃所有 k
+                                # 可选 floor(=截断MED floor,精确归一); fixed=用下面的常数 error_scale
+    # 归一后操作点 r = med*/2^(k-1) = 0.249/error_weight（与 k 无关）；floor 处 r≈2，
+    # 故 error_weight<0.124 近似 cell 才会把 med 推到 floor 之上。固定 error_weight 时扫 k 即扫前沿。
+    error_weight: 0.06          # r≈4(med*≈2×floor)；调大→更贴floor/更省误差，调小→更省面积
+    error_scale: 1.0e5          # pow2k/floor 模式下此值被覆盖（仅 fixed 用）
+    med_budget: null            # 误差当目标后无需预算（本模式忽略 budget 铰链）
+    med_violation_weight: 1.0   # 本模式不生效（保留向后兼容）
+    bias_weight: 0.0            # 关闭偏置罚（误差只看 MED）
+
+    # ===== 关掉可微误差 surrogate =====
+    use_error_loss: false
+    error_loss_weight: 0.0
+    bias_loss_weight: 0.0
+
+    normalize_advantage: true

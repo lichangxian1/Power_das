@@ -498,6 +498,18 @@ class CompressorRouting:
         # 误差项归一尺度（点2）：把 med/bias 的 LSB 绝对值除以 error_scale，使 err_term
         # 落到和 PPA(~O(1)) 同量级。默认 1.0 = 不归一（旧行为，向后兼容）。
         error_scale=1.0,
+        # 误差作为普通目标项（和 area/power 同评估）：error_as_metric=True 时 get_objective
+        # 用 error_weight*med/error_scale 线性计入目标（像 area_weight*area/area_scale），
+        # 不再用 med_budget 铰链 max(0,med-budget)；此模式下 med_budget/med_violation_weight 忽略。
+        error_as_metric=False,
+        error_weight=0.0,
+        # error_scale 跨-k 归一模式（仅 error_as_metric 用，解决"不同 k 的 MED 差几个数量级、
+        # 固定 error_scale 没法用一个 error_weight 通吃"）：
+        #   "fixed" = 用传入的 error_scale 常数（旧行为）；
+        #   "pow2k" = error_scale=2^(trunc_cols-1)（截断边界 LSB 权重，闭式、≈floor）；
+        #   "floor" = error_scale=截断 MED floor self._trunc_med（精确、各 k 归一后 floor 处=1）。
+        # pow2k/floor 下 med/error_scale≈O(1) 对所有 k → 单一 error_weight 跨 k 行为一致。
+        error_scale_mode="fixed",
         # 可微误差 surrogate（D2 开关）
         use_error_loss=False,
         error_loss_weight=0.0,
@@ -619,6 +631,9 @@ class CompressorRouting:
         self.error_gate_vectors = int(error_gate_vectors)
         self.bias_weight = bias_weight
         self.error_scale = error_scale
+        self.error_as_metric = bool(error_as_metric)
+        self.error_weight = error_weight
+        self.error_scale_mode = error_scale_mode
         self.use_error_loss = use_error_loss
         self.error_loss_weight = error_loss_weight
         self.bias_loss_weight = bias_loss_weight
@@ -870,6 +885,20 @@ class CompressorRouting:
             "MED_trunc=%.2f WCE_trunc=%d bits=%s",
             k, e_delta, c_actual, c_target, delta_max, trunc_med, self._trunc_wce, bits,
         )
+        # 跨-k 归一 error_scale（仅 error_as_metric）：让 med/error_scale≈O(1) 对所有 k，
+        # 从而单一 error_weight 跨 k 行为一致（见 error_scale_mode 注释）。
+        if self.error_as_metric and self.error_scale_mode != "fixed" and k > 0:
+            if self.error_scale_mode == "pow2k":
+                self.error_scale = float(1 << (k - 1))
+            elif self.error_scale_mode == "floor":
+                self.error_scale = max(float(self._trunc_med), 1.0)
+            else:
+                raise ValueError(f"未知 error_scale_mode={self.error_scale_mode!r}")
+            logging.info(
+                "[trunc] error_scale_mode=%s -> error_scale=%.2f "
+                "(归一后 floor/scale=%.3f)",
+                self.error_scale_mode, self.error_scale, trunc_med / self.error_scale,
+            )
 
     def _analytic_error(self, type_choices):
         """从采样类型闭式估计 (med_lsb, abs_bias_lsb, nmed, wce_lsb)。
@@ -1992,7 +2021,11 @@ class CompressorRouting:
                 med = measured_error["med"]
                 abs_bias = abs(measured_error["bias"])
             # 点2：除 error_scale 把 LSB 绝对值压到和 PPA 同量级。
-            if self.med_budget is not None:
+            if self.error_as_metric:
+                # 误差作为普通目标项，评估方式同 area/power：error_weight*med/error_scale
+                # （线性计入，无 budget 铰链；med_budget/med_violation_weight 此模式忽略）。
+                err_term += self.error_weight * med / self.error_scale
+            elif self.med_budget is not None:
                 err_term += (
                     self.med_violation_weight
                     * max(0.0, med - self.med_budget)
@@ -2229,6 +2262,18 @@ class CompressorRouting:
                 )
                 self.found_best_info.update(self._best_info_metadata())
 
+    def _effective_med(self, d):
+        """与 get_objective 同口径的 MED（供日志/上报）：verilator 实测优先，失败回退
+        解析；无误差源（无近似 cell 且无截断）= 0。d 可为单个 sample_info 或 found_best_info。"""
+        me = d.get("measured_error")
+        if (self.error_gate == "verilator"
+                and me is not None and me.get("med") is not None):
+            return float(me["med"])
+        if (self.use_approx_types and d.get("cell_types")) or self.trunc_cols > 0:
+            med, _b, _n, _w = self._analytic_error(d.get("cell_types") or {})
+            return float(med)
+        return 0.0
+
     def log_episode(self, episode_idx, info):
         self.tb_logger.add_scalar("objective", info["objective"], episode_idx)
         self.tb_logger.add_scalar(
@@ -2261,6 +2306,7 @@ class CompressorRouting:
                 ppa_value += simulated_result[ppa_key]
             ppa_value /= len(info["simulated_result"])
             self.tb_logger.add_scalar(f"ppa/{ppa_key}", ppa_value, episode_idx)
+        self.tb_logger.add_scalar("ppa/med", info.get("med", 0.0), episode_idx)
         self.tb_logger.add_scalar("lr", self.scheduler.get_last_lr()[0], episode_idx)
 
         self.tb_logger.add_scalar(
@@ -2274,6 +2320,8 @@ class CompressorRouting:
                 ppa_value += simulated_result[ppa_key]
             ppa_value /= len(self.found_best_info["simulated_result"])
             self.tb_logger.add_scalar(f"found_best/{ppa_key}", ppa_value, episode_idx)
+        best_med = self._effective_med(self.found_best_info)
+        self.tb_logger.add_scalar("found_best/med", best_med, episode_idx)
         self.tb_logger.add_scalar("lr", self.scheduler.get_last_lr()[0], episode_idx)
 
         # ── real-time console progress ──────────────────────────────────────
@@ -2290,12 +2338,12 @@ class CompressorRouting:
         )
         logging.info(
             "[ep %4d/%d]  obj=%.6f  area=%.1f  delay=%.4fns"
-            "  pwr=%.4fmW[%s]%s%s"
-            "  || best: obj=%.6f  area=%.1f  pwr=%.4fmW",
+            "  pwr=%.4fmW[%s]  med=%.1f%s%s"
+            "  || best: obj=%.6f  area=%.1f  pwr=%.4fmW  med=%.1f",
             episode_idx, self.num_episodes, info["objective"],
             cur["area"], cur["delay"], cur["power"] * 1000,
-            self.power_source, vio_str, proxy_str,
-            best["objective"], best["area"], best["power"] * 1000,
+            self.power_source, info.get("med", float("nan")), vio_str, proxy_str,
+            best["objective"], best["area"], best["power"] * 1000, best_med,
         )
 
     def run_episode(self, episode_idx):
@@ -2316,6 +2364,7 @@ class CompressorRouting:
         info["epoch_loss"] = []
         info["objective"] = sample_info_list[min_idx]["objective"]
         info["simulated_result"] = sample_info_list[min_idx]["result"]
+        info["med"] = self._effective_med(sample_info_list[min_idx])
 
         self.update_pool(sample_info_list[min_idx]["objective"], self.state)
 
@@ -2343,8 +2392,9 @@ class CompressorRouting:
                 l_delay = self.get_delay_loss(Z_mat_dict)
                 l += self.delay_loss_weight * l_delay
                 loss_info["l_delay"] = l_delay.item()
-            if self.use_error_loss and self.use_approx_types:
-                # D2 可微误差 surrogate（权重已在 get_error_loss 内部乘好）
+            if self.use_error_loss and self.use_approx_types and not self.error_as_metric:
+                # D2 可微误差 surrogate（权重已在 get_error_loss 内部乘好）。
+                # error_as_metric 模式下误差已作普通目标项进 reward，可微 surrogate 关闭。
                 l_error = self.get_error_loss()
                 l += l_error
                 loss_info["l_error"] = l_error.item()
