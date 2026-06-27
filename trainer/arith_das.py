@@ -767,16 +767,16 @@ class CompressorRouting:
 
         sel = json.load(open(self._resolve_path(sel_path)))["selected"]
         lib = json.load(open(self._resolve_path(lib_path)))["cells"]
-        order32 = [
-            "comp32_exact", "comp32_apx_pos_1", "comp32_apx_pos_2", "comp32_apx_pos_3",
-            "comp32_apx_neg_1", "comp32_apx_neg_2", "comp32_apx_neg_3",
-        ]
-        order22 = [
-            "comp22_exact", "comp22_apx_pos_1", "comp22_apx_pos_2",
-            "comp22_apx_neg_1", "comp22_apx_neg_2",
-        ]
-        self.type_table_32 = [dict(sel[k]) for k in order32 if k in sel]
-        self.type_table_22 = [dict(sel[k]) for k in order22 if k in sel]
+        # 别名顺序：直接从 selected 文件按 type 字段读取（exact 永远在 index 0，其余按文件
+        # 出现顺序）。不再写死 pos/neg 的 6+4 槽位，使菜单大小可变（v3 lean/dense A/B 对照）。
+        # 向后兼容旧 selected_compressors.json（同样筛出 exact+6/exact+4、index0=exact）。
+        def _ordered(ctype):
+            ks = [k for k, v in sel.items() if v.get("type") == ctype]
+            ex = [k for k in ks if sel[k].get("group") == "exact"]
+            ap = [k for k in ks if sel[k].get("group") != "exact"]
+            return ex + ap
+        self.type_table_32 = [dict(sel[k]) for k in _ordered("32")]
+        self.type_table_22 = [dict(sel[k]) for k in _ordered("22")]
         assert self.type_table_32[0]["group"] == "exact", "T32[0] 必须是 exact"
         assert self.type_table_22[0]["group"] == "exact", "T22[0] 必须是 exact"
 
