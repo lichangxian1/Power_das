@@ -507,6 +507,9 @@ class CompressorRouting:
         # ≈exp(b)/(exp(b)+N-1)（如 4.0→~0.9）。让策略从"近全 exact"起步、按需加近似 cell，
         # 避免冷启动 ~85% 节点随机近似导致前期 obj 爆高、PPA 梯度被淹。默认 0=旧行为。
         exact_init_bias=0.0,
+        # 保底候选：每轮额外评估一个同 routing、全 exact cell 的设计，只参与 best/日志，
+        # 不进 PPO loss。用于避免类型采样把 found_best 拖到比纯截断同 routing 更差。
+        inject_exact_candidate=False,
         # error_scale 跨-k 归一模式（仅 error_as_metric 用，解决"不同 k 的 MED 差几个数量级、
         # 固定 error_scale 没法用一个 error_weight 通吃"）：
         #   "fixed"  = 用传入的 error_scale 常数（旧行为）；
@@ -638,6 +641,7 @@ class CompressorRouting:
         self.error_scale = error_scale
         self.error_as_metric = bool(error_as_metric)
         self.error_weight = error_weight
+        self.inject_exact_candidate = bool(inject_exact_candidate)
         self.error_scale_mode = error_scale_mode
         self.use_error_loss = use_error_loss
         self.error_loss_weight = error_loss_weight
@@ -1904,6 +1908,29 @@ class CompressorRouting:
                         "cell_types": type_choices,
                     }
                 )
+                if (
+                    self.inject_exact_candidate
+                    and self.use_approx_types
+                    and sample_idx == 0
+                ):
+                    exact_rtl_path = os.path.join(
+                        self.build_dir, f"MUL-{self.num_samples}-exact.v"
+                    )
+                    mul.emit_verilog(
+                        exact_rtl_path,
+                        assignment=self.emit_assignment(samples_connection, cell_map={}),
+                        extra_modules_src="",
+                    )
+                    sample_info.append(
+                        {
+                            "rtl_path": exact_rtl_path,
+                            "connection": samples_connection,
+                            "overall_log_prob": overall_log_prob,
+                            "cell_types": {},
+                            "baseline_only": True,
+                            "candidate_kind": "all_exact",
+                        }
+                    )
 
             if self.synth in ("openroad", "dc"):
                 if self.fixed_target_delay is not None:
@@ -1985,6 +2012,12 @@ class CompressorRouting:
                     lvl = logging.ERROR if n_fb * 2 > len(kept_sample_info) else logging.INFO
                     logging.log(lvl, "[errgate] verilator 回退解析 %d/%d 样本",
                                 n_fb, len(kept_sample_info))
+            if self.inject_exact_candidate:
+                exact_kept = sum(
+                    1 for s in kept_sample_info
+                    if s.get("candidate_kind") == "all_exact"
+                )
+                logging.info("[exact] all-exact baseline candidates kept: %d", exact_kept)
         return kept_sample_info
 
     def _summarize_result(self, simulated_result):
@@ -2380,6 +2413,9 @@ class CompressorRouting:
             self.scheduler.step()
             return
         self.update_found_best_info(sample_info_list)
+        ppo_sample_info_list = [
+            item for item in sample_info_list if not item.get("baseline_only")
+        ]
 
         min_idx = np.argmin([item["objective"] for item in sample_info_list])
         info = {}
@@ -2396,10 +2432,12 @@ class CompressorRouting:
 
             loss_info = {}
             l = torch.tensor([0.0], device=self.device)
-            if self.use_ppo_loss:
-                l_ppo = self.get_ppo_loss(Z_mat_dict, sample_info_list)
+            if self.use_ppo_loss and ppo_sample_info_list:
+                l_ppo = self.get_ppo_loss(Z_mat_dict, ppo_sample_info_list)
                 l += self.ppo_loss_weight * l_ppo
                 loss_info["l_ppo"] = l_ppo.item()
+            elif self.use_ppo_loss:
+                loss_info["l_ppo"] = 0.0
             if self.use_disc_loss:
                 l_discrete = self.get_discrete_loss(Z_mat_dict)
                 l += self.disc_loss_weight * l_discrete

@@ -84,6 +84,7 @@ trainer:
     approx_library_path: Appr_Comp/library.json
     approx_max_col: 16
     exact_init_bias: 4.0        # 类型头初始偏向 exact：初始 P(exact)≈0.9，从"近全exact"起步按需加近似cell
+    inject_exact_candidate: true # 每轮额外评估同 routing 的 all-exact 候选，只保底 best，不进 PPO
 
     # ===== 误差作为普通目标项（核心改动）=====
     error_as_metric: true       # med 线性计入 obj: error_weight*med/error_scale
