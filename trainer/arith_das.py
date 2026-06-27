@@ -503,11 +503,16 @@ class CompressorRouting:
         # 不再用 med_budget 铰链 max(0,med-budget)；此模式下 med_budget/med_violation_weight 忽略。
         error_as_metric=False,
         error_weight=0.0,
+        # 类型头初始化偏向 exact(index0)：>0 时给 type_head bias[0] 设此正偏置 → 初始 P(exact)
+        # ≈exp(b)/(exp(b)+N-1)（如 4.0→~0.9）。让策略从"近全 exact"起步、按需加近似 cell，
+        # 避免冷启动 ~85% 节点随机近似导致前期 obj 爆高、PPA 梯度被淹。默认 0=旧行为。
+        exact_init_bias=0.0,
         # error_scale 跨-k 归一模式（仅 error_as_metric 用，解决"不同 k 的 MED 差几个数量级、
         # 固定 error_scale 没法用一个 error_weight 通吃"）：
-        #   "fixed" = 用传入的 error_scale 常数（旧行为）；
-        #   "pow2k" = error_scale=2^(trunc_cols-1)（截断边界 LSB 权重，闭式、≈floor）；
-        #   "floor" = error_scale=截断 MED floor self._trunc_med（精确、各 k 归一后 floor 处=1）。
+        #   "fixed"  = 用传入的 error_scale 常数（旧行为）；
+        #   "pow2k"  = error_scale=2^(trunc_cols-1)（闭式，med/scale 跨 k ~3.7×）；
+        #   "sqrt2k" = error_scale=√k·2^(k-1)（闭式，更平，med/scale 跨 k ~1.3×；floor∝std(Δ)）；
+        #   "floor"  = error_scale=截断 MED floor self._trunc_med（精确、各 k 归一后 floor 处=1）。
         # pow2k/floor 下 med/error_scale≈O(1) 对所有 k → 单一 error_weight 跨 k 行为一致。
         error_scale_mode="fixed",
         # 可微误差 surrogate（D2 开关）
@@ -667,6 +672,19 @@ class CompressorRouting:
             self.type_head_22 = nn.Linear(
                 self.gcn.embedding_dim, len(self.type_table_22)
             ).to(device)
+            # 类型头初始化偏向 exact(index0)：给 bias[0] 设正偏置，使初始策略≈"近全 exact"、
+            # 按需再加近似 cell（而非随机≈均匀→~85% 节点一上来就近似）。默认 0=旧行为。
+            if exact_init_bias:
+                import math as _m
+                with torch.no_grad():
+                    self.type_head_32.bias[0] = float(exact_init_bias)
+                    self.type_head_22.bias[0] = float(exact_init_bias)
+                eb = _m.exp(float(exact_init_bias))
+                logging.info(
+                    "[approx] type_head exact-init bias=%.2f -> 初始 P(exact)≈%.2f(T32)/%.2f(T22)",
+                    exact_init_bias, eb / (eb + len(self.type_table_32) - 1),
+                    eb / (eb + len(self.type_table_22) - 1),
+                )
             self._bias32 = torch.tensor(
                 [e["bias"] for e in self.type_table_32], device=device
             )
@@ -890,6 +908,10 @@ class CompressorRouting:
         if self.error_as_metric and self.error_scale_mode != "fixed" and k > 0:
             if self.error_scale_mode == "pow2k":
                 self.error_scale = float(1 << (k - 1))
+            elif self.error_scale_mode == "sqrt2k":
+                # √k·2^(k-1)：截断 MED floor ∝ std(Δ) ∝ √k·2^(k-1)，比 pow2k 跨 k 更平
+                # （med/scale 跨 k 仅 ~1.3× vs pow2k ~3.7×）。
+                self.error_scale = (float(k) ** 0.5) * float(1 << (k - 1))
             elif self.error_scale_mode == "floor":
                 self.error_scale = max(float(self._trunc_med), 1.0)
             else:
