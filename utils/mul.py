@@ -224,6 +224,30 @@ class Mul:
                         verilog_str += f"{f_str}assign pp_{column_index}[{pp_index}] = refined_y_{encoder_index}[{bit_pos}];\n"
                     sgn_index = (column_index - (self.bit_width + 4)) // 2 + 2
                     verilog_str += f"{f_str}assign pp_{column_index}[{initial_pp[column_index] - 1}] = ~sgn_{sgn_index};\n"
+
+            # Phase C ①（booth）：低列截断。booth 的 pp 位由 encoder 输出/符号位驱动，
+            # 索引公式分多种 special case，故不在各发射点内联，而在生成后统一改写：把
+            # col<trunc_cols 的所有 pp 位（含符号位）改成常数（前 m 个 1'b1 注入校正常数 C，
+            # 其余 1'b0）。等价 AND 路径——out = a*b − Δ_low + C，DC 常数传播删低列逻辑＝截断
+            # PPA 收益；误差由 verilator 闸门实测（C 用 P=1/4 估计、对 booth 偏置非最优但 bit
+            # 口径一致、各候选同 C ⇒ 对比公平）。是覆盖（非新增驱动），不会重复 assign。
+            trunc_cols = int(getattr(self.ct, "trunc_cols", 0) or 0)
+            if trunc_cols > 0:
+                import re as _re
+                trunc_bits = getattr(self.ct, "trunc_bits", None) or {}
+                _pat = _re.compile(r"^\s*assign pp_(\d+)\[(\d+)\] = ")
+                _lines = []
+                for _line in verilog_str.split("\n"):
+                    _mo = _pat.match(_line)
+                    if _mo:
+                        _c, _i = int(_mo.group(1)), int(_mo.group(2))
+                        if _c < trunc_cols:
+                            _m = int(trunc_bits.get(_c, 0))
+                            _bit = "1'b1" if _i < _m else "1'b0"
+                            _lines.append(f"{f_str}assign pp_{_c}[{_i}] = {_bit};")
+                            continue
+                    _lines.append(_line)
+                verilog_str = "\n".join(_lines)
         else:
             raise NotImplementedError
 

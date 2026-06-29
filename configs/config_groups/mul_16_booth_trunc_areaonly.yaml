@@ -1,0 +1,99 @@
+# 纯 k 截断 + 只优化 area 的 arith-das baseline（对照 trunc_dadda_baseline，但布线/压缩树
+# 由 PPO 搜索而非固定随机布线）。相对 mul_16_and_approx_p2p1.yaml 的差异（全部为"只优化
+# area + 纯截断"服务）：
+#   use_approx_types: false   —— 关近似 cell 类型搜索 ⇒ 误差只来自低位截断（纯 k 截断），
+#                                每个 k 的 MED 固定 = trunc floor，优化器无法用 cell 改误差。
+#   power_weight:      0.0    —— 目标里去掉功耗项（功耗仍由 DC 测、用于上报，但不进 reward）。
+#   bias_weight:       0.0    —— err_term 里去掉 bias 软罚 ⇒ reward 纯 area。
+#   use_error_loss:    false  —— 关可微误差 surrogate（纯截断误差对路由不可导/恒定，无意义）。
+#   error/bias_loss_weight: 0 —— 同上。
+# 其余（delay_weight 由 train_dc.py 强制置 0、synth=dc、error_gate=verilator）不变。
+# med_budget 由 launcher 传 1e12 关闭 MED 软罚（纯截断误差恒定，本就不影响排序，关掉更干净）。
+experiment:
+  kwargs:
+    seed: 42
+    log_level: INFO
+    experiment_prefix: mul_16_booth_trunc_areaonly_routing_gene
+    device: &device cuda:0
+    log_dir: logs
+    build_dir: build
+    rtl_file: MUL.v
+    n_processing: 12
+    n_full_target_delay_processing: 12
+    bit_width: 16
+    encode_type: booth
+    ct_arch: dadda
+
+trainer:
+  name: CompressorRoutingGeneArch
+  kwargs:
+    # loss params
+    use_ppo_loss: true
+    ppo_loss_weight: 1.0
+    use_delay_loss: false
+    delay_loss_weight: 0.1
+    use_glitch_loss: false
+    glitch_loss_weight: 0.1
+    lse_gamma_val: 0.01
+    use_rule_loss: true
+    rule_loss_weight: 1e-2
+    rule_loss_wight_incr: 1e-3
+    use_disc_loss: true
+    disc_loss_weight: 1e-2
+    disc_loss_weight_incr: 1e-3
+    # training scale
+    num_episodes: 300
+    num_samples: 2
+    num_epochs: 1 # ppo epochs
+    save_freq: 100
+    log_freq: 1
+    # learning params
+    optim_name: Adam
+    optim_kwargs:
+      lr: 1e-4
+    scheduler_name: CosineAnnealingLR
+    scheduler_kwargs:
+      T_max: 300
+      eta_min: 1e-5
+    clip_range: 0.2
+    max_grad_norm: 0.5
+    # model params
+    gcn_kwargs:
+      input_dim: 7
+      hidden_dims_list: [[512, 512], [256, 256], [128, 128]]
+      output_dim: 64
+      activation: tanh
+      use_layernorm: true
+      dropout: 0.0
+    # eda params  —— 只优化 area：delay_weight 由 train_dc.py 置 0；power_weight 这里置 0。
+    delay_weight: 2.0
+    area_weight: 2.0
+    power_weight: 0.0
+    delay_scale: 1.394475
+    area_scale: 2026.5
+    power_scale: 0.0035775
+    # power source: 仍用真实 EDA（DC 一次综合同时给 area+power，功耗免费上报、不进 reward）
+    use_power_proxy: false
+    power_source: eda
+    area_violation_weight: 1.0
+    delay_violation_weight: 1.0
+    reference_point: [2.0, 3000]
+    pareto_target: ["delay", "area"]
+    pool_size: 20
+    gomil_path: null
+
+    # ===== 纯 k 截断：关闭近似压缩器类型搜索（误差只来自低位截断）=====
+    use_approx_types: false
+    approx_lib_path: Appr_Comp/selected_compressors.json
+    approx_library_path: Appr_Comp/library.json
+    approx_max_col: 16
+    med_budget: 4096.0          # launcher 传 --med_budget 1e12 关闭 MED 软罚
+    # ===== 误差项全关（reward 纯 area）=====
+    error_scale: 1.0e5
+    med_violation_weight: 1.0
+    bias_weight: 0.0
+    use_error_loss: false
+    error_loss_weight: 0.0
+    bias_loss_weight: 0.0
+    # advantage 归一
+    normalize_advantage: true
