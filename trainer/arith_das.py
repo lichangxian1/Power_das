@@ -490,6 +490,10 @@ class CompressorRouting:
         approx_lib_path="Appr_Comp/selected_compressors.json",
         approx_library_path="Appr_Comp/library.json",
         approx_max_col=6,
+        # 近似 cell 只在截断边界上方的窗口 [trunc_cols, trunc_cols+window) 内可选（None=旧行为，
+        # 用 approx_max_col 作上界）。cell 误差 ∝ wae·2^col，高列代价指数增长几乎永远不划算；
+        # 把动作集中到边界附近的廉价低列，省掉无用探索、提高发现有益 cell 的概率。
+        approx_col_window=None,
         # 误差 reward（约束式 A）。med/bias 用 LSB 绝对单位（跨位宽稳定、梯度 O(1)）；
         # NMED=med/maxprod 仅用于上报。budget/weight 都以 LSB 计。
         med_budget=None,
@@ -633,6 +637,7 @@ class CompressorRouting:
         # ===== Phase B：近似类型搜索状态 =====
         self.use_approx_types = use_approx_types
         self.approx_max_col = approx_max_col
+        self.approx_col_window = approx_col_window
         self.med_budget = med_budget
         self.med_violation_weight = med_violation_weight
         self.error_gate = error_gate
@@ -712,11 +717,11 @@ class CompressorRouting:
                 device=device, dtype=torch.float32,
             )
             logging.info(
-                "[approx] type heads on: T32=%d T22=%d, max_col=%d, "
+                "[approx] type heads on: T32=%d T22=%d, max_col=%d, col_window=%s, "
                 "med_budget(LSB)=%s, use_error_loss=%s, wce_budget(LSB)=%s",
                 len(self.type_table_32), len(self.type_table_22),
-                self.approx_max_col, self.med_budget, self.use_error_loss,
-                self.wce_budget,
+                self.approx_max_col, self.approx_col_window, self.med_budget,
+                self.use_error_loss, self.wce_budget,
             )
 
         opt_params = list(self.gcn.parameters())
@@ -851,10 +856,15 @@ class CompressorRouting:
         return cell_map
 
     def _masked_type_logits(self, logits, col):
-        """col >= approx_max_col 或 col < trunc_cols 时只留 exact(index 0)，其余置 -1e9。
-        截断列被常数驱动、cell 会被 DC 删掉，故不在那放近似 cell。
+        """col 落在 [trunc_cols, upper) 外时只留 exact(index 0)，其余置 -1e9。
+        upper = approx_max_col；若设了 approx_col_window，则 upper=min(approx_max_col,
+        trunc_cols+window)——把可近似列收窄到截断边界上方的窗口（高列 cell 误差∝2^col 几乎
+        永远不划算，集中探索廉价低列）。截断列被常数驱动、cell 会被 DC 删掉，也不放。
         用 masked_fill（非 in-place，autograd 安全）。"""
-        if col >= self.approx_max_col or col < self.trunc_cols:
+        upper = self.approx_max_col
+        if self.approx_col_window is not None:
+            upper = min(upper, self.trunc_cols + self.approx_col_window)
+        if col >= upper or col < self.trunc_cols:
             mask = torch.ones_like(logits, dtype=torch.bool)
             mask[0] = False
             logits = logits.masked_fill(mask, -1e9)

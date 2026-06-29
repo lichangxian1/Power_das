@@ -51,6 +51,8 @@ def main():
     p.add_argument("--med_violation_weight", type=float, default=None,
                    help="MED 超预算软罚权重")
     p.add_argument("--trunc_cols", type=int, default=None, help="① 低列截断深度 k（0=无截断）")
+    p.add_argument("--approx_col_window", type=int, default=None,
+                   help="近似 cell 只在 [k, k+window) 列可选（收窄到截断边界，集中探索廉价低列）")
     p.add_argument("--wce_budget", type=float, default=None, help="④ WCE 上限（LSB）")
     p.add_argument("--target_delay", type=float, default=1.5, help="DC 时钟周期 (ns)")
     p.add_argument("--seed", type=int, default=None)
@@ -119,6 +121,8 @@ def main():
         tk["med_violation_weight"] = args.med_violation_weight
     if args.trunc_cols is not None:
         tk["trunc_cols"] = args.trunc_cols
+    if args.approx_col_window is not None:
+        tk["approx_col_window"] = args.approx_col_window
     if args.wce_budget is not None:
         tk["wce_budget"] = args.wce_budget
     if args.device is not None:
