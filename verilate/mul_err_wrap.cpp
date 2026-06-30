@@ -9,9 +9,12 @@
 // so cross-design objective differences are NOT polluted by MC noise.
 //
 // Vector count = argv[1] if given, else 16M.
-// Output (single line, parsed by trainer): "masked,MED,BIAS_signed,RMSE,ER_pct,MaxAbsErr"
+// Output (single line, parsed by trainer): "masked,MED,BIAS_signed,RMSE,ER_pct,MaxAbsErr,MRED"
 //   - BIAS is the SIGNED mean error (objective takes abs() itself).
 //   - MaxAbsErr (MC WCE) is reported but NOT trusted as a gate (MC tail does not converge).
+//   - MRED = mean_{golden!=0}( |e_wrapped| / golden31 ), golden31 = (a*b)&MASK31 (same masked
+//     reference as MED); golden31==0 cases (a==0 or b==0, ~3e-5 of vectors) are excluded.
+//     Relative metric: small products dominate, so truncation/low-bit error is penalized hard.
 #include "VMUL.h"
 #include "verilated.h"
 #include <cstdio>
@@ -39,7 +42,8 @@ int main(int argc, char** argv) {
     __int128 abs_sum = 0;       // Σ|e|   (exact integer accumulation)
     __int128 sig_sum = 0;       // Σe     (signed)
     double   sq_sum  = 0.0;     // Σe^2   (double; RMSE is informational)
-    long long n_err = 0, m_max = 0;
+    double   rel_sum = 0.0;     // Σ|e|/golden31  (MRED accumulator, golden!=0)
+    long long n_err = 0, m_max = 0, n_rel = 0;
 
     uint64_t s0 = 0x9E3779B97F4A7C15ULL ^ SEED, s1 = 0xD1B54A32D192ED03ULL;
     for (long long i = 0; i < MC; i++) {
@@ -60,6 +64,7 @@ int main(int argc, char** argv) {
         sq_sum  += (double)e * (double)e;
         if (ae > m_max) m_max = ae;
         if (e != 0) n_err++;
+        if (golden != 0) { rel_sum += (double)ae / (double)golden; n_rel++; }
     }
 
     double dn = (double)MC;
@@ -68,7 +73,8 @@ int main(int argc, char** argv) {
                 + (double)(long long)(sig_sum % (__int128)MC) / dn;
     double rmse = sqrt(sq_sum / dn);
     double er   = (double)n_err / dn * 100.0;
+    double mred = n_rel > 0 ? rel_sum / (double)n_rel : 0.0;
 
-    printf("masked,%.6f,%.6f,%.6f,%.6f,%lld\n", med, bias, rmse, er, m_max);
+    printf("masked,%.6f,%.6f,%.6f,%.6f,%lld,%.8f\n", med, bias, rmse, er, m_max, mred);
     return 0;
 }

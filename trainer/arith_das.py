@@ -1850,16 +1850,19 @@ class CompressorRouting:
                                    capture_output=True, text=True, timeout=120)
                 if r.returncode != 0:
                     raise RuntimeError(f"verilator run rc={r.returncode}")
-                med = bias = wce = None
+                med = bias = wce = mred = None
                 for line in r.stdout.strip().splitlines():
                     p = line.split(",")
                     if p[0] == "masked":
                         med, bias, wce = float(p[1]), float(p[2]), float(p[5])
+                        if len(p) > 6:           # MRED 为 harness 新增的第 7 字段（向后兼容）
+                            mred = float(p[6])
                         break
                 if med is None:
                     raise RuntimeError("no masked line")
                 shutil.rmtree(verr, ignore_errors=True)
-                return {"med": med, "bias": bias, "wce_mc": wce, "source": "verilator"}
+                return {"med": med, "bias": bias, "wce_mc": wce,
+                        "mred": mred, "source": "verilator"}
             except Exception as e:  # noqa: BLE001
                 logging.warning("[errgate] verilator measure attempt %d failed (%s): %s",
                                 attempt, os.path.basename(rtl_path), e)
@@ -2085,8 +2088,17 @@ class CompressorRouting:
             if self.error_gate == "verilator" and measured_error is not None:
                 med = measured_error["med"]
                 abs_bias = abs(measured_error["bias"])
+            # ── MRED 模式：误差用相对误差 MRED 当软罚闸门（verilator 实测）。深截断毁小积→
+            # MRED 被重罚。无 bias 项（相对误差无干净的 bias 分解）。error_metric 默认 "med"
+            # 保持向后兼容；mred 项尺度由 mred_scale（默认 0.01）归一。
+            if getattr(self, "error_metric", "med") == "mred":
+                mred = (measured_error or {}).get("mred")
+                if mred is not None:   # verilator 失败(罕见，2 次重试)时 mred=None → 不罚该样本
+                    budget = getattr(self, "mred_budget", 0.0) or 0.0
+                    scale = getattr(self, "mred_scale", 0.01) or 0.01
+                    err_term += self.med_violation_weight * max(0.0, mred - budget) / scale
             # 点2：除 error_scale 把 LSB 绝对值压到和 PPA 同量级。
-            if self.error_as_metric:
+            elif self.error_as_metric:
                 # 误差作为普通目标项，评估方式同 area/power：error_weight*med/error_scale
                 # （线性计入，无 budget 铰链；med_budget/med_violation_weight 此模式忽略）。
                 err_term += self.error_weight * med / self.error_scale
@@ -2096,7 +2108,8 @@ class CompressorRouting:
                     * max(0.0, med - self.med_budget)
                     / self.error_scale
                 )
-            err_term += self.bias_weight * abs_bias / self.error_scale
+            if getattr(self, "error_metric", "med") != "mred":
+                err_term += self.bias_weight * abs_bias / self.error_scale
             # ④ 尾部/WCE 约束（默认关）：超出 wce_budget 才罚，压重尾/最坏情况误差。
             if self.wce_budget is not None:
                 err_term += (
@@ -2401,14 +2414,16 @@ class CompressorRouting:
             if self.power_source == "proxy" and cur.get("eda_power") is not None
             else ""
         )
+        best_mred = (self.found_best_info.get("measured_error") or {}).get("mred")
+        mred_str = f"  mred={best_mred * 100:.3f}%" if best_mred is not None else ""
         logging.info(
             "[ep %4d/%d]  obj=%.6f  area=%.1f  delay=%.4fns"
             "  pwr=%.4fmW[%s]  med=%.1f%s%s"
-            "  || best: obj=%.6f  area=%.1f  pwr=%.4fmW  med=%.1f",
+            "  || best: obj=%.6f  area=%.1f  pwr=%.4fmW  med=%.1f%s",
             episode_idx, self.num_episodes, info["objective"],
             cur["area"], cur["delay"], cur["power"] * 1000,
             self.power_source, info.get("med", float("nan")), vio_str, proxy_str,
-            best["objective"], best["area"], best["power"] * 1000, best_med,
+            best["objective"], best["area"], best["power"] * 1000, best_med, mred_str,
         )
 
     def run_episode(self, episode_idx):

@@ -54,6 +54,12 @@ def main():
     p.add_argument("--approx_col_window", type=int, default=None,
                    help="近似 cell 只在 [k, k+window) 列可选（收窄到截断边界，集中探索廉价低列）")
     p.add_argument("--wce_budget", type=float, default=None, help="④ WCE 上限（LSB）")
+    p.add_argument("--error_metric", choices=["med", "mred"], default="med",
+                   help="误差指标：med(绝对,默认) 或 mred(相对误差,重罚小积/截断)")
+    p.add_argument("--mred_budget", type=float, default=None,
+                   help="MRED 软罚预算(分数，如 0.005=0.5%%)；error_metric=mred 时生效")
+    p.add_argument("--mred_scale", type=float, default=0.01,
+                   help="MRED 软罚归一分母(默认 0.01，使超额 0.01 → 罚 1.0)")
     p.add_argument("--target_delay", type=float, default=1.5, help="DC 时钟周期 (ns)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default=None)
@@ -125,6 +131,10 @@ def main():
         tk["approx_col_window"] = args.approx_col_window
     if args.wce_budget is not None:
         tk["wce_budget"] = args.wce_budget
+    if args.error_metric == "mred":
+        # MRED 无法逐节点分解 → 关掉绝对-MED 可微 surrogate，纯靠 verilator-MRED reward 闸门。
+        tk["use_error_loss"] = False
+        tk["error_gate"] = "verilator"   # MRED 必须用实测（无解析 proxy）
     if args.device is not None:
         tk["device"] = args.device
     seed = args.seed if args.seed is not None else exp_kwargs.get("seed", 42)
@@ -150,6 +160,13 @@ def main():
     set_seed(seed)
     trainer_cls = getattr(trainer, cfg["trainer"]["name"])
     exp = trainer_cls(**tk)
+    # MRED 接线（get_objective 用 getattr 读，默认 med 保持向后兼容）
+    exp.error_metric = args.error_metric
+    exp.mred_budget = args.mred_budget
+    exp.mred_scale = args.mred_scale
+    if args.error_metric == "mred":
+        logging.info("ERROR METRIC = MRED | mred_budget=%s mred_scale=%s use_error_loss=False",
+                     args.mred_budget, args.mred_scale)
     exp.run_experiment()
     rtl = exp.export_best_candidate(run_dir)
     logging.info("done. best RTL -> %s", rtl)
