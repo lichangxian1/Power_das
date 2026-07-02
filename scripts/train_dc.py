@@ -44,10 +44,14 @@ def main():
     p.add_argument("--out", required=True, help="run 目录（含 build/ logs/ best_info.json）")
     p.add_argument("--episodes", type=int, default=None)
     p.add_argument("--samples", type=int, default=None)
+    p.add_argument("--save_freq", type=int, default=None,
+                   help="每多少轮存一次 best 结构 checkpoint（防中途停丢结构；默认用 config 的 100）")
     p.add_argument("--n_processing", type=int, default=None)
     p.add_argument("--med_budget", type=float, default=None)
     p.add_argument("--error_scale", type=float, default=None,
                    help="MED 软罚归一化分母；低误差段需调小（默认 1e5 在低 MED 下罚项可忽略）")
+    p.add_argument("--error_weight", type=float, default=None,
+                   help="error_as_metric 模式下 med 线性项权重；调小→cell 更便宜、更多 k 用 cell（更不准）")
     p.add_argument("--med_violation_weight", type=float, default=None,
                    help="MED 超预算软罚权重")
     p.add_argument("--trunc_cols", type=int, default=None, help="① 低列截断深度 k（0=无截断）")
@@ -116,6 +120,8 @@ def main():
         tk.setdefault("scheduler_kwargs", {})["T_max"] = args.episodes  # T_max 必须 == episodes
     if args.samples is not None:
         tk["num_samples"] = args.samples
+    if args.save_freq is not None:
+        tk["save_freq"] = args.save_freq
     if args.n_processing is not None:
         tk["n_processing"] = args.n_processing
         tk["n_full_target_delay_processing"] = args.n_processing
@@ -123,6 +129,8 @@ def main():
         tk["med_budget"] = args.med_budget
     if args.error_scale is not None:
         tk["error_scale"] = args.error_scale
+    if args.error_weight is not None:
+        tk["error_weight"] = args.error_weight
     if args.med_violation_weight is not None:
         tk["med_violation_weight"] = args.med_violation_weight
     if args.trunc_cols is not None:

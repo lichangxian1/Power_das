@@ -2163,6 +2163,17 @@ class CompressorRouting:
     def _candidate_rank(self, sample_info):
         result = sample_info.get("result", sample_info.get("simulated_result"))
         summary = self._summarize_result(result)
+        # 方案1：MRED ε-硬约束。可行(mred≤budget)优先，可行里按 PPA(area+power 归一)最小；
+        # 不可行按超额量排。mred 没测到(verilator 失败)→ 最差档，避免被当"可行"误选为 best。
+        if getattr(self, "error_metric", "med") == "mred" and getattr(self, "mred_budget", None):
+            me = sample_info.get("measured_error") or {}
+            mred = me.get("mred")
+            ppa = (self.area_weight * summary["area"] / self.area_scale
+                   + self.power_weight * summary["power"] / self.power_scale)
+            if mred is None:
+                return (2, float("inf"), ppa)
+            return (0 if mred <= self.mred_budget else 1,
+                    max(0.0, mred - self.mred_budget), ppa)
         # Unconstrained (EDA) mode mirrors Arith-DAS exactly: rank purely by the
         # scalar objective so the exported "best" design matches the baseline.
         # The feasibility/power ranking below only applies to area-budget runs.
@@ -2415,15 +2426,23 @@ class CompressorRouting:
             else ""
         )
         best_mred = (self.found_best_info.get("measured_error") or {}).get("mred")
-        mred_str = f"  mred={best_mred * 100:.3f}%" if best_mred is not None else ""
+        cur_mred = info.get("mred")
+        extra = ""
+        if cur_mred is not None:
+            extra += f"  mred={cur_mred * 100:.4f}%"
+        if "n_over" in info:
+            extra += f"  over_budget={info['n_over']}/{info['n_total']}"
+        best_str = f"  best_mred={best_mred * 100:.4f}%" if best_mred is not None else ""
+        if info.get("n_approx") is not None:
+            best_str += f"  n_approx={info['n_approx']}"
         logging.info(
             "[ep %4d/%d]  obj=%.6f  area=%.1f  delay=%.4fns"
-            "  pwr=%.4fmW[%s]  med=%.1f%s%s"
+            "  pwr=%.4fmW[%s]  med=%.1f%s%s%s"
             "  || best: obj=%.6f  area=%.1f  pwr=%.4fmW  med=%.1f%s",
             episode_idx, self.num_episodes, info["objective"],
             cur["area"], cur["delay"], cur["power"] * 1000,
-            self.power_source, info.get("med", float("nan")), vio_str, proxy_str,
-            best["objective"], best["area"], best["power"] * 1000, best_med, mred_str,
+            self.power_source, info.get("med", float("nan")), vio_str, proxy_str, extra,
+            best["objective"], best["area"], best["power"] * 1000, best_med, best_str,
         )
 
     def run_episode(self, episode_idx):
@@ -2448,6 +2467,17 @@ class CompressorRouting:
         info["objective"] = sample_info_list[min_idx]["objective"]
         info["simulated_result"] = sample_info_list[min_idx]["result"]
         info["med"] = self._effective_med(sample_info_list[min_idx])
+        # 训练监控：当前候选 mred、best 设计的近似压缩器数量、本轮超 budget 的样本数。
+        info["mred"] = (sample_info_list[min_idx].get("measured_error") or {}).get("mred")
+        info["n_approx"] = sum(
+            1 for tk in (self.found_best_info.get("cell_types") or {}).values()
+            if tk and tk[1] != 0
+        )
+        _bud = getattr(self, "mred_budget", None)
+        if getattr(self, "error_metric", "med") == "mred" and _bud:
+            _ms = [(s.get("measured_error") or {}).get("mred") for s in sample_info_list]
+            info["n_over"] = sum(1 for m in _ms if m is not None and m > _bud)
+            info["n_total"] = len(sample_info_list)
 
         self.update_pool(sample_info_list[min_idx]["objective"], self.state)
 
