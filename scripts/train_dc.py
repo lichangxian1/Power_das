@@ -175,6 +175,11 @@ def main():
     if args.error_metric == "mred":
         logging.info("ERROR METRIC = MRED | mred_budget=%s mred_scale=%s use_error_loss=False",
                      args.mred_budget, args.mred_scale)
+        # 截断常数在构造函数的 _start_reset 里已按 med 口径算过(当时 error_metric 还未赋值)，
+        # 清缓存显式重算，让 _setup_truncation 走 mred 分支取 C*（argmin E[|C−Δ|/p]）。
+        if getattr(exp, "trunc_cols", 0) > 0:
+            exp._trunc_bits = {}
+            exp._setup_truncation()
     exp.run_experiment()
     rtl = exp.export_best_candidate(run_dir)
     logging.info("done. best RTL -> %s", rtl)

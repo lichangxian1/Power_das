@@ -875,7 +875,9 @@ class CompressorRouting:
 
         E[Δ] = Σ_{c<k} 0.25·pp[c]·2^c   （AND, P=1/4；截断丢失值期望，恒正→负偏置）
         C = round(E[Δ])（trunc_correct='bias'），贪心用 col<k 的槽位表示（列 c 有 pp[c] 个槽、权重 2^c）
-        Δmax = Σ_{c<k} pp[c]·2^c，WCE_trunc = max(C, Δmax−C)。"""
+        Δmax = Σ_{c<k} pp[c]·2^c，WCE_trunc = max(C, Δmax−C)。
+        error_metric=mred 时 C 改取 argmin E[|C−Δ|/p]（全宽 MC）：round(E[Δ]) 是 MED 最优但对
+        MRED 过校正（小积整积被截、输出≈C、(C−p)/p 被 1/p 加权重锤），C* 比 E[Δ] 小 2–10×。"""
         k = self.trunc_cols
         if not (0 <= k <= len(self.initial_pp)):
             raise ValueError(
@@ -885,6 +887,40 @@ class CompressorRouting:
         e_delta = sum(0.25 * pp[c] * (1 << c) for c in range(k))
         delta_max = sum(pp[c] * (1 << c) for c in range(k))
         c_target = int(round(e_delta)) if self.trunc_correct == "bias" else 0
+        # mred 口径：常数改取 MRED 最优 C*（Δ 只依赖 a/b 低 k 位，但 1/p 权重需要全宽乘积，
+        # 故单独全宽 MC；确定性 seed，整个训练只算一次——_trunc_bits 缓存保证）。
+        if (getattr(self, "error_metric", "med") == "mred"
+                and self.trunc_correct == "bias" and k > 0 and c_target > 0):
+            rng_f = np.random.default_rng(1)
+            W = int(self.bit_width)
+            Nf = 1_000_000
+            af = rng_f.integers(0, 1 << W, size=Nf, dtype=np.int64)
+            bf = rng_f.integers(0, 1 << W, size=Nf, dtype=np.int64)
+            dl = np.zeros(Nf, dtype=np.int64)
+            for i in range(min(k, W)):
+                ai = (af >> i) & 1
+                for j in range(min(k - i, W)):
+                    dl += (ai & ((bf >> j) & 1)) << (i + j)
+            pm = af * bf
+            nz = pm > 0
+            pw = pm[nz].astype(np.float64)
+            dw = dl[nz].astype(np.float64)
+
+            def _mred_of(cc):
+                return float(np.mean(np.abs(cc - dw) / pw))
+
+            grid = np.linspace(0.0, 1.2 * c_target, 81)
+            i0 = int(np.argmin([_mred_of(cc) for cc in grid]))
+            step = grid[1] - grid[0]
+            fine = np.linspace(max(0.0, grid[i0] - step), grid[i0] + step, 41)
+            vals = [_mred_of(cc) for cc in fine]
+            j0 = int(np.argmin(vals))
+            c_star = int(round(fine[j0]))
+            logging.info(
+                "[trunc-mred] C*=%d (MED口径 C0=%d)  模型MRED: C0=%.3e → C*=%.3e",
+                c_star, c_target, _mred_of(float(c_target)), vals[j0],
+            )
+            c_target = c_star
         bits, remaining = {}, c_target
         for c in range(k - 1, -1, -1):          # 高列→低列贪心填常数 1
             w = 1 << c
