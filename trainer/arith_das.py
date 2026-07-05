@@ -511,6 +511,12 @@ class CompressorRouting:
         # ≈exp(b)/(exp(b)+N-1)（如 4.0→~0.9）。让策略从"近全 exact"起步、按需加近似 cell，
         # 避免冷启动 ~85% 节点随机近似导致前期 obj 爆高、PPA 梯度被淹。默认 0=旧行为。
         exact_init_bias=0.0,
+        # 方案 B：先采样本设计总共启用多少个近似 cell，再采样具体 slot/cell。
+        # 关闭时保持旧行为（每个 slot 独立采 exact/approx）。开启后能稳定覆盖 n_approx=1/2/4
+        # 等极稀疏候选，避免低 MRED budget 下从 all-exact 直接跳到十几个 cell。
+        approx_cardinality_sampler=False,
+        approx_cardinality_choices=None,
+        approx_cardinality_init_logits=None,
         # 保底候选：每轮额外评估一个同 routing、全 exact cell 的设计，只参与 best/日志，
         # 不进 PPO loss。用于避免类型采样把 found_best 拖到比纯截断同 routing 更差。
         inject_exact_candidate=False,
@@ -647,6 +653,19 @@ class CompressorRouting:
         self.error_as_metric = bool(error_as_metric)
         self.error_weight = error_weight
         self.inject_exact_candidate = bool(inject_exact_candidate)
+        self.approx_cardinality_sampler = bool(approx_cardinality_sampler)
+        if approx_cardinality_choices is None:
+            approx_cardinality_choices = [0, 1, 2, 4, 8, 16]
+        self.approx_cardinality_choices = [
+            int(x) for x in approx_cardinality_choices
+        ]
+        if sorted(set(self.approx_cardinality_choices)) != self.approx_cardinality_choices:
+            raise ValueError(
+                "approx_cardinality_choices must be sorted unique non-negative ints"
+            )
+        if self.approx_cardinality_choices[0] != 0:
+            raise ValueError("approx_cardinality_choices must start with 0")
+        self.approx_cardinality_logits = None
         self.error_scale_mode = error_scale_mode
         self.use_error_loss = use_error_loss
         self.error_loss_weight = error_loss_weight
@@ -681,6 +700,25 @@ class CompressorRouting:
             self.type_head_22 = nn.Linear(
                 self.gcn.embedding_dim, len(self.type_table_22)
             ).to(device)
+            if self.approx_cardinality_sampler:
+                if approx_cardinality_init_logits is None:
+                    approx_cardinality_init_logits = [0.0] * len(
+                        self.approx_cardinality_choices
+                    )
+                if len(approx_cardinality_init_logits) != len(
+                    self.approx_cardinality_choices
+                ):
+                    raise ValueError(
+                        "approx_cardinality_init_logits length must match "
+                        "approx_cardinality_choices"
+                    )
+                self.approx_cardinality_logits = nn.Parameter(
+                    torch.tensor(
+                        [float(x) for x in approx_cardinality_init_logits],
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                )
             # 类型头初始化偏向 exact(index0)：给 bias[0] 设正偏置，使初始策略≈"近全 exact"、
             # 按需再加近似 cell（而非随机≈均匀→~85% 节点一上来就近似）。默认 0=旧行为。
             if exact_init_bias:
@@ -723,11 +761,19 @@ class CompressorRouting:
                 self.approx_max_col, self.approx_col_window, self.med_budget,
                 self.use_error_loss, self.wce_budget,
             )
+            if self.approx_cardinality_sampler:
+                logging.info(
+                    "[approx] cardinality sampler on: choices=%s init_logits=%s",
+                    self.approx_cardinality_choices,
+                    [float(x) for x in self.approx_cardinality_logits.detach().cpu()],
+                )
 
         opt_params = list(self.gcn.parameters())
         if self.use_approx_types:
             opt_params += list(self.type_head_32.parameters())
             opt_params += list(self.type_head_22.parameters())
+            if self.approx_cardinality_logits is not None:
+                opt_params.append(self.approx_cardinality_logits)
         self.optim: optim.Optimizer = getattr(optim, optim_name)(
             opt_params, **optim_kwargs
         )
@@ -746,6 +792,7 @@ class CompressorRouting:
             "assignment": None,
             "ct": None,
             "cell_types": None,  # Phase B：最优设计的每槽 cell 类型，导出时复原近似 cell
+            "cell_type_info": None,
         }
 
         self.total_epoch_num = 0
@@ -809,15 +856,23 @@ class CompressorRouting:
             self.approx_module_src_by_name[name] = src
 
     def sample_cell_types(self):
-        """对每个压缩器节点采样 cell 类型。返回 (cell_map, type_choices, type_log_prob)。
+        """对压缩器节点采样 cell 类型。
 
-        cell_map: {node_idx -> module名}（仅非 exact）；type_choices: {node_idx -> (t,k)}。
-        col >= approx_max_col 的节点强制 exact。需 self._node_emb（get_Z_mat 已设）。
+        返回 (cell_map, type_choices, type_log_prob, type_sample_info)。
+        cell_map: {node_idx -> module名}（仅非 exact）。
+        type_choices: 旧独立模式记录全部节点；cardinality 模式只记录非 exact 节点。
+        type_sample_info: PPO 重算 log_prob 所需的采样口径元数据。
         """
+        if self.approx_cardinality_sampler:
+            return self._sample_cell_types_cardinality()
+        return self._sample_cell_types_independent()
+
+    def _sample_cell_types_independent(self):
+        """旧行为：每个可压缩器槽独立采 exact/approx。"""
         cell_map, type_choices = {}, {}
         total_log_prob = 0.0
         if not self.use_approx_types:
-            return cell_map, type_choices, total_log_prob
+            return cell_map, type_choices, total_log_prob, {"mode": "none"}
         emb = self._node_emb
         for node_idx, info in enumerate(self.comp_graph.vertex_list):
             _, c, t, _ = info
@@ -835,7 +890,176 @@ class CompressorRouting:
             type_choices[node_idx] = (t, k)
             if k != 0:
                 cell_map[node_idx] = table[k]["name"]
-        return cell_map, type_choices, total_log_prob
+        return cell_map, type_choices, total_log_prob, {"mode": "independent"}
+
+    def _approx_col_upper(self):
+        upper = self.approx_max_col
+        if self.approx_col_window is not None:
+            upper = min(upper, self.trunc_cols + self.approx_col_window)
+        return upper
+
+    def _is_approx_col_allowed(self, col):
+        return self.trunc_cols <= col < self._approx_col_upper()
+
+    def _eligible_type_nodes(self):
+        nodes = []
+        for node_idx, info in enumerate(self.comp_graph.vertex_list):
+            _, c, t, _ = info
+            if t in (0, 1) and self._is_approx_col_allowed(c):
+                nodes.append(node_idx)
+        return nodes
+
+    def _type_head_and_table(self, t):
+        if t == 0:
+            return self.type_head_32, self.type_table_32
+        if t == 1:
+            return self.type_head_22, self.type_table_22
+        raise ValueError(f"unknown compressor type {t}")
+
+    def _node_type_logits(self, node_idx):
+        _, c, t, _ = self.comp_graph.vertex_list[node_idx]
+        head, _table = self._type_head_and_table(t)
+        return self._masked_type_logits(head(self._node_emb[node_idx]), c)
+
+    def _cardinality_dist(self, n_eligible):
+        choices = torch.tensor(
+            self.approx_cardinality_choices, device=self.device, dtype=torch.long
+        )
+        mask = choices <= int(n_eligible)
+        logits = self.approx_cardinality_logits.masked_fill(~mask, -1e9)
+        return torch.distributions.Categorical(logits=logits)
+
+    def _eligible_node_scores(self, eligible_nodes):
+        scores = []
+        for node_idx in eligible_nodes:
+            logits = self._node_type_logits(node_idx)
+            # Score slots by approximate-vs-exact odds; K itself is sampled separately.
+            scores.append(torch.logsumexp(logits[1:], dim=0) - logits[0])
+        return torch.stack(scores)
+
+    def _sample_cell_types_cardinality(self):
+        """方案 B：先采 n_approx，再无放回采 slot，最后在非 exact cell 中采具体类型。"""
+        cell_map, type_choices = {}, {}
+        total_log_prob = 0.0
+        if not self.use_approx_types:
+            return cell_map, type_choices, total_log_prob, {"mode": "none"}
+
+        eligible_nodes = self._eligible_type_nodes()
+        if not eligible_nodes:
+            return (
+                cell_map,
+                type_choices,
+                total_log_prob,
+                {"mode": "cardinality", "cardinality_choice_idx": 0, "selected_order": []},
+            )
+
+        k_dist = self._cardinality_dist(len(eligible_nodes))
+        k_sample = k_dist.sample()
+        total_log_prob += k_dist.log_prob(k_sample).item()
+        k_choice_idx = int(k_sample.item())
+        n_approx = int(self.approx_cardinality_choices[k_choice_idx])
+
+        selected_order = []
+        if n_approx > 0:
+            scores = self._eligible_node_scores(eligible_nodes)
+            remaining = torch.ones(
+                len(eligible_nodes), device=self.device, dtype=torch.bool
+            )
+            for _ in range(n_approx):
+                node_dist = torch.distributions.Categorical(
+                    logits=scores.masked_fill(~remaining, -1e9)
+                )
+                pos = node_dist.sample()
+                total_log_prob += node_dist.log_prob(pos).item()
+                pos_i = int(pos.item())
+                remaining[pos_i] = False
+                node_idx = eligible_nodes[pos_i]
+                selected_order.append(node_idx)
+
+                _, _c, t, _ = self.comp_graph.vertex_list[node_idx]
+                logits = self._node_type_logits(node_idx)
+                cell_dist = torch.distributions.Categorical(logits=logits[1:])
+                cell_sample = cell_dist.sample()
+                total_log_prob += cell_dist.log_prob(cell_sample).item()
+                k = int(cell_sample.item()) + 1
+                _head, table = self._type_head_and_table(t)
+                type_choices[node_idx] = (t, k)
+                cell_map[node_idx] = table[k]["name"]
+
+        return (
+            cell_map,
+            type_choices,
+            total_log_prob,
+            {
+                "mode": "cardinality",
+                "cardinality_choice_idx": k_choice_idx,
+                "selected_order": selected_order,
+            },
+        )
+
+    def _sampled_cell_type(self, cell_types, node_idx):
+        if node_idx in cell_types:
+            return cell_types[node_idx]
+        return cell_types.get(str(node_idx))
+
+    def _independent_cell_type_log_prob(self, cell_types):
+        new_log_prob = torch.zeros((), device=self.device)
+        for node_idx, (t, k) in cell_types.items():
+            node_idx = int(node_idx)
+            logits = self._node_type_logits(node_idx)
+            dist = torch.distributions.Categorical(logits=logits)
+            new_log_prob = new_log_prob + dist.log_prob(
+                torch.tensor(int(k), device=self.device)
+            )
+        return new_log_prob
+
+    def _cardinality_cell_type_log_prob(self, cell_types, type_sample_info):
+        eligible_nodes = self._eligible_type_nodes()
+        k_choice_idx = int(type_sample_info.get("cardinality_choice_idx", 0))
+        k_dist = self._cardinality_dist(len(eligible_nodes))
+        new_log_prob = k_dist.log_prob(
+            torch.tensor(k_choice_idx, device=self.device)
+        )
+
+        selected_order = [int(x) for x in type_sample_info.get("selected_order", [])]
+        if not selected_order:
+            return new_log_prob
+
+        pos_by_node = {node_idx: pos for pos, node_idx in enumerate(eligible_nodes)}
+        scores = self._eligible_node_scores(eligible_nodes)
+        remaining = torch.ones(len(eligible_nodes), device=self.device, dtype=torch.bool)
+        for node_idx in selected_order:
+            pos_i = pos_by_node[node_idx]
+            node_dist = torch.distributions.Categorical(
+                logits=scores.masked_fill(~remaining, -1e9)
+            )
+            new_log_prob = new_log_prob + node_dist.log_prob(
+                torch.tensor(pos_i, device=self.device)
+            )
+            remaining[pos_i] = False
+
+            tk = self._sampled_cell_type(cell_types, node_idx)
+            if tk is None:
+                raise ValueError(f"missing sampled cell type for node {node_idx}")
+            _t, k = tk
+            logits = self._node_type_logits(node_idx)
+            cell_dist = torch.distributions.Categorical(logits=logits[1:])
+            new_log_prob = new_log_prob + cell_dist.log_prob(
+                torch.tensor(int(k) - 1, device=self.device)
+            )
+        return new_log_prob
+
+    def _cell_type_log_prob(self, sample_info):
+        type_sample_info = sample_info.get("cell_type_info") or {}
+        mode = type_sample_info.get("mode")
+        if mode == "cardinality":
+            return self._cardinality_cell_type_log_prob(
+                sample_info.get("cell_types") or {}, type_sample_info
+            )
+        cell_types = sample_info.get("cell_types") or {}
+        if cell_types:
+            return self._independent_cell_type_log_prob(cell_types)
+        return None
 
     def _approx_modules_src(self, cell_map):
         if not cell_map:
@@ -861,10 +1085,7 @@ class CompressorRouting:
         trunc_cols+window)——把可近似列收窄到截断边界上方的窗口（高列 cell 误差∝2^col 几乎
         永远不划算，集中探索廉价低列）。截断列被常数驱动、cell 会被 DC 删掉，也不放。
         用 masked_fill（非 in-place，autograd 安全）。"""
-        upper = self.approx_max_col
-        if self.approx_col_window is not None:
-            upper = min(upper, self.trunc_cols + self.approx_col_window)
-        if col >= upper or col < self.trunc_cols:
+        if not self._is_approx_col_allowed(col):
             mask = torch.ones_like(logits, dtype=torch.bool)
             mask[0] = False
             logits = logits.masked_fill(mask, -1e9)
@@ -1076,13 +1297,18 @@ class CompressorRouting:
         torch.save(self.gcn.state_dict(), gcn_save_path)
         # Phase B：类型头不在 gcn 内，单独存，否则 resume/重载会丢失已学的类型策略
         if self.use_approx_types:
-            torch.save(
-                {
-                    "type_head_32": self.type_head_32.state_dict(),
-                    "type_head_22": self.type_head_22.state_dict(),
-                },
-                os.path.join(save_dir, "type_heads.pth"),
-            )
+            type_state = {
+                "type_head_32": self.type_head_32.state_dict(),
+                "type_head_22": self.type_head_22.state_dict(),
+            }
+            if self.approx_cardinality_logits is not None:
+                type_state["approx_cardinality_logits"] = (
+                    self.approx_cardinality_logits.detach().cpu()
+                )
+                type_state["approx_cardinality_choices"] = (
+                    self.approx_cardinality_choices
+                )
+            torch.save(type_state, os.path.join(save_dir, "type_heads.pth"))
         with open(os.path.join(save_dir, "best_info.json"), "w") as f:
             json.dump(
                 self.found_best_info, f, indent=4, default=convert_to_serializable
@@ -1932,7 +2158,9 @@ class CompressorRouting:
                     Z_mat_dict
                 )
                 # Phase B：采样每个压缩器槽的 cell 类型（关时返回空，行为不变）
-                cell_map, type_choices, type_log_prob = self.sample_cell_types()
+                cell_map, type_choices, type_log_prob, type_sample_info = (
+                    self.sample_cell_types()
+                )
                 overall_log_prob += type_log_prob
                 assignment = self.emit_assignment(samples_connection, cell_map=cell_map)
 
@@ -1955,6 +2183,7 @@ class CompressorRouting:
                         "connection": samples_connection,
                         "overall_log_prob": overall_log_prob,
                         "cell_types": type_choices,
+                        "cell_type_info": type_sample_info,
                     }
                 )
                 if (
@@ -1976,6 +2205,7 @@ class CompressorRouting:
                             "connection": samples_connection,
                             "overall_log_prob": overall_log_prob,
                             "cell_types": {},
+                            "cell_type_info": {"mode": "exact_baseline"},
                             "baseline_only": True,
                             "candidate_kind": "all_exact",
                         }
@@ -2262,6 +2492,7 @@ class CompressorRouting:
                 "ct": self.found_best_info["ct"],
                 "assignment": self.found_best_info["assignment"],
                 "cell_types": cell_types,
+                "cell_type_info": self.found_best_info.get("cell_type_info"),
                 "approx_cells": {str(k): v for k, v in cell_map.items()},
                 "routing_assignment": routing_assignment,
                 "rtl_path": rtl_path,
@@ -2338,17 +2569,12 @@ class CompressorRouting:
                         new_log_prob += log_prob
                         M[:, sample["sample"]] = False
 
-            # Phase B：重算类型头 log_prob，与采样口径一致（同 approx_max_col 掩码）
-            if self.use_approx_types and sample_info.get("cell_types"):
-                emb = self._node_emb
-                for node_idx, (t, k) in sample_info["cell_types"].items():
-                    head = self.type_head_32 if t == 0 else self.type_head_22
-                    c = self.comp_graph.vertex_list[node_idx][1]
-                    logits = self._masked_type_logits(head(emb[node_idx]), c)
-                    dist = torch.distributions.Categorical(logits=logits)
-                    new_log_prob = new_log_prob + dist.log_prob(
-                        torch.tensor([k], device=self.device)
-                    )
+            # Phase B：重算类型采样 log_prob。旧模式为逐 slot 独立 categorical；
+            # cardinality 模式为 P(K) + P(slot sequence | K) + P(cell | slot)。
+            if self.use_approx_types:
+                type_log_prob = self._cell_type_log_prob(sample_info)
+                if type_log_prob is not None:
+                    new_log_prob = new_log_prob + type_log_prob
 
             if self.normalize_advantage:
                 A = -(sample_info["objective"] - _adv_mean) / _adv_std
@@ -2377,6 +2603,9 @@ class CompressorRouting:
                 self.found_best_info["simulated_result"] = sample_info["result"]
                 self.found_best_info["cell_types"] = copy.deepcopy(
                     sample_info.get("cell_types")
+                )
+                self.found_best_info["cell_type_info"] = copy.deepcopy(
+                    sample_info.get("cell_type_info")
                 )
                 # 可审计：记录该最优点的误差闸门来源（verilator 实测 / analytic 回退）
                 me = sample_info.get("measured_error")

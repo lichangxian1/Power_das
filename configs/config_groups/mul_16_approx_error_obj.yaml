@@ -84,6 +84,9 @@ trainer:
     approx_library_path: Appr_Comp/library.json
     approx_max_col: 16
     exact_init_bias: 4.0        # 类型头初始偏向 exact：初始 P(exact)≈0.9，从"近全exact"起步按需加近似cell
+    approx_cardinality_sampler: true
+    approx_cardinality_choices: [0, 1, 2, 4, 8, 16, 32, 64]
+    approx_cardinality_init_logits: [0.0, 1.0, 1.0, 0.5, 0.0, -0.5, -1.0, -1.5]
     inject_exact_candidate: true # 每轮额外评估同 routing 的 all-exact 候选，只保底 best，不进 PPO
 
     # ===== 误差作为普通目标项（核心改动）=====
