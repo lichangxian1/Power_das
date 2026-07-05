@@ -181,3 +181,21 @@ module HA_no_carry (a, cin, sum);
     assign sum = a ^ cin; 
 endmodule
 """
+
+CT42_verilog_src = """
+module CT42 (a, b, c, d, sum, carry, cout);
+    input a;
+    input b;
+    input c;
+    input d;
+    output sum;
+    output carry;
+    output cout;
+
+    wire s0;
+    wire c0;
+    HA ha0 (.a(a), .cin(b), .sum(s0), .cout(c0));
+    FA fa0 (.a(s0), .b(c), .cin(d), .sum(sum), .cout(carry));
+    assign cout = c0;
+endmodule
+"""

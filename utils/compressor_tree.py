@@ -106,17 +106,21 @@ def get_initial_partial_product(bit_width: int, encode_type: str) -> np.ndarray:
 
 
 class CompressorTree(ABC):
-    def __init__(self, pp=None, ct32=None, ct22=None):
+    def __init__(self, pp=None, ct32=None, ct22=None, ct42=None):
         self.pp: np.ndarray = pp
         self.ct32: np.ndarray = ct32
         self.ct22: np.ndarray = ct22
+        if ct42 is None and ct32 is not None:
+            ct42 = np.zeros_like(ct32, dtype=int)
+        self.ct42: np.ndarray = ct42
 
     @classmethod
     def from_dict(cls, d):
         ct32 = np.asarray(d["ct32"]).astype(int)
         ct22 = np.asarray(d["ct22"]).astype(int)
+        ct42 = np.asarray(d.get("ct42", np.zeros_like(ct32))).astype(int)
         pp = np.asarray(d["pp"]).astype(int)
-        return cls(pp, ct32, ct22)
+        return cls(pp, ct32, ct22, ct42)
 
     @classmethod
     def wallace(cls, pp):
@@ -333,22 +337,35 @@ class CompressorTree(ABC):
         return {
             "ct32": self.ct32.tolist(),
             "ct22": self.ct22.tolist(),
+            "ct42": self.ct42.tolist(),
         }
 
     def compressor_assignment(self):
-        assert len(self.pp) == len(self.ct32) and len(self.pp) == len(self.ct22)
+        assert (
+            len(self.pp) == len(self.ct32)
+            and len(self.pp) == len(self.ct22)
+            and len(self.pp) == len(self.ct42)
+        )
         column_len = len(self.pp)
         ct32_remain = copy.deepcopy(self.ct32)
         ct22_remain = copy.deepcopy(self.ct22)
+        ct42_remain = copy.deepcopy(self.ct42)
         current_stage = 0
         ct32_decomposed = np.zeros([1, len(self.ct32)]).astype(int)
         ct22_decomposed = np.zeros([1, len(self.ct22)]).astype(int)
+        ct42_decomposed = np.zeros([1, len(self.ct42)]).astype(int)
 
         current_pp = copy.deepcopy(self.pp)
-        while (ct32_remain > 0).any() or (ct22_remain > 0).any():
+        while (ct32_remain > 0).any() or (ct22_remain > 0).any() or (ct42_remain > 0).any():
             next_pp = np.zeros_like(current_pp)
             for column_index in range(column_len):
                 current_pp_height = int(current_pp[column_index])
+                assigned_ct42 = min(
+                    int(ct42_remain[column_index]),
+                    current_pp_height // 4,
+                )
+                ct42_remain[column_index] -= assigned_ct42
+                current_pp_height -= assigned_ct42 * 4
                 assigned_ct32 = min(
                     int(ct32_remain[column_index]),
                     current_pp_height // 3,
@@ -362,35 +379,50 @@ class CompressorTree(ABC):
                 ct22_remain[column_index] -= assigned_ct22
                 current_pp_height -= assigned_ct22 * 2
                 next_pp[column_index] += (
-                    current_pp_height + assigned_ct32 + assigned_ct22
+                    current_pp_height + assigned_ct32 + assigned_ct22 + assigned_ct42
                 )
                 if column_index < column_len - 1:
-                    next_pp[column_index + 1] += assigned_ct32 + assigned_ct22
+                    next_pp[column_index + 1] += (
+                        assigned_ct32 + assigned_ct22 + 2 * assigned_ct42
+                    )
 
                 ct32_decomposed[current_stage][column_index] = assigned_ct32
                 ct22_decomposed[current_stage][column_index] = assigned_ct22
+                ct42_decomposed[current_stage][column_index] = assigned_ct42
             current_pp = next_pp
             ct32_decomposed = np.r_[ct32_decomposed, np.zeros([1, len(self.ct32)])]
             ct22_decomposed = np.r_[ct22_decomposed, np.zeros([1, len(self.ct22)])]
+            ct42_decomposed = np.r_[ct42_decomposed, np.zeros([1, len(self.ct42)])]
             current_stage += 1
         ct32_decomposed = ct32_decomposed.astype(int)
         ct22_decomposed = ct22_decomposed.astype(int)
-        if np.sum(ct32_decomposed[-1, :]) == 0 and np.sum(ct22_decomposed[-1, :]) == 0:
+        ct42_decomposed = ct42_decomposed.astype(int)
+        if (
+            np.sum(ct32_decomposed[-1, :]) == 0
+            and np.sum(ct22_decomposed[-1, :]) == 0
+            and np.sum(ct42_decomposed[-1, :]) == 0
+        ):
             ct32_decomposed = ct32_decomposed[:-1]
             ct22_decomposed = ct22_decomposed[:-1]
-        return ct32_decomposed, ct22_decomposed
+            ct42_decomposed = ct42_decomposed[:-1]
+        return ct32_decomposed, ct22_decomposed, ct42_decomposed
 
     def compressor_assignment_fused(self):
-        dec_ct32, dec_ct22 = self.compressor_assignment()
+        dec_ct32, dec_ct22, dec_ct42 = self.compressor_assignment()
         assignment = []
         stage_num, col_num = dec_ct32.shape
         ct32_counter = np.zeros_like(self.pp, dtype=int)
         ct22_counter = np.zeros_like(self.pp, dtype=int)
+        ct42_counter = np.zeros_like(self.pp, dtype=int)
 
         for s in range(stage_num):
             stage_assignment = []
             for c in range(col_num):
                 column_assignment = []
+                for ct42_idx in range(dec_ct42[s, c]):
+                    compressor_info = (s, c, 4, ct42_counter[c])
+                    ct42_counter[c] += 1
+                    column_assignment.append(compressor_info)
                 for ct32_idx in range(dec_ct32[s, c]):
                     compressor_info = (s, c, 0, ct32_counter[c])
                     ct32_counter[c] += 1
@@ -401,7 +433,11 @@ class CompressorTree(ABC):
                     column_assignment.append(compressor_info)
                 stage_assignment.append(column_assignment)
             assignment.append(stage_assignment)
-        assert (ct32_counter == self.ct32).all() and (ct22_counter == self.ct22).all()
+        assert (
+            (ct32_counter == self.ct32).all()
+            and (ct22_counter == self.ct22).all()
+            and (ct42_counter == self.ct42).all()
+        )
         return assignment
 
     def compressor_assignment_ufomac(
@@ -1255,6 +1291,18 @@ class CompressorTree(ABC):
         v_src += "    );\n"
         return v_src
 
+    def declare_ct42(self, ct42_name, input_list, sum_name, carry_name, cout_name):
+        v_src = f"    CT42 {ct42_name} (\n"
+        v_src += f"        .a({input_list[0]}),\n"
+        v_src += f"        .b({input_list[1]}),\n"
+        v_src += f"        .c({input_list[2]}),\n"
+        v_src += f"        .d({input_list[3]}),\n"
+        v_src += f"        .sum({sum_name}),\n"
+        v_src += f"        .carry({carry_name}),\n"
+        v_src += f"        .cout({cout_name})\n"
+        v_src += "    );\n"
+        return v_src
+
     def declare_comment(self, comment: str, num_stars=50, align="c"):
         v_src = "/*" + "*" * num_stars + "\n"
         lines = comment.splitlines()
@@ -1270,8 +1318,13 @@ class CompressorTree(ABC):
         return v_src
 
     def emit_verilog_backup(self, file_path=None, dec_ct32=None, dec_ct22=None):
+        dec_ct42 = None
         if dec_ct32 is None or dec_ct22 is None:
-            dec_ct32, dec_ct22 = self.compressor_assignment()
+            dec_ct32, dec_ct22, dec_ct42 = self.compressor_assignment()
+        if (dec_ct42 is not None and int(np.sum(dec_ct42)) > 0) or int(np.sum(self.ct42)) > 0:
+            raise NotImplementedError(
+                "CT42 emission requires emit_verilog_fused_assignment or a dict router"
+            )
         stage_num = len(dec_ct32)
         column_num = len(self.pp)
 
@@ -1455,8 +1508,13 @@ class CompressorTree(ABC):
         method="GUROBI_CMD",
         **kwargs,
     ):
+        dec_ct42 = None
         if dec_ct32 is None or dec_ct22 is None:
-            dec_ct32, dec_ct22 = self.compressor_assignment()
+            dec_ct32, dec_ct22, dec_ct42 = self.compressor_assignment()
+        if (dec_ct42 is not None and int(np.sum(dec_ct42)) > 0) or int(np.sum(self.ct42)) > 0:
+            raise NotImplementedError(
+                "CT42 emission requires emit_verilog_fused_assignment or a dict router"
+            )
         column_num = len(self.pp)
 
         comment = ""
@@ -1540,6 +1598,7 @@ class CompressorTree(ABC):
         comment += f"Generated by CompressorTree\n"
         comment += f"ct32={self.ct32}\n"
         comment += f"ct22={self.ct22}\n"
+        comment += f"ct42={self.ct42}\n"
         v_src = self.declare_comment(comment, align="l")
 
         v_src += "module CompressorTree(\n"
@@ -1572,12 +1631,23 @@ class CompressorTree(ABC):
                             input_wire_list[column_index].pop() for _ in range(3)
                         ]
                         declare_ct: Callable = self.declare_fa
+                        carry_width = 1
                     elif t == 1:
                         ct_name = f"ct22_s{stage_index}_c{column_index}_{idx}"
                         input_wires = [
                             input_wire_list[column_index].pop() for _ in range(2)
                         ]
                         declare_ct: Callable = self.declare_ha
+                        carry_width = 1
+                    elif t == 4:
+                        if column_index + 1 >= column_num:
+                            raise ValueError("CT42 cannot be emitted in the final column")
+                        ct_name = f"ct42_s{stage_index}_c{column_index}_{idx}"
+                        input_wires = [
+                            input_wire_list[column_index].pop() for _ in range(4)
+                        ]
+                        declare_ct = None
+                        carry_width = 2
                     else:
                         raise NotImplementedError(f"Unknown compressor type: {t}")
                     sum_name = f"sum_from_{ct_name}"
@@ -1586,11 +1656,24 @@ class CompressorTree(ABC):
                     v_src += self.declare_wire(carry_name)
 
                     cell = cell_policy(s, c, t, idx) if cell_policy is not None else None
-                    v_src += declare_ct(ct_name, input_wires, sum_name, carry_name, cell=cell)
+                    if t == 4:
+                        if cell is not None:
+                            raise ValueError("Approximate CT42 cells are not supported yet")
+                        cout_name = f"cout_from_{ct_name}"
+                        v_src += self.declare_wire(cout_name)
+                        v_src += self.declare_ct42(
+                            ct_name, input_wires, sum_name, carry_name, cout_name
+                        )
+                    else:
+                        v_src += declare_ct(
+                            ct_name, input_wires, sum_name, carry_name, cell=cell
+                        )
 
                     output_wire_list[column_index].appendleft(sum_name)
                     if column_index + 1 < column_num:
                         output_wire_list[column_index + 1].appendleft(carry_name)
+                        if carry_width == 2:
+                            output_wire_list[column_index + 1].appendleft(cout_name)
                 while len(output_wire_list[column_index]) > 0:
                     wire = output_wire_list[column_index].pop()
                     input_wire_list[column_index].appendleft(wire)
@@ -1634,6 +1717,7 @@ class CompressorTree(ABC):
         comment += f"Generated by CompressorTree\n"
         comment += f"ct32={self.ct32}\n"
         comment += f"ct22={self.ct22}\n"
+        comment += f"ct42={self.ct42}\n"
         v_src = self.declare_comment(comment, align="l")
 
         v_src += "module CompressorTree(\n"

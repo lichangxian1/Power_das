@@ -188,6 +188,7 @@ class MultiChannelResGCN(nn.Module):
         self.fc_a = nn.Linear(in_dim, output_dim)
         self.fc_b = nn.Linear(in_dim, output_dim)
         self.fc_c = nn.Linear(in_dim, output_dim)
+        self.fc_d = nn.Linear(in_dim, output_dim)
 
         self.fc_sum = nn.Linear(in_dim, output_dim)
         self.fc_carry = nn.Linear(in_dim, output_dim)
@@ -199,16 +200,27 @@ class MultiChannelResGCN(nn.Module):
         return x
 
     def forward(
-        self, x, edge_index_a, edge_index_b, edge_index_c, return_embedding=False
+        self,
+        x,
+        edge_index_a,
+        edge_index_b,
+        edge_index_c,
+        return_embedding=False,
+        return_port_d=False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # return_embedding 默认 False -> 返回值与改前完全一致（零回归）
         x = self.embed(x, edge_index_a, edge_index_b, edge_index_c)
         out_a = self.fc_a(x)
         out_b = self.fc_b(x)
         out_c = self.fc_c(x)
+        out_d = self.fc_d(x)
 
         out_sum = self.fc_sum(x)
         out_carry = self.fc_carry(x)
+        if return_port_d:
+            if return_embedding:
+                return out_a, out_b, out_c, out_d, out_sum, out_carry, x
+            return out_a, out_b, out_c, out_d, out_sum, out_carry
         if return_embedding:
             return out_a, out_b, out_c, out_sum, out_carry, x
         return out_a, out_b, out_c, out_sum, out_carry
@@ -219,9 +231,12 @@ class CompressorGraph:
         self,
         pp: np.ndarray,
         assignment: List[List[Tuple]],
+        num_node_types: int = 4,
     ):
         self.assignment = assignment
         self.pp = pp
+        self.num_node_types = int(num_node_types)
+        self.port_num = 4 if self.num_node_types >= 5 else 3
 
         self.stage_num = len(assignment)
         self.col_num = len(assignment[0])
@@ -231,8 +246,10 @@ class CompressorGraph:
         remain_pp = np.zeros_like(pp, dtype=int)
         ct32 = np.zeros_like(pp, dtype=int)
         ct22 = np.zeros_like(pp, dtype=int)
+        ct42 = np.zeros_like(pp, dtype=int)
         dec_ct32 = np.zeros((self.stage_num, self.col_num), dtype=int)
         dec_ct22 = np.zeros((self.stage_num, self.col_num), dtype=int)
+        dec_ct42 = np.zeros((self.stage_num, self.col_num), dtype=int)
 
         for s in range(self.stage_num):
             for c in range(self.col_num):
@@ -244,37 +261,49 @@ class CompressorGraph:
                     elif type_idx == 1:
                         ct22[c] += 1
                         dec_ct22[s, c] += 1
+                    elif type_idx == 4:
+                        ct42[c] += 1
+                        dec_ct42[s, c] += 1
                     else:
                         raise ValueError
         carry_num = 0
         for c in range(self.col_num):
-            remain_pp[c] = pp[c] + carry_num - 2 * ct32[c] - ct22[c]
-            carry_num = ct32[c] + ct22[c]
+            remain_pp[c] = pp[c] + carry_num - 2 * ct32[c] - ct22[c] - 3 * ct42[c]
+            carry_num = ct32[c] + ct22[c] + 2 * ct42[c]
         logging.info(f"remain_pp\n: {remain_pp}")
 
         self.remain_pp = remain_pp
         self.dec_ct32 = dec_ct32
         self.dec_ct22 = dec_ct22
+        self.dec_ct42 = dec_ct42
         self.ct32 = ct32
         self.ct22 = ct22
+        self.ct42 = ct42
         self.slice_size = np.zeros((self.stage_num + 1, self.col_num), dtype=int)
         self.slice_size[0, :] = pp
         for s in range(1, self.stage_num + 1):
             self.slice_size[s, 0] = (
-                self.slice_size[s - 1, 0] - dec_ct32[s - 1, 0] * 2 - dec_ct22[s - 1, 0]
+                self.slice_size[s - 1, 0]
+                - dec_ct32[s - 1, 0] * 2
+                - dec_ct22[s - 1, 0]
+                - dec_ct42[s - 1, 0] * 3
             )
             for c in range(1, self.col_num):
                 self.slice_size[s, c] = (
                     self.slice_size[s - 1, c]
                     - dec_ct32[s - 1, c] * 2
                     - dec_ct22[s - 1, c]
+                    - dec_ct42[s - 1, c] * 3
                     + dec_ct32[s - 1, c - 1]
                     + dec_ct22[s - 1, c - 1]
+                    + dec_ct42[s - 1, c - 1] * 2
                 )
         self.port_size = np.zeros((self.stage_num + 1, self.col_num), dtype=int)
         for s in range(self.stage_num):
             for c in range(self.col_num):
-                self.port_size[s, c] = 3 * dec_ct32[s, c] + 2 * dec_ct22[s, c]
+                self.port_size[s, c] = (
+                    3 * dec_ct32[s, c] + 2 * dec_ct22[s, c] + 4 * dec_ct42[s, c]
+                )
         self.virtual_node_num = self.slice_size - self.port_size
 
         self.pp_indices = []
@@ -320,7 +349,7 @@ class CompressorGraph:
         for vertex_idx in range(num_nodes):
             vertex_info = self.vertex_list[vertex_idx]
             stage_idx, col_idx, type_idx, idx = vertex_info
-            type_onehot = np.zeros(4)
+            type_onehot = np.zeros(self.num_node_types)
             type_onehot[type_idx] = 1
             vertex_attr = np.concatenate(
                 [np.array([stage_idx, col_idx, idx]), type_onehot], axis=0
@@ -336,6 +365,10 @@ class CompressorGraph:
             elif dst_type_idx == 1:
                 edge_index_a.append((src_idx, dst_idx))
                 edge_index_b.append((src_idx, dst_idx))
+            elif dst_type_idx == 4:
+                edge_index_a.append((src_idx, dst_idx))
+                edge_index_b.append((src_idx, dst_idx))
+                edge_index_c.append((src_idx, dst_idx))
             elif dst_type_idx == 3:
                 edge_index_a.append((src_idx, dst_idx))
             else:
@@ -351,7 +384,7 @@ class CompressorGraph:
                     if src_col_idx == dst_col_idx and dst_stage_idx == 0:
                         __add_edge_index(src_idx, dst_idx, dst_type_idx)
             else:
-                if stage_idx < self.stage_num - 1:
+                if src_stage_idx < self.stage_num - 1:
                     for dst_idx in range(src_idx + 1, num_nodes):
                         dst_info = self.vertex_list[dst_idx]
                         dst_stage_idx, dst_col_idx, dst_type_idx, _ = dst_info
@@ -360,7 +393,7 @@ class CompressorGraph:
                             and src_stage_idx + 1 == dst_stage_idx
                         ):
                             __add_edge_index(src_idx, dst_idx, dst_type_idx)
-                    if col_idx < self.col_num - 1 and src_type_idx != 3:
+                    if src_col_idx < self.col_num - 1 and src_type_idx != 3:
                         for dst_idx in range(src_idx + 1, num_nodes):
                             dst_info = self.vertex_list[dst_idx]
                             dst_stage_idx, dst_col_idx, dst_type_idx, _ = dst_info
@@ -387,46 +420,65 @@ class CompressorGraph:
         src_indices = self.slice_indice_map[(s - 1, c)]
         dst_indices = self.slice_indice_map[(s, c)]
         mask = torch.full(
-            (3, len(src_indices), len(dst_indices)), True, dtype=torch.bool
+            (self.port_num, len(src_indices), len(dst_indices)), True, dtype=torch.bool
         )
         for local_dst_idx, dst_idx in enumerate(dst_indices):
             dst_info = self.vertex_list[dst_idx]
             dst_stage_idx, dst_col_idx, dst_type_idx, _ = dst_info
             if dst_type_idx == 0:
+                if self.port_num > 3:
+                    mask[3:, :, local_dst_idx] = False
+            elif dst_type_idx == 4:
                 pass
             elif dst_type_idx == 1:
                 mask[2, :, local_dst_idx] = False
+                if self.port_num > 3:
+                    mask[3:, :, local_dst_idx] = False
             elif dst_type_idx == 3:
                 mask[1:, :, local_dst_idx] = False
             else:
                 raise ValueError
         return mask
 
-    def get_slice_carry_mask(self, s, c) -> torch.Tensor:
+    def get_slice_carry_sources(self, s, c):
+        """Return routable carry-output events from column c-1 into (s, c).
+
+        FA/HA emit one carry. CT42 emits two same-weight carry outputs, so it appears
+        twice with distinct output names.
+        """
         src_indices = self.slice_indice_map[(s - 1, c - 1)]
+        out = []
+        for src_idx in src_indices:
+            _ss, _cc, src_type_idx, _ii = self.vertex_list[src_idx]
+            if src_type_idx in (0, 1):
+                out.append((src_idx, "carry"))
+            elif src_type_idx == 4:
+                out.append((src_idx, "carry"))
+                out.append((src_idx, "cout"))
+        return out
+
+    def get_slice_carry_mask(self, s, c) -> torch.Tensor:
+        carry_sources = self.get_slice_carry_sources(s, c)
         dst_indices = self.slice_indice_map[(s, c)]
         mask = torch.full(
-            (3, len(src_indices), len(dst_indices)), True, dtype=torch.bool
+            (self.port_num, len(carry_sources), len(dst_indices)), True, dtype=torch.bool
         )
         for local_dst_idx, dst_idx in enumerate(dst_indices):
             dst_info = self.vertex_list[dst_idx]
             dst_stage_idx, dst_col_idx, dst_type_idx, _ = dst_info
             if dst_type_idx == 0:
+                if self.port_num > 3:
+                    mask[3:, :, local_dst_idx] = False
+            elif dst_type_idx == 4:
                 pass
             elif dst_type_idx == 1:
                 mask[2, :, local_dst_idx] = False
+                if self.port_num > 3:
+                    mask[3:, :, local_dst_idx] = False
             elif dst_type_idx == 3:
                 mask[1:, :, local_dst_idx] = False
             else:
                 raise ValueError
-
-        for local_src_idx, src_idx in enumerate(src_indices):
-            src_info = self.vertex_list[src_idx]
-            src_stage_idx, src_col_idx, src_type_idx, _ = src_info
-            if src_type_idx == 0 or src_type_idx == 1:
-                pass
-            else:
-                mask[:, local_src_idx, :] = False
         return mask
 
 
@@ -557,11 +609,16 @@ class CompressorRouting:
         delay_target_ns=None,   # None → 用 fixed_target_delay（DC 时钟周期）当阈值
         # advantage 归一（点1）：A=-(obj-mean)/(std+eps)。默认 False = 旧行为 A=-obj。
         normalize_advantage=False,
+        # Exact 4:2 compressor architecture primitive. Default off for byte-level
+        # compatibility with existing FA/HA-only runs.
+        use_ct42=False,
         **kwargs,
     ):
         self.bit_width = bit_width
         self.encode_type = encode_type
         self.ct_arch = ct_arch
+        self.use_ct42 = bool(use_ct42)
+        self.num_node_types = 5 if self.use_ct42 else 4
 
         self.lse_gamma_val = lse_gamma_val
         self.num_episodes = num_episodes
@@ -615,6 +672,8 @@ class CompressorRouting:
         self.power_source = power_source
         self.power_proxy_output_scale = power_proxy_output_scale
         self.power_proxy = None
+        if self.use_ct42 and self.power_source == "proxy":
+            raise ValueError("use_ct42=True is not compatible with the current FA/HA-only power proxy")
         if self.power_source == "proxy":
             if power_proxy_ckpt is None:
                 raise ValueError("power_source='proxy' requires power_proxy_ckpt")
@@ -636,8 +695,16 @@ class CompressorRouting:
         self.gnn_b = None
         self.gnn_c = None
 
-        self.gcn_kwargs = gcn_kwargs
-        self.gcn = MultiChannelResGCN(**gcn_kwargs)
+        self.gcn_kwargs = copy.deepcopy(gcn_kwargs)
+        expected_input_dim = 3 + self.num_node_types
+        if int(self.gcn_kwargs.get("input_dim", expected_input_dim)) != expected_input_dim:
+            logging.info(
+                "[ct42] overriding gcn input_dim %s -> %s",
+                self.gcn_kwargs.get("input_dim"),
+                expected_input_dim,
+            )
+            self.gcn_kwargs["input_dim"] = expected_input_dim
+        self.gcn = MultiChannelResGCN(**self.gcn_kwargs)
         self.gcn.to(device)
 
         # ===== Phase B：近似类型搜索状态 =====
@@ -1239,7 +1306,12 @@ class CompressorRouting:
         )
         os.makedirs(build_dir, exist_ok=True)
 
-        ct = CompressorTree(self.initial_pp, self.state["ct32"], self.state["ct22"])
+        ct = CompressorTree(
+            self.initial_pp,
+            self.state["ct32"],
+            self.state["ct22"],
+            self.state.get("ct42"),
+        )
         if self.trunc_cols > 0:               # ① full-target-delay 诊断/导出也必须带截断
             ct.trunc_cols = self.trunc_cols
             ct.trunc_bits = self._trunc_bits
@@ -1317,7 +1389,9 @@ class CompressorRouting:
         self.state = self.found_best_info["ct"]
         self.assignment = self.found_best_info["assignment"]
         pp = self.initial_pp
-        self.comp_graph = CompressorGraph(pp, self.assignment)
+        self.comp_graph = CompressorGraph(
+            pp, self.assignment, num_node_types=self.num_node_types
+        )
 
         logging.info(f"testing full target delay at episode {episode_idx}")
         simulated_result = self.get_full_target_delay_result()
@@ -1413,23 +1487,38 @@ class CompressorRouting:
             }
         out_delay_list = []
         for (s, c), Z_mat_slice in Z_mat_dict.items():
+            keys = ["a", "b", "c", "d"][: self.comp_graph.port_num]
+            z_ports = []
             if c == 0:
-                Z_a = Z_mat_slice["sa"]
-                Z_b = Z_mat_slice["sb"]
-                Z_c = Z_mat_slice["sc"]
+                for key in keys:
+                    z_ports.append(Z_mat_slice[f"s{key}"])
                 last_slice_delay = slice_delay_dict[(s - 1, c)]["s"]
             else:
-                Z_a = torch.cat([Z_mat_slice["sa"], Z_mat_slice["ca"]], dim=0)
-                Z_b = torch.cat([Z_mat_slice["sb"], Z_mat_slice["cb"]], dim=0)
-                Z_c = torch.cat([Z_mat_slice["sc"], Z_mat_slice["cc"]], dim=0)
+                for key in keys:
+                    z_ports.append(
+                        torch.cat(
+                            [Z_mat_slice[f"s{key}"], Z_mat_slice[f"c{key}"]],
+                            dim=0,
+                        )
+                    )
+                carry_sources = self.comp_graph.get_slice_carry_sources(s, c)
+                prev_nodes = self.comp_graph.slice_indice_map[(s - 1, c - 1)]
+                local_by_node = {node_idx: i for i, node_idx in enumerate(prev_nodes)}
+                carry_delay_prev = slice_delay_dict[(s - 1, c - 1)]["c"]
+                if carry_sources:
+                    carry_rows = torch.cat(
+                        [
+                            carry_delay_prev[local_by_node[src_idx] : local_by_node[src_idx] + 1]
+                            for src_idx, _out_name in carry_sources
+                        ],
+                        dim=0,
+                    )
+                else:
+                    carry_rows = torch.zeros((0, 1), device=self.device)
                 last_slice_delay = torch.cat(
-                    [
-                        slice_delay_dict[(s - 1, c)]["s"],
-                        slice_delay_dict[(s - 1, c - 1)]["c"],
-                    ],
-                    dim=0,
+                    [slice_delay_dict[(s - 1, c)]["s"], carry_rows], dim=0
                 )
-            Z = torch.cat([Z_a, Z_b, Z_c], dim=1)
+            Z = torch.cat(z_ports, dim=1)
             mask = Z > -1e6
             p = torch.softmax(Z, dim=0).masked_fill(~mask, 0.0)
             permutated_delay = p.T @ last_slice_delay
@@ -1440,9 +1529,18 @@ class CompressorRouting:
             sum_delay = torch.zeros((node_num, 1), device=self.device)
             carry_delay = torch.zeros((node_num, 1), device=self.device)
 
-            a_delay = permutated_delay[:node_num, :]
-            b_delay = permutated_delay[node_num : 2 * node_num, :]
-            c_delay = permutated_delay[2 * node_num :, :]
+            port_delays = [
+                permutated_delay[i * node_num : (i + 1) * node_num, :]
+                for i in range(self.comp_graph.port_num)
+            ]
+            a_delay = port_delays[0]
+            b_delay = port_delays[1]
+            c_delay = port_delays[2]
+            d_delay = (
+                port_delays[3]
+                if self.comp_graph.port_num > 3
+                else torch.zeros_like(c_delay)
+            )
             for local_idx, node_idx in enumerate(slice_indices):
                 node_info = self.comp_graph.vertex_list[node_idx]
                 node_stage_idx, node_col_idx, node_type_idx, _ = node_info
@@ -1502,6 +1600,22 @@ class CompressorRouting:
                     assert b_delay[local_idx, :].item() == 0.0
                     sum_delay[local_idx, :] = a_delay[local_idx, :].flatten()
                     carry_delay[local_idx, :] = a_delay[local_idx, :].flatten()
+                elif node_type_idx == 4:
+                    # Exact CT42 is modeled as HA+FA depth for differentiable delay.
+                    in_delay = torch.cat(
+                        [
+                            a_delay[local_idx, :].flatten(),
+                            b_delay[local_idx, :].flatten(),
+                            c_delay[local_idx, :].flatten(),
+                            d_delay[local_idx, :].flatten(),
+                        ]
+                    )
+                    sum_delay[local_idx, :] = lse_gamma(
+                        in_delay + 0.15, self.lse_gamma_val
+                    )
+                    carry_delay[local_idx, :] = lse_gamma(
+                        in_delay + 0.10, self.lse_gamma_val
+                    )
                 else:
                     raise ValueError("Invalid node type index")
             if s == self.comp_graph.stage_num:
@@ -1522,15 +1636,14 @@ class CompressorRouting:
         l = 0.0
         time_start = time.time()
         for (s, c), Z_mat_slice in Z_mat_dict.items():
-            if c == 0:
-                Z_a = Z_mat_slice["sa"]
-                Z_b = Z_mat_slice["sb"]
-                Z_c = Z_mat_slice["sc"]
-            else:
-                Z_a = torch.cat([Z_mat_slice["sa"], Z_mat_slice["ca"]], dim=0)
-                Z_b = torch.cat([Z_mat_slice["sb"], Z_mat_slice["cb"]], dim=0)
-                Z_c = torch.cat([Z_mat_slice["sc"], Z_mat_slice["cc"]], dim=0)
-            Z = torch.cat([Z_a, Z_b, Z_c], dim=1)
+            keys = ["a", "b", "c", "d"][: self.comp_graph.port_num]
+            z_ports = []
+            for key in keys:
+                z = Z_mat_slice[f"s{key}"]
+                if c > 0:
+                    z = torch.cat([z, Z_mat_slice[f"c{key}"]], dim=0)
+                z_ports.append(z)
+            Z = torch.cat(z_ports, dim=1)
             mask = Z > -1e6
             p = torch.softmax(Z, dim=0).masked_fill(~mask, 0.0)
             row_sum = torch.sum(p, dim=1)
@@ -1547,15 +1660,14 @@ class CompressorRouting:
         l = 0.0
         time_start = time.time()
         for (s, c), Z_mat_slice in Z_mat_dict.items():
-            if c == 0:
-                Z_a = Z_mat_slice["sa"]
-                Z_b = Z_mat_slice["sb"]
-                Z_c = Z_mat_slice["sc"]
-            else:
-                Z_a = torch.cat([Z_mat_slice["sa"], Z_mat_slice["ca"]], dim=0)
-                Z_b = torch.cat([Z_mat_slice["sb"], Z_mat_slice["cb"]], dim=0)
-                Z_c = torch.cat([Z_mat_slice["sc"], Z_mat_slice["cc"]], dim=0)
-            Z = torch.cat([Z_a, Z_b, Z_c], dim=1)
+            keys = ["a", "b", "c", "d"][: self.comp_graph.port_num]
+            z_ports = []
+            for key in keys:
+                z = Z_mat_slice[f"s{key}"]
+                if c > 0:
+                    z = torch.cat([z, Z_mat_slice[f"c{key}"]], dim=0)
+                z_ports.append(z)
+            Z = torch.cat(z_ports, dim=1)
             mask = Z > -1e6
             p = torch.softmax(Z, dim=0).masked_fill(~mask, 0.0)
             l += torch.sum(torch.pow((p * (1 - p)), 2))
@@ -1617,29 +1729,26 @@ class CompressorRouting:
         for s in range(stage_num + 1):
             for c in range(col_num):
                 sum_mask = self.comp_graph.get_slice_sum_mask(s, c).to(self.device)
-                if c == 0:
-                    M_a = sum_mask[0, :, :]
-                    M_b = sum_mask[1, :, :]
-                    M_c = sum_mask[2, :, :]
-                else:
+                masks = [sum_mask[p, :, :] for p in range(self.comp_graph.port_num)]
+                if c > 0:
                     carry_mask = self.comp_graph.get_slice_carry_mask(s, c).to(
                         self.device
                     )
-                    M_a = torch.cat((sum_mask[0, :, :], carry_mask[0, :, :]), dim=0)
-                    M_b = torch.cat((sum_mask[1, :, :], carry_mask[1, :, :]), dim=0)
-                    M_c = torch.cat((sum_mask[2, :, :], carry_mask[2, :, :]), dim=0)
-                M = torch.cat((M_a, M_b, M_c), dim=1)
+                    masks = [
+                        torch.cat((sum_mask[p, :, :], carry_mask[p, :, :]), dim=0)
+                        for p in range(self.comp_graph.port_num)
+                    ]
+                M = torch.cat(masks, dim=1)
                 mask_cache[(s, c)] = M
         for (s, c), Z_mat_slice in Z_mat_dict.items():
-            if c == 0:
-                Z_a = Z_mat_slice["sa"]
-                Z_b = Z_mat_slice["sb"]
-                Z_c = Z_mat_slice["sc"]
-            else:
-                Z_a = torch.cat([Z_mat_slice["sa"], Z_mat_slice["ca"]], dim=0)
-                Z_b = torch.cat([Z_mat_slice["sb"], Z_mat_slice["cb"]], dim=0)
-                Z_c = torch.cat([Z_mat_slice["sc"], Z_mat_slice["cc"]], dim=0)
-            Z = torch.cat([Z_a, Z_b, Z_c], dim=1)
+            keys = ["a", "b", "c", "d"][: self.comp_graph.port_num]
+            z_ports = []
+            for key in keys:
+                z = Z_mat_slice[f"s{key}"]
+                if c > 0:
+                    z = torch.cat([z, Z_mat_slice[f"c{key}"]], dim=0)
+                z_ports.append(z)
+            Z = torch.cat(z_ports, dim=1)
             Z_cache[(s, c)] = Z
         return mask_cache, Z_cache
 
@@ -1686,16 +1795,14 @@ class CompressorRouting:
                             "local_dst_idx": local_dst_idx,
                             "sample": sample.item(),
                             "slice": (s, c),
+                            "src_output": "sum",
                         },
                     )
                 )
             if c > 0:
-                carry_src_indices = self.comp_graph.slice_indice_map[(s - 1, c - 1)]
-                for local_src_idx, src_idx in enumerate(carry_src_indices):
+                carry_sources = self.comp_graph.get_slice_carry_sources(s, c)
+                for local_src_idx, (src_idx, src_output) in enumerate(carry_sources):
                     src_info = self.comp_graph.vertex_list[src_idx]
-                    src_stage_idx, src_col_idx, src_type_idx, _ = src_info
-                    if src_type_idx == 2 or src_type_idx == 3:
-                        continue
                     logits = Z[local_src_idx + len(sum_src_indices), :].masked_fill(
                         ~M[local_src_idx + len(sum_src_indices), :], -1e9
                     )
@@ -1721,6 +1828,7 @@ class CompressorRouting:
                                 "local_dst_idx": local_dst_idx,
                                 "sample": sample.item(),
                                 "slice": (s, c),
+                                "src_output": src_output,
                             },
                         )
                     )
@@ -1734,6 +1842,11 @@ class CompressorRouting:
                 node_wires[node_id] = {
                     "from": {"a": None, "b": None, "c": None},
                     "to": {"sum": None, "carry": None},
+                }
+            elif node_type == 4:
+                node_wires[node_id] = {
+                    "from": {"a": None, "b": None, "c": None, "d": None},
+                    "to": {"sum": None, "carry": None, "cout": None},
                 }
             elif node_type == 1:
                 node_wires[node_id] = {
@@ -1861,11 +1974,39 @@ class CompressorRouting:
             v_src += f"    HA_no_carry {instance_name} (.a({a_wire}), .cin({b_wire}), .sum({sum_wire}));\n"
         return v_src, wire_set
 
+    def _declare_ct42(self, node_idx, wire_set: Set, node_wires: Dict):
+        stage_idx, col_idx, type_idx, idx = self.comp_graph.vertex_list[node_idx]
+        assert type_idx == 4
+        v_src = ""
+        instance_name = f"ct42_{node_idx}"
+
+        a_wire = f"from_{node_wires[node_idx]['from']['a']}_to_{node_idx}"
+        b_wire = f"from_{node_wires[node_idx]['from']['b']}_to_{node_idx}"
+        c_wire = f"from_{node_wires[node_idx]['from']['c']}_to_{node_idx}"
+        d_wire = f"from_{node_wires[node_idx]['from']['d']}_to_{node_idx}"
+        sum_wire = f"from_{node_idx}_to_{node_wires[node_idx]['to']['sum']}"
+        carry_dst = node_wires[node_idx]["to"]["carry"]
+        cout_dst = node_wires[node_idx]["to"]["cout"]
+        if carry_dst is None or cout_dst is None:
+            raise ValueError("CT42 must not be placed in the final carryless column")
+        carry_wire = f"from_{node_idx}_to_{carry_dst}"
+        cout_wire = f"from_{node_idx}_to_{cout_dst}"
+
+        for wire in [a_wire, b_wire, c_wire, d_wire, sum_wire, carry_wire, cout_wire]:
+            v, wire_set = self._declare_wire(wire, wire_set)
+            v_src += v
+        v_src += f"// ct42 node {(stage_idx, col_idx, type_idx, idx)}\n"
+        v_src += (
+            f"    CT42 {instance_name} (.a({a_wire}), .b({b_wire}), .c({c_wire}), "
+            f".d({d_wire}), .sum({sum_wire}), .carry({carry_wire}), .cout({cout_wire}));\n"
+        )
+        return v_src, wire_set
+
     def emit_assignment(self, samples_connection, cell_map=None):
         node_wires = {}
-        INPUT_PORTS = ["a", "b", "c"]
+        INPUT_PORTS = ["a", "b", "c", "d"]
 
-        for src_idx, dst_idx, dst_conc_type, _ in samples_connection:
+        for src_idx, dst_idx, dst_conc_type, meta in samples_connection:
             src_info = self.comp_graph.vertex_list[src_idx]
             dst_info = self.comp_graph.vertex_list[dst_idx]
             src_stage_idx, src_col_idx, src_type_idx, _ = src_info
@@ -1884,8 +2025,9 @@ class CompressorRouting:
                 input_port_name = INPUT_PORTS[dst_conc_type]
                 assert input_port_name in node_wires[dst_idx]["from"]
                 node_wires[dst_idx]["from"][input_port_name] = src_idx
-                assert "carry" in node_wires[src_idx]["to"]
-                node_wires[src_idx]["to"]["carry"] = dst_idx
+                src_output = meta.get("src_output", "carry")
+                assert src_output in node_wires[src_idx]["to"]
+                node_wires[src_idx]["to"][src_output] = dst_idx
             else:
                 raise ValueError(
                     f"Invalid edge: {src_info} -> {dst_info}, {src_col_idx} -> {dst_col_idx}"
@@ -1904,6 +2046,8 @@ class CompressorRouting:
                 v, wire_set = self._declare_ct32(node_idx, wire_set, node_wires, cell_map)
             elif type_idx == 1:
                 v, wire_set = self._declare_ct22(node_idx, wire_set, node_wires, cell_map)
+            elif type_idx == 4:
+                v, wire_set = self._declare_ct42(node_idx, wire_set, node_wires)
             else:
                 raise ValueError("Invalid node type")
             v_src += v
@@ -1930,13 +2074,42 @@ class CompressorRouting:
         time_end = time.time()
         time_start = time.time()
         if self.use_approx_types:
-            out_a, out_b, out_c, out_sum, out_carry, self._node_emb = self.gcn.forward(
-                x, edge_index_a, edge_index_b, edge_index_c, return_embedding=True
-            )
+            if self.use_ct42:
+                (
+                    out_a,
+                    out_b,
+                    out_c,
+                    out_d,
+                    out_sum,
+                    out_carry,
+                    self._node_emb,
+                ) = self.gcn.forward(
+                    x,
+                    edge_index_a,
+                    edge_index_b,
+                    edge_index_c,
+                    return_embedding=True,
+                    return_port_d=True,
+                )
+            else:
+                out_a, out_b, out_c, out_sum, out_carry, self._node_emb = self.gcn.forward(
+                    x, edge_index_a, edge_index_b, edge_index_c, return_embedding=True
+                )
+                out_d = None
         else:
-            out_a, out_b, out_c, out_sum, out_carry = self.gcn.forward(
-                x, edge_index_a, edge_index_b, edge_index_c
-            )
+            if self.use_ct42:
+                out_a, out_b, out_c, out_d, out_sum, out_carry = self.gcn.forward(
+                    x,
+                    edge_index_a,
+                    edge_index_b,
+                    edge_index_c,
+                    return_port_d=True,
+                )
+            else:
+                out_a, out_b, out_c, out_sum, out_carry = self.gcn.forward(
+                    x, edge_index_a, edge_index_b, edge_index_c
+                )
+                out_d = None
         time_end = time.time()
         stage_num, col_num = self.comp_graph.stage_num, self.comp_graph.col_num
         Z_mat_dict = {}
@@ -1952,32 +2125,29 @@ class CompressorRouting:
                     self.comp_graph.slice_indice_map[(s, c)], device=self.device
                 )
                 sum_mask = self.comp_graph.get_slice_sum_mask(s, c).to(self.device)
-                Z_sa = out_sum[sum_src_indices, :] @ out_a[dst_indices, :].T
-                Z_sb = out_sum[sum_src_indices, :] @ out_b[dst_indices, :].T
-                Z_sc = out_sum[sum_src_indices, :] @ out_c[dst_indices, :].T
-                Z_sa = Z_sa.masked_fill(~sum_mask[0, :, :], -1e9)
-                Z_sb = Z_sb.masked_fill(~sum_mask[1, :, :], -1e9)
-                Z_sc = Z_sc.masked_fill(~sum_mask[2, :, :], -1e9)
-                Z_mat_dict[(s, c)]["sa"] = Z_sa
-                Z_mat_dict[(s, c)]["sb"] = Z_sb
-                Z_mat_dict[(s, c)]["sc"] = Z_sc
+                port_outs = [out_a, out_b, out_c]
+                port_keys = ["a", "b", "c"]
+                if self.comp_graph.port_num > 3:
+                    port_outs.append(out_d)
+                    port_keys.append("d")
+                for p_idx, (key, out_port) in enumerate(zip(port_keys, port_outs)):
+                    z = out_sum[sum_src_indices, :] @ out_port[dst_indices, :].T
+                    z = z.masked_fill(~sum_mask[p_idx, :, :], -1e9)
+                    Z_mat_dict[(s, c)][f"s{key}"] = z
                 if c > 0:
+                    carry_sources = self.comp_graph.get_slice_carry_sources(s, c)
                     carry_src_indices = torch.tensor(
-                        self.comp_graph.slice_indice_map[(s - 1, c - 1)],
+                        [src_idx for src_idx, _out_name in carry_sources],
                         device=self.device,
+                        dtype=torch.long,
                     )
                     carry_mask = self.comp_graph.get_slice_carry_mask(s, c).to(
                         self.device
                     )
-                    Z_ca = out_carry[carry_src_indices, :] @ out_a[dst_indices, :].T
-                    Z_cb = out_carry[carry_src_indices, :] @ out_b[dst_indices, :].T
-                    Z_cc = out_carry[carry_src_indices, :] @ out_c[dst_indices, :].T
-                    Z_ca = Z_ca.masked_fill(~carry_mask[0, :, :], -1e9)
-                    Z_cb = Z_cb.masked_fill(~carry_mask[1, :, :], -1e9)
-                    Z_cc = Z_cc.masked_fill(~carry_mask[2, :, :], -1e9)
-                    Z_mat_dict[(s, c)]["ca"] = Z_ca
-                    Z_mat_dict[(s, c)]["cb"] = Z_cb
-                    Z_mat_dict[(s, c)]["cc"] = Z_cc
+                    for p_idx, (key, out_port) in enumerate(zip(port_keys, port_outs)):
+                        z = out_carry[carry_src_indices, :] @ out_port[dst_indices, :].T
+                        z = z.masked_fill(~carry_mask[p_idx, :, :], -1e9)
+                        Z_mat_dict[(s, c)][f"c{key}"] = z
         time_end = time.time()
         return Z_mat_dict
 
@@ -2165,7 +2335,10 @@ class CompressorRouting:
                 assignment = self.emit_assignment(samples_connection, cell_map=cell_map)
 
                 ct = CompressorTree(
-                    self.initial_pp, self.state["ct32"], self.state["ct22"]
+                    self.initial_pp,
+                    self.state["ct32"],
+                    self.state["ct22"],
+                    self.state.get("ct42"),
                 )
                 if self.trunc_cols > 0:           # ① 把截断信息挂到 ct，emit_pp_encoder 会读
                     ct.trunc_cols = self.trunc_cols
@@ -2467,14 +2640,23 @@ class CompressorRouting:
         try:
             self.state = copy.deepcopy(self.found_best_info["ct"])
             self.assignment = copy.deepcopy(self.found_best_info["assignment"])
-            self.comp_graph = CompressorGraph(self.initial_pp, self.assignment)
+            self.comp_graph = CompressorGraph(
+                self.initial_pp,
+                self.assignment,
+                num_node_types=self.num_node_types,
+            )
             # Phase B：从最优设计的 cell_types 复原近似 cell（comp_graph 同序，node_idx 一致）
             cell_types = self.found_best_info.get("cell_types") or {}
             cell_map = self._cell_map_from_types(cell_types)
             routing_assignment = self.emit_assignment(
                 self.found_best_info["connection"], cell_map=cell_map
             )
-            ct = CompressorTree(self.initial_pp, self.state["ct32"], self.state["ct22"])
+            ct = CompressorTree(
+                self.initial_pp,
+                self.state["ct32"],
+                self.state["ct22"],
+                self.state.get("ct42"),
+            )
             if self.trunc_cols > 0:               # ① 导出也带截断
                 ct.trunc_cols = self.trunc_cols
                 ct.trunc_bits = self._trunc_bits
@@ -2547,16 +2729,8 @@ class CompressorRouting:
                     M[:, sample["sample"]] = False
 
                 if c > 0:
-                    carry_src_indices = torch.tensor(
-                        self.comp_graph.slice_indice_map[(s - 1, c - 1)],
-                        device=self.device,
-                    )
-                    for local_src_idx, src_idx in enumerate(carry_src_indices):
-                        src_info = self.comp_graph.vertex_list[src_idx]
-                        src_stage_idx, src_col_idx, src_type_idx, _ = src_info
-                        if src_type_idx == 2 or src_type_idx == 3:
-                            continue
-
+                    carry_sources = self.comp_graph.get_slice_carry_sources(s, c)
+                    for local_src_idx, (_src_idx, _src_output) in enumerate(carry_sources):
                         sample = sample_info["connection"][sample_id][3]
                         sample_id += 1
                         logits = Z[local_src_idx + len(sum_src_indices), :].masked_fill(
@@ -2700,6 +2874,8 @@ class CompressorRouting:
         best_str = f"  best_mred={best_mred * 100:.4f}%" if best_mred is not None else ""
         if info.get("n_approx") is not None:
             best_str += f"  n_approx={info['n_approx']}"
+        if info.get("n_ct42") is not None:
+            best_str += f"  n_ct42={info['n_ct42']}"
         logging.info(
             "[ep %4d/%d]  obj=%.6f  area=%.1f  delay=%.4fns"
             "  pwr=%.4fmW[%s]  med=%.1f%s%s%s"
@@ -2738,6 +2914,7 @@ class CompressorRouting:
             1 for tk in (self.found_best_info.get("cell_types") or {}).values()
             if tk and tk[1] != 0
         )
+        info["n_ct42"] = int(np.sum((self.found_best_info.get("ct") or {}).get("ct42", [])))
         _bud = getattr(self, "mred_budget", None)
         if getattr(self, "error_metric", "med") == "mred" and _bud:
             _ms = [(s.get("measured_error") or {}).get("mred") for s in sample_info_list]
@@ -2815,6 +2992,8 @@ class CompressorRouting:
             "ct32": ct.ct32.astype(int),
             "ct22": ct.ct22.astype(int),
         }
+        if self.use_ct42:
+            init_state["ct42"] = np.zeros_like(ct.ct32, dtype=int)
         self.pool.add(init_objective, init_state)
 
         if self.gomil_path is not None:
@@ -2826,6 +3005,14 @@ class CompressorRouting:
                         "ct32": np.asarray(gomil_data["ct"]["ct32"], dtype=int),
                         "ct22": np.asarray(gomil_data["ct"]["ct22"], dtype=int),
                     }
+                    if self.use_ct42:
+                        gomil_state["ct42"] = np.asarray(
+                            gomil_data["ct"].get(
+                                "ct42",
+                                np.zeros_like(gomil_state["ct32"]),
+                            ),
+                            dtype=int,
+                        )
                     gomil_objective = self.get_objective(
                         gomil_data["simulated_result_list"],
                         cell_types=gomil_data.get("cell_types"),
@@ -2849,9 +3036,11 @@ class CompressorRouting:
         self.transition(action)
 
         pp = get_initial_partial_product(self.bit_width, self.encode_type)
-        ct = CompressorTree(pp, self.state["ct32"], self.state["ct22"])
+        ct = CompressorTree(pp, self.state["ct32"], self.state["ct22"], self.state.get("ct42"))
         self.assignment = ct.compressor_assignment_fused()
-        self.comp_graph = CompressorGraph(pp, self.assignment)
+        self.comp_graph = CompressorGraph(
+            pp, self.assignment, num_node_types=self.num_node_types
+        )
 
     def legalize_ct_architecture(self, ct32: np.ndarray, ct22: np.ndarray):
         initial_pp = copy.deepcopy(self.initial_pp)
@@ -2912,6 +3101,34 @@ class CompressorRouting:
         return ct32, ct22
 
     def transition(self, action: int) -> np.ndarray:
+        if self.use_ct42:
+            action_type_num = 2
+            action_column = action // action_type_num
+            action_type = action % action_type_num
+            ct32 = copy.deepcopy(self.state["ct32"])
+            ct22 = copy.deepcopy(self.state["ct22"])
+            ct42 = copy.deepcopy(
+                self.state.get("ct42", np.zeros_like(ct32, dtype=int))
+            )
+            if action_type == 0:
+                if ct32[action_column] <= 0 or ct22[action_column] <= 0:
+                    raise ValueError(f"illegal CT42 promote action at column {action_column}")
+                ct32[action_column] -= 1
+                ct22[action_column] -= 1
+                ct42[action_column] += 1
+            elif action_type == 1:
+                if ct42[action_column] <= 0:
+                    raise ValueError(f"illegal CT42 demote action at column {action_column}")
+                ct32[action_column] += 1
+                ct22[action_column] += 1
+                ct42[action_column] -= 1
+            else:
+                raise NotImplementedError
+            self.state["ct32"] = ct32.astype(int)
+            self.state["ct22"] = ct22.astype(int)
+            self.state["ct42"] = ct42.astype(int)
+            return self.state
+
         action_column = action // 4
         action_type = action % 4
         ct_32 = copy.deepcopy(self.state["ct32"])
@@ -2935,6 +3152,21 @@ class CompressorRouting:
         self.state["ct22"] = legalized_ct22
 
     def get_action_mask(self):
+        if self.use_ct42:
+            action_type_num = 2
+            ct32 = self.state["ct32"]
+            ct22 = self.state["ct22"]
+            ct42 = self.state.get("ct42", np.zeros_like(ct32, dtype=int))
+            mask = np.zeros([action_type_num * len(self.initial_pp)])
+            for column_index in range(0, len(self.initial_pp) - 1):
+                if ct32[column_index] > 0 and ct22[column_index] > 0:
+                    mask[column_index * action_type_num] = 1
+                if ct42[column_index] > 0:
+                    mask[column_index * action_type_num + 1] = 1
+            if not np.any(mask):
+                raise ValueError("use_ct42=True but no legal CT42 promote/demote action exists")
+            return mask != 0
+
         action_type_num = 4
         ct_32 = self.state["ct32"]
         ct_22 = self.state["ct22"]

@@ -67,6 +67,8 @@ def main():
     p.add_argument("--target_delay", type=float, default=1.5, help="DC 时钟周期 (ns)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default=None)
+    p.add_argument("--use_ct42", action="store_true",
+                   help="把 exact 4:2 compressor 作为可搜索架构原语接入；CT42 只使用精确实现")
     # DC 重标定（按烟雾实测：DC-direct area~800µm², delay~1.44ns,
     # power~10.7mW＝0.0107W（默认 0.5 翻转率，比 XA/SAIF 高约 20×））
     p.add_argument("--delay_scale", type=float, default=1.44)
@@ -115,6 +117,8 @@ def main():
             "experiment_prefix": "dc_" + str(exp_kwargs.get("experiment_prefix", "mul16")),
         }
     )
+    if args.use_ct42:
+        tk["use_ct42"] = True
     if args.episodes is not None:
         tk["num_episodes"] = args.episodes
         tk.setdefault("scheduler_kwargs", {})["T_max"] = args.episodes  # T_max 必须 == episodes
@@ -158,10 +162,10 @@ def main():
     )
     logging.info("EDA_BASE_DIR_DC=%s", os.environ["EDA_BASE_DIR_DC"])
     logging.info(
-        "DC train: synth=dc episodes=%s samples=%s n_proc=%s med_budget=%s td=%sns "
+        "DC train: synth=dc episodes=%s samples=%s n_proc=%s med_budget=%s td=%sns use_ct42=%s "
         "scales(delay/area/power)=%s/%s/%s",
         tk.get("num_episodes"), tk.get("num_samples"), tk.get("n_processing"),
-        tk.get("med_budget"), tk.get("fixed_target_delay"),
+        tk.get("med_budget"), tk.get("fixed_target_delay"), tk.get("use_ct42", False),
         tk["delay_scale"], tk["area_scale"], tk["power_scale"],
     )
 

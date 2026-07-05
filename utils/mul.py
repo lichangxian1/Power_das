@@ -10,6 +10,7 @@ from utils import (
     HA_verilog_src,
     FA_no_carry_verilog_src,
     HA_no_carry_verilog_src,
+    CT42_verilog_src,
 )
 import utils
 import multiprocessing
@@ -313,6 +314,7 @@ class Mul:
         verilog_src += HA_verilog_src
         verilog_src += FA_no_carry_verilog_src
         verilog_src += HA_no_carry_verilog_src
+        verilog_src += CT42_verilog_src
         verilog_src += extra_modules_src
 
         if rtl_path is not None:
@@ -587,6 +589,7 @@ class Mac(Mul):
         verilog_src += HA_verilog_src
         verilog_src += FA_no_carry_verilog_src
         verilog_src += HA_no_carry_verilog_src
+        verilog_src += CT42_verilog_src
 
         if rtl_path is not None:
             os.makedirs(os.path.dirname(rtl_path), exist_ok=True)
