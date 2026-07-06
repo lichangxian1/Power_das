@@ -1878,12 +1878,36 @@ class CompressorRouting:
             v_src += f"    wire {wire_name};\n"
         return v_src, wire_set
 
+    @staticmethod
+    def _edge_ref(src_idx, src_output):
+        return int(src_idx), str(src_output)
+
+    @staticmethod
+    def _wire_from_ref(src_ref, dst_idx):
+        if src_ref is None or dst_idx is None:
+            return None
+        src_idx, src_output = src_ref
+        return f"from_{src_idx}_{src_output}_to_{dst_idx}"
+
+    def _wire_from_output(self, src_idx, src_output, dst_idx):
+        return self._wire_from_ref(self._edge_ref(src_idx, src_output), dst_idx)
+
+    def _input_wire(self, node_wires: Dict, node_idx, input_port):
+        src_ref = node_wires[node_idx]["from"][input_port]
+        if src_ref is None:
+            raise ValueError(f"unrouted input {input_port} for node {node_idx}")
+        return self._wire_from_ref(src_ref, node_idx)
+
+    def _output_wire(self, node_wires: Dict, node_idx, output_port):
+        dst_idx = node_wires[node_idx]["to"][output_port]
+        return self._wire_from_output(node_idx, output_port, dst_idx)
+
     def _declare_pp(self, node_idx, wire_set: Set, node_wires: Dict):
         stage_idx, col_idx, type_idx, idx = self.comp_graph.vertex_list[node_idx]
         assert type_idx == 2
         v_src = ""
         instance_name = f"pp_{col_idx}[{idx}]"
-        sum_wire = f"from_{node_idx}_to_{node_wires[node_idx]['to']['sum']}"
+        sum_wire = self._output_wire(node_wires, node_idx, "sum")
         v, wire_set = self._declare_wire(sum_wire, wire_set)
         v_src += v
 
@@ -1897,9 +1921,9 @@ class CompressorRouting:
         v_src = ""
         instance_name = f"visual_{node_idx}"
 
-        a_wire = f"from_{node_wires[node_idx]['from']['a']}_to_{node_idx}"
+        a_wire = self._input_wire(node_wires, node_idx, "a")
         if stage_idx < self.comp_graph.stage_num:
-            sum_wire = f"from_{node_idx}_to_{node_wires[node_idx]['to']['sum']}"
+            sum_wire = self._output_wire(node_wires, node_idx, "sum")
         else:
             sum_wire = None
 
@@ -1925,13 +1949,13 @@ class CompressorRouting:
         instance_name = f"ct32_{node_idx}"
         cell = (cell_map or {}).get(node_idx) or "FA"
 
-        a_wire = f"from_{node_wires[node_idx]['from']['a']}_to_{node_idx}"
-        b_wire = f"from_{node_wires[node_idx]['from']['b']}_to_{node_idx}"
-        c_wire = f"from_{node_wires[node_idx]['from']['c']}_to_{node_idx}"
+        a_wire = self._input_wire(node_wires, node_idx, "a")
+        b_wire = self._input_wire(node_wires, node_idx, "b")
+        c_wire = self._input_wire(node_wires, node_idx, "c")
 
-        sum_wire = f"from_{node_idx}_to_{node_wires[node_idx]['to']['sum']}"
+        sum_wire = self._output_wire(node_wires, node_idx, "sum")
         if node_wires[node_idx]["to"]["carry"] is not None:
-            carry_wire = f"from_{node_idx}_to_{node_wires[node_idx]['to']['carry']}"
+            carry_wire = self._output_wire(node_wires, node_idx, "carry")
         else:
             assert col_idx == self.comp_graph.col_num - 1
             carry_wire = None
@@ -1955,11 +1979,11 @@ class CompressorRouting:
         instance_name = f"ct22_{node_idx}"
         cell = (cell_map or {}).get(node_idx) or "HA"
 
-        a_wire = f"from_{node_wires[node_idx]['from']['a']}_to_{node_idx}"
-        b_wire = f"from_{node_wires[node_idx]['from']['b']}_to_{node_idx}"
-        sum_wire = f"from_{node_idx}_to_{node_wires[node_idx]['to']['sum']}"
+        a_wire = self._input_wire(node_wires, node_idx, "a")
+        b_wire = self._input_wire(node_wires, node_idx, "b")
+        sum_wire = self._output_wire(node_wires, node_idx, "sum")
         if node_wires[node_idx]["to"]["carry"] is not None:
-            carry_wire = f"from_{node_idx}_to_{node_wires[node_idx]['to']['carry']}"
+            carry_wire = self._output_wire(node_wires, node_idx, "carry")
         else:
             assert col_idx == self.comp_graph.col_num - 1
             carry_wire = None
@@ -1980,17 +2004,17 @@ class CompressorRouting:
         v_src = ""
         instance_name = f"ct42_{node_idx}"
 
-        a_wire = f"from_{node_wires[node_idx]['from']['a']}_to_{node_idx}"
-        b_wire = f"from_{node_wires[node_idx]['from']['b']}_to_{node_idx}"
-        c_wire = f"from_{node_wires[node_idx]['from']['c']}_to_{node_idx}"
-        d_wire = f"from_{node_wires[node_idx]['from']['d']}_to_{node_idx}"
-        sum_wire = f"from_{node_idx}_to_{node_wires[node_idx]['to']['sum']}"
+        a_wire = self._input_wire(node_wires, node_idx, "a")
+        b_wire = self._input_wire(node_wires, node_idx, "b")
+        c_wire = self._input_wire(node_wires, node_idx, "c")
+        d_wire = self._input_wire(node_wires, node_idx, "d")
+        sum_wire = self._output_wire(node_wires, node_idx, "sum")
         carry_dst = node_wires[node_idx]["to"]["carry"]
         cout_dst = node_wires[node_idx]["to"]["cout"]
         if carry_dst is None or cout_dst is None:
             raise ValueError("CT42 must not be placed in the final carryless column")
-        carry_wire = f"from_{node_idx}_to_{carry_dst}"
-        cout_wire = f"from_{node_idx}_to_{cout_dst}"
+        carry_wire = self._wire_from_output(node_idx, "carry", carry_dst)
+        cout_wire = self._wire_from_output(node_idx, "cout", cout_dst)
 
         for wire in [a_wire, b_wire, c_wire, d_wire, sum_wire, carry_wire, cout_wire]:
             v, wire_set = self._declare_wire(wire, wire_set)
@@ -2006,6 +2030,23 @@ class CompressorRouting:
         node_wires = {}
         INPUT_PORTS = ["a", "b", "c", "d"]
 
+        def connect(src_idx, dst_idx, dst_conc_type, src_output):
+            input_port_name = INPUT_PORTS[dst_conc_type]
+            assert input_port_name in node_wires[dst_idx]["from"]
+            if node_wires[dst_idx]["from"][input_port_name] is not None:
+                raise ValueError(
+                    f"input {input_port_name} of node {dst_idx} is routed twice"
+                )
+            assert src_output in node_wires[src_idx]["to"]
+            if node_wires[src_idx]["to"][src_output] is not None:
+                raise ValueError(
+                    f"output {src_output} of node {src_idx} is routed twice"
+                )
+            node_wires[dst_idx]["from"][input_port_name] = self._edge_ref(
+                src_idx, src_output
+            )
+            node_wires[src_idx]["to"][src_output] = dst_idx
+
         for src_idx, dst_idx, dst_conc_type, meta in samples_connection:
             src_info = self.comp_graph.vertex_list[src_idx]
             dst_info = self.comp_graph.vertex_list[dst_idx]
@@ -2016,18 +2057,15 @@ class CompressorRouting:
 
             assert src_stage_idx + 1 == dst_stage_idx
             if src_col_idx == dst_col_idx:
-                input_port_name = INPUT_PORTS[dst_conc_type]
-                assert input_port_name in node_wires[dst_idx]["from"]
-                node_wires[dst_idx]["from"][input_port_name] = src_idx
-                assert "sum" in node_wires[src_idx]["to"]
-                node_wires[src_idx]["to"]["sum"] = dst_idx
+                src_output = meta.get("src_output", "sum")
+                if src_output != "sum":
+                    raise ValueError(
+                        f"same-column edge must use sum output, got {src_output}"
+                    )
+                connect(src_idx, dst_idx, dst_conc_type, src_output)
             elif src_col_idx + 1 == dst_col_idx:
-                input_port_name = INPUT_PORTS[dst_conc_type]
-                assert input_port_name in node_wires[dst_idx]["from"]
-                node_wires[dst_idx]["from"][input_port_name] = src_idx
                 src_output = meta.get("src_output", "carry")
-                assert src_output in node_wires[src_idx]["to"]
-                node_wires[src_idx]["to"][src_output] = dst_idx
+                connect(src_idx, dst_idx, dst_conc_type, src_output)
             else:
                 raise ValueError(
                     f"Invalid edge: {src_info} -> {dst_info}, {src_col_idx} -> {dst_col_idx}"
