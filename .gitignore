@@ -44,3 +44,4 @@ library
 library/t28_official/*.lib
 logs
 Appr_Comp/rtl
+*.rpt

@@ -1049,6 +1049,10 @@ class CompressorRouting:
     def _load_approx42_table(self, selected):
         lib_path = self._resolve_path(self.approx42_library_path)
         lib42 = json.load(open(lib_path))["cells"]
+        # 原生 4 输入 cell（无 cin 端口，gen_comp42_native.py 产出）：发射时不接 .cin
+        self._ct42_native4_names = {
+            n for n, c in lib42.items() if c.get("pattern_bits") == 4
+        }
         selected42_keys = [k for k, v in selected.items() if v.get("type") == "42"]
         if selected42_keys:
             exact_keys = [
@@ -2221,9 +2225,14 @@ class CompressorRouting:
                 f".d({d_wire}), .sum({sum_wire}), .carry({carry_wire}), .cout({cout_wire}));\n"
             )
         else:
+            native4 = (
+                cell in getattr(self, "_ct42_native4_names", set())
+                or cell.startswith("comp42n_")
+            )
+            cin_part = "" if native4 else ".cin(1'b0), "
             v_src += (
                 f"    {cell} {instance_name} (.a({a_wire}), .b({b_wire}), .c({c_wire}), "
-                f".d({d_wire}), .cin(1'b0), .sum({sum_wire}), "
+                f".d({d_wire}), {cin_part}.sum({sum_wire}), "
                 f".carry({carry_wire}), .cout({cout_wire}));\n"
             )
         return v_src, wire_set
