@@ -3282,8 +3282,20 @@ class CompressorRouting:
             pp, self.assignment, num_node_types=self.num_node_types
         )
 
-    def legalize_ct_architecture(self, ct32: np.ndarray, ct22: np.ndarray):
-        initial_pp = copy.deepcopy(self.initial_pp)
+    def _ct42_effective_pp(self, ct42):
+        """把固定的 ct42 背景折进等效初始列高：每列消耗 3、给下一列 2。
+        0..3 经典动作的合法性/合法化在等效列高上判定即与无 ct42 时同构。"""
+        eff = np.asarray(copy.deepcopy(self.initial_pp), dtype=int)
+        ct42 = np.asarray(ct42, dtype=int)
+        eff -= 3 * ct42
+        eff[1:] += 2 * ct42[:-1]
+        return eff
+
+    def legalize_ct_architecture(self, ct32: np.ndarray, ct22: np.ndarray, initial_pp=None):
+        if initial_pp is None:
+            initial_pp = copy.deepcopy(self.initial_pp)
+        else:
+            initial_pp = np.asarray(copy.deepcopy(initial_pp), dtype=int)
         assert len(ct32) == len(initial_pp) and len(ct22) == len(initial_pp)
         ct32 = copy.deepcopy(ct32).astype(int)
         ct22 = copy.deepcopy(ct22).astype(int)
@@ -3342,7 +3354,10 @@ class CompressorRouting:
 
     def transition(self, action: int) -> np.ndarray:
         if self.use_ct42:
-            action_type_num = 2
+            # 6 动作/列：0..3 = 经典 ±HA / FA<->HA（ct42 折进等效列高后合法化），
+            #            4 = promote42 (FA+HA -> CT42)，5 = demote42 (CT42 -> FA+HA)。
+            # 动作空间是无 ct42 搜索的严格超集，纯截断解不再不可达。
+            action_type_num = 6
             action_column = action // action_type_num
             action_type = action % action_type_num
             ct32 = copy.deepcopy(self.state["ct32"])
@@ -3350,22 +3365,35 @@ class CompressorRouting:
             ct42 = copy.deepcopy(
                 self.state.get("ct42", np.zeros_like(ct32, dtype=int))
             )
-            if action_type == 0:
+            if action_type == 4:
                 if ct32[action_column] <= 0 or ct22[action_column] <= 0:
                     raise ValueError(f"illegal CT42 promote action at column {action_column}")
                 ct32[action_column] -= 1
                 ct22[action_column] -= 1
                 ct42[action_column] += 1
-            elif action_type == 1:
+            elif action_type == 5:
                 if ct42[action_column] <= 0:
                     raise ValueError(f"illegal CT42 demote action at column {action_column}")
                 ct32[action_column] += 1
                 ct22[action_column] += 1
                 ct42[action_column] -= 1
+            elif action_type in (0, 1, 2, 3):
+                if action_type == 0:
+                    ct22[action_column] += 1
+                elif action_type == 1:
+                    ct22[action_column] -= 1
+                elif action_type == 2:
+                    ct22[action_column] += 1
+                    ct32[action_column] -= 1
+                elif action_type == 3:
+                    ct22[action_column] -= 1
+                    ct32[action_column] += 1
+                eff_pp = self._ct42_effective_pp(ct42)
+                ct32, ct22 = self.legalize_ct_architecture(ct32, ct22, initial_pp=eff_pp)
             else:
                 raise NotImplementedError
-            self.state["ct32"] = ct32.astype(int)
-            self.state["ct22"] = ct22.astype(int)
+            self.state["ct32"] = np.asarray(ct32).astype(int)
+            self.state["ct22"] = np.asarray(ct22).astype(int)
             self.state["ct42"] = ct42.astype(int)
             return self.state
 
@@ -3393,26 +3421,37 @@ class CompressorRouting:
 
     def get_action_mask(self):
         if self.use_ct42:
-            action_type_num = 2
+            # 6 动作/列：0..3 经典 ±HA / FA<->HA（在 ct42 等效列高上判定），
+            # 4 promote42 / 5 demote42（列高不变；末列禁用，两个 carry 无处去）。
+            action_type_num = 6
             ct32 = self.state["ct32"]
             ct22 = self.state["ct22"]
             ct42 = self.state.get("ct42", np.zeros_like(ct32, dtype=int))
             mask = np.zeros([action_type_num * len(self.initial_pp)])
             for column_index in range(0, len(self.initial_pp) - 1):
                 if ct32[column_index] > 0 and ct22[column_index] > 0:
-                    mask[column_index * action_type_num] = 1
+                    mask[column_index * action_type_num + 4] = 1
                 if ct42[column_index] > 0:
-                    mask[column_index * action_type_num + 1] = 1
+                    mask[column_index * action_type_num + 5] = 1
+            eff_pp = self._ct42_effective_pp(ct42)
+            mask = self._fill_classic_action_mask(eff_pp, mask, action_type_num)
             if not np.any(mask):
-                raise ValueError("use_ct42=True but no legal CT42 promote/demote action exists")
+                raise ValueError("use_ct42=True but no legal action exists")
             return mask != 0
 
         action_type_num = 4
+        initial_pp = self.initial_pp
+        mask = np.zeros([action_type_num * len(initial_pp)])
+        mask = self._fill_classic_action_mask(initial_pp, mask, action_type_num)
+        mask = mask != 0
+        return mask
+
+    def _fill_classic_action_mask(self, initial_pp, mask, action_type_num):
+        """0..3 经典动作（+HA/-HA/FA->HA/HA->FA）的合法性判定，写入并返回 mask。
+        use_ct42 时 initial_pp 传 ct42 等效列高即可复用同一判定。"""
         ct_32 = self.state["ct32"]
         ct_22 = self.state["ct22"]
 
-        initial_pp = self.initial_pp
-        mask = np.zeros([action_type_num * len(initial_pp)])
         remain_pp = copy.deepcopy(initial_pp)
         for column_index in range(len(remain_pp)):
             if column_index > 0:
@@ -3480,7 +3519,6 @@ class CompressorRouting:
                         if i + 1 < len(pp):
                             pp[i + 1] = pp[i + 1] - 1
                         pp[i] = 2
-        mask = mask != 0
         return mask
 
     def update_pool(

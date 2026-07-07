@@ -192,10 +192,13 @@ module CT42 (a, b, c, d, sum, carry, cout);
     output carry;
     output cout;
 
-    wire s0;
-    wire c0;
-    HA ha0 (.a(a), .cin(b), .sum(s0), .cout(c0));
-    FA fa0 (.a(s0), .b(c), .cin(d), .sum(sum), .cout(carry));
-    assign cout = c0;
+    // 平衡树 4:2（a+b+c+d == sum + 2*carry + 2*cout）：
+    // sum 仅 2 级 XOR；DC 表征（t28, compile_ultra）面积/时序均优于 HA+FA 拼装
+    // （18.14 vs 27.55 um^2, tmax 0.56 vs 0.62ns，见 outputs/2026-07-07_ct42_char）。
+    wire w = a ^ b;
+    wire x = c ^ d;
+    assign sum   = w ^ x;
+    assign cout  = (w & c) | (~w & a);
+    assign carry = (w ^ c) & d;
 endmodule
 """
