@@ -68,7 +68,13 @@ def main():
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default=None)
     p.add_argument("--use_ct42", action="store_true",
-                   help="把 exact 4:2 compressor 作为可搜索架构原语接入；CT42 只使用精确实现")
+                   help="把 4:2 compressor 作为可搜索架构原语接入；use_approx_types=true 时 CT42 也可选近似 cell")
+    p.add_argument("--approx42_library_path", default=None,
+                   help="4:2 近似压缩器库 JSON，默认使用 trainer 内置的 Appr_Comp/library42_pair32_func.json")
+    p.add_argument("--approx42_rtl_path", default=None,
+                   help="4:2 近似压缩器 Verilog 库，默认使用 trainer 内置的 Appr_Comp/rtl/comp42_lib.v")
+    p.add_argument("--approx42_max_types", type=int, default=None,
+                   help="4:2 类型菜单大小上限，含 exact；默认使用 trainer 内置值")
     # DC 重标定（按烟雾实测：DC-direct area~800µm², delay~1.44ns,
     # power~10.7mW＝0.0107W（默认 0.5 翻转率，比 XA/SAIF 高约 20×））
     p.add_argument("--delay_scale", type=float, default=1.44)
@@ -119,6 +125,12 @@ def main():
     )
     if args.use_ct42:
         tk["use_ct42"] = True
+    if args.approx42_library_path is not None:
+        tk["approx42_library_path"] = args.approx42_library_path
+    if args.approx42_rtl_path is not None:
+        tk["approx42_rtl_path"] = args.approx42_rtl_path
+    if args.approx42_max_types is not None:
+        tk["approx42_max_types"] = args.approx42_max_types
     if args.episodes is not None:
         tk["num_episodes"] = args.episodes
         tk.setdefault("scheduler_kwargs", {})["T_max"] = args.episodes  # T_max 必须 == episodes

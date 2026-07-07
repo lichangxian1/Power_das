@@ -142,6 +142,8 @@ def load_checkpointed_exp(config: Path, run_dir: Path, save_iter: str, out_dir: 
     type_state = torch.load(ckpt / "type_heads.pth", map_location=device)
     exp.type_head_32.load_state_dict(type_state["type_head_32"])
     exp.type_head_22.load_state_dict(type_state["type_head_22"])
+    if getattr(exp, "type_head_42", None) is not None and "type_head_42" in type_state:
+        exp.type_head_42.load_state_dict(type_state["type_head_42"])
     if exp.approx_cardinality_logits is not None and "approx_cardinality_logits" in type_state:
         with torch.no_grad():
             exp.approx_cardinality_logits.copy_(type_state["approx_cardinality_logits"].to(exp.device))

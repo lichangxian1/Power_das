@@ -6,6 +6,7 @@ import copy
 import time
 import json
 import logging
+import re
 
 import torch
 import torch.nn as nn
@@ -541,6 +542,9 @@ class CompressorRouting:
         use_approx_types=False,
         approx_lib_path="Appr_Comp/selected_compressors.json",
         approx_library_path="Appr_Comp/library.json",
+        approx42_library_path="Appr_Comp/library42_pair32_func.json",
+        approx42_rtl_path="Appr_Comp/rtl/comp42_lib.v",
+        approx42_max_types=16,
         approx_max_col=6,
         # 近似 cell 只在截断边界上方的窗口 [trunc_cols, trunc_cols+window) 内可选（None=旧行为，
         # 用 approx_max_col 作上界）。cell 误差 ∝ wae·2^col，高列代价指数增长几乎永远不划算；
@@ -709,6 +713,9 @@ class CompressorRouting:
 
         # ===== Phase B：近似类型搜索状态 =====
         self.use_approx_types = use_approx_types
+        self.approx42_library_path = approx42_library_path
+        self.approx42_rtl_path = approx42_rtl_path
+        self.approx42_max_types = approx42_max_types
         self.approx_max_col = approx_max_col
         self.approx_col_window = approx_col_window
         self.med_budget = med_budget
@@ -755,8 +762,10 @@ class CompressorRouting:
         self.normalize_advantage = normalize_advantage
         self.type_table_32 = None
         self.type_table_22 = None
+        self.type_table_42 = None
         self.type_head_32 = None
         self.type_head_22 = None
+        self.type_head_42 = None
         self.approx_module_src_by_name = {}
         self._node_emb = None  # get_Z_mat 设置：逐节点嵌入（类型头 + ppo 复用）
         if self.use_approx_types:
@@ -767,6 +776,10 @@ class CompressorRouting:
             self.type_head_22 = nn.Linear(
                 self.gcn.embedding_dim, len(self.type_table_22)
             ).to(device)
+            if self.use_ct42:
+                self.type_head_42 = nn.Linear(
+                    self.gcn.embedding_dim, len(self.type_table_42)
+                ).to(device)
             if self.approx_cardinality_sampler:
                 if approx_cardinality_init_logits is None:
                     approx_cardinality_init_logits = [0.0] * len(
@@ -793,12 +806,25 @@ class CompressorRouting:
                 with torch.no_grad():
                     self.type_head_32.bias[0] = float(exact_init_bias)
                     self.type_head_22.bias[0] = float(exact_init_bias)
+                    if self.type_head_42 is not None:
+                        self.type_head_42.bias[0] = float(exact_init_bias)
                 eb = _m.exp(float(exact_init_bias))
-                logging.info(
-                    "[approx] type_head exact-init bias=%.2f -> 初始 P(exact)≈%.2f(T32)/%.2f(T22)",
-                    exact_init_bias, eb / (eb + len(self.type_table_32) - 1),
-                    eb / (eb + len(self.type_table_22) - 1),
+                p42 = (
+                    eb / (eb + len(self.type_table_42) - 1)
+                    if self.use_ct42 and self.type_table_42 else None
                 )
+                if p42 is None:
+                    logging.info(
+                        "[approx] type_head exact-init bias=%.2f -> 初始 P(exact)≈%.2f(T32)/%.2f(T22)",
+                        exact_init_bias, eb / (eb + len(self.type_table_32) - 1),
+                        eb / (eb + len(self.type_table_22) - 1),
+                    )
+                else:
+                    logging.info(
+                        "[approx] type_head exact-init bias=%.2f -> 初始 P(exact)≈%.2f(T32)/%.2f(T22)/%.2f(T42)",
+                        exact_init_bias, eb / (eb + len(self.type_table_32) - 1),
+                        eb / (eb + len(self.type_table_22) - 1), p42,
+                    )
             self._bias32 = torch.tensor(
                 [e["bias"] for e in self.type_table_32], device=device
             )
@@ -811,6 +837,16 @@ class CompressorRouting:
             self._wae22 = torch.tensor(
                 [e["wae"] for e in self.type_table_22], device=device
             )
+            if self.use_ct42:
+                self._bias42 = torch.tensor(
+                    [e["bias"] for e in self.type_table_42], device=device
+                )
+                self._wae42 = torch.tensor(
+                    [e["wae"] for e in self.type_table_42], device=device
+                )
+            else:
+                self._bias42 = None
+                self._wae42 = None
             # ④ 每 cell 最坏误差 maxe（exact=0），供 WCE 上界 Σ maxe·2^col。
             # 注意 JSON 里 maxe 是 int → 必须显式 float32，否则 p(Float)@maxes(Long) 报 dtype 错。
             self._maxe32 = torch.tensor(
@@ -821,10 +857,18 @@ class CompressorRouting:
                 [float(e.get("maxe", 0.0)) for e in self.type_table_22],
                 device=device, dtype=torch.float32,
             )
+            if self.use_ct42:
+                self._maxe42 = torch.tensor(
+                    [float(e.get("maxe", 0.0)) for e in self.type_table_42],
+                    device=device, dtype=torch.float32,
+                )
+            else:
+                self._maxe42 = None
+            t42_msg = f" T42={len(self.type_table_42)}" if self.use_ct42 else ""
             logging.info(
-                "[approx] type heads on: T32=%d T22=%d, max_col=%d, col_window=%s, "
+                "[approx] type heads on: T32=%d T22=%d%s, max_col=%d, col_window=%s, "
                 "med_budget(LSB)=%s, use_error_loss=%s, wce_budget(LSB)=%s",
-                len(self.type_table_32), len(self.type_table_22),
+                len(self.type_table_32), len(self.type_table_22), t42_msg,
                 self.approx_max_col, self.approx_col_window, self.med_budget,
                 self.use_error_loss, self.wce_budget,
             )
@@ -839,6 +883,8 @@ class CompressorRouting:
         if self.use_approx_types:
             opt_params += list(self.type_head_32.parameters())
             opt_params += list(self.type_head_22.parameters())
+            if self.type_head_42 is not None:
+                opt_params += list(self.type_head_42.parameters())
             if self.approx_cardinality_logits is not None:
                 opt_params.append(self.approx_cardinality_logits)
         self.optim: optim.Optimizer = getattr(optim, optim_name)(
@@ -898,6 +944,11 @@ class CompressorRouting:
         self.type_table_22 = [dict(sel[k]) for k in _ordered("22")]
         assert self.type_table_32[0]["group"] == "exact", "T32[0] 必须是 exact"
         assert self.type_table_22[0]["group"] == "exact", "T22[0] 必须是 exact"
+        if self.use_ct42:
+            self.type_table_42 = self._load_approx42_table(sel)
+            assert self.type_table_42[0]["group"] == "exact", "T42[0] 必须是 exact"
+        else:
+            self.type_table_42 = []
 
         # 预生成每个近似 cell 的可综合 SOP module（LUT 取自 library.json）
         APPR = os.path.join(self._REPO_ROOT, "Appr_Comp")
@@ -921,6 +972,136 @@ class CompressorRouting:
                                   cell["sum_lut"], cell["carry_lut"],
                                   f"{name} bias={entry['bias']:+.3f}")
             self.approx_module_src_by_name[name] = src
+        if self.use_ct42:
+            self._load_approx42_modules()
+
+    def _extract_verilog_modules(self, rtl_path, names):
+        src = open(self._resolve_path(rtl_path)).read()
+        modules = {}
+        for name in names:
+            pat = (
+                r"(?ms)^module\s+"
+                + re.escape(name)
+                + r"\b.*?^endmodule\s*\n?"
+            )
+            m = re.search(pat, src)
+            if m is None:
+                raise ValueError(f"cannot find Verilog module {name} in {rtl_path}")
+            modules[name] = m.group(0)
+            if not modules[name].endswith("\n"):
+                modules[name] += "\n"
+        return modules
+
+    def _ct42_entry_with_cin0_metrics(self, name, cell):
+        entry = {
+            "name": name,
+            "type": "42",
+            "group": cell.get("group", "P"),
+            "alias": cell.get("alias", name),
+            "builder": cell.get("builder"),
+            "area": cell.get("area"),
+            "power_mw": cell.get("power_mw"),
+            "delay_ns": cell.get("delay_ns"),
+        }
+        patterns = cell.get("patterns")
+        if patterns and "sum_lut" in cell and "carry_lut" in cell and "cout_lut" in cell:
+            bias = 0.0
+            wae = 0.0
+            maxe = 0.0
+            er = 0.0
+            for i, bits in enumerate(patterns):
+                if bits[-1] != "0":
+                    continue
+                a, b, c, d = [int(x) for x in bits[:4]]
+                approx = (
+                    int(cell["sum_lut"][i])
+                    + 2 * int(cell["carry_lut"][i])
+                    + 2 * int(cell["cout_lut"][i])
+                )
+                exact = a + b + c + d
+                err = approx - exact
+                prob = 1.0
+                for bit in (a, b, c, d):
+                    prob *= 0.25 if bit else 0.75
+                bias += prob * err
+                wae += prob * abs(err)
+                maxe = max(maxe, abs(err))
+                if err != 0:
+                    er += prob
+            entry.update({"bias": bias, "wae": wae, "er": er, "maxe": maxe})
+        else:
+            entry.update(
+                {
+                    "bias": cell.get("bias", cell.get("weighted_signed_error", 0.0)),
+                    "wae": cell.get("wae", cell.get("weighted_absolute_error", 0.0)),
+                    "er": cell.get("er", cell.get("error_rate", 0.0)),
+                    "maxe": cell.get("maxe", cell.get("max_error", 0.0)),
+                }
+            )
+        if cell.get("is_exact") or entry["group"] == "exact":
+            entry["group"] = "exact"
+            entry["bias"] = 0.0
+            entry["wae"] = 0.0
+            entry["er"] = 0.0
+            entry["maxe"] = 0.0
+        return entry
+
+    def _load_approx42_table(self, selected):
+        lib_path = self._resolve_path(self.approx42_library_path)
+        lib42 = json.load(open(lib_path))["cells"]
+        selected42_keys = [k for k, v in selected.items() if v.get("type") == "42"]
+        if selected42_keys:
+            exact_keys = [
+                k for k in selected42_keys
+                if selected[k].get("group") == "exact"
+            ]
+            approx_keys = [
+                k for k in selected42_keys
+                if selected[k].get("group") != "exact"
+            ]
+            table = []
+            for key in exact_keys + approx_keys:
+                name = selected[key]["name"]
+                cell = dict(lib42.get(name, {}))
+                cell.update(selected[key])
+                table.append(self._ct42_entry_with_cin0_metrics(name, cell))
+            return table
+
+        entries = [
+            self._ct42_entry_with_cin0_metrics(name, cell)
+            for name, cell in lib42.items()
+        ]
+        exact = [e for e in entries if e.get("group") == "exact"]
+        approx = [e for e in entries if e.get("group") != "exact"]
+        approx.sort(key=lambda e: (float(e["wae"]), abs(float(e["bias"])), float(e["maxe"]), e["name"]))
+        if not exact:
+            exact = [{
+                "name": "CT42",
+                "type": "42",
+                "group": "exact",
+                "bias": 0.0,
+                "wae": 0.0,
+                "er": 0.0,
+                "maxe": 0.0,
+            }]
+        max_types = self.approx42_max_types
+        if max_types is not None:
+            max_types = int(max_types)
+            if max_types < 1:
+                raise ValueError("approx42_max_types must be >= 1 or None")
+            approx = approx[: max(0, max_types - 1)]
+        return [exact[0]] + approx
+
+    def _load_approx42_modules(self):
+        names = [
+            e["name"] for e in self.type_table_42
+            if e.get("group") != "exact"
+        ]
+        if not names:
+            return
+        self.approx_module_src_by_name.update(
+            self._extract_verilog_modules(self.approx42_rtl_path, names)
+        )
 
     def sample_cell_types(self):
         """对压缩器节点采样 cell 类型。
@@ -947,6 +1128,8 @@ class CompressorRouting:
                 head, table = self.type_head_32, self.type_table_32
             elif t == 1:
                 head, table = self.type_head_22, self.type_table_22
+            elif t == 4 and self.use_ct42:
+                head, table = self.type_head_42, self.type_table_42
             else:
                 continue
             logits = self._masked_type_logits(head(emb[node_idx]), c)
@@ -972,7 +1155,10 @@ class CompressorRouting:
         nodes = []
         for node_idx, info in enumerate(self.comp_graph.vertex_list):
             _, c, t, _ = info
-            if t in (0, 1) and self._is_approx_col_allowed(c):
+            if t in (0, 1, 4) and self._is_approx_col_allowed(c):
+                _head, table = self._type_head_and_table(t)
+                if len(table) <= 1:
+                    continue
                 nodes.append(node_idx)
         return nodes
 
@@ -981,6 +1167,8 @@ class CompressorRouting:
             return self.type_head_32, self.type_table_32
         if t == 1:
             return self.type_head_22, self.type_table_22
+        if t == 4 and self.use_ct42:
+            return self.type_head_42, self.type_table_42
         raise ValueError(f"unknown compressor type {t}")
 
     def _node_type_logits(self, node_idx):
@@ -1142,7 +1330,7 @@ class CompressorRouting:
         for node_idx, tk in (cell_types or {}).items():
             t, k = tk
             if k != 0:
-                table = self.type_table_32 if t == 0 else self.type_table_22
+                _head, table = self._type_head_and_table(t)
                 cell_map[int(node_idx)] = table[k]["name"]
         return cell_map
 
@@ -1274,7 +1462,7 @@ class CompressorRouting:
         for node_idx, (t, k) in type_choices.items():
             if k == 0:
                 continue
-            table = self.type_table_32 if t == 0 else self.type_table_22
+            _head, table = self._type_head_and_table(t)
             entry = table[k]
             col = self.comp_graph.vertex_list[node_idx][1]
             w = float(1 << col)
@@ -1373,6 +1561,8 @@ class CompressorRouting:
                 "type_head_32": self.type_head_32.state_dict(),
                 "type_head_22": self.type_head_22.state_dict(),
             }
+            if self.type_head_42 is not None:
+                type_state["type_head_42"] = self.type_head_42.state_dict()
             if self.approx_cardinality_logits is not None:
                 type_state["approx_cardinality_logits"] = (
                     self.approx_cardinality_logits.detach().cpu()
@@ -1693,6 +1883,10 @@ class CompressorRouting:
                 head, biases, waes, maxes = (
                     self.type_head_22, self._bias22, self._wae22, self._maxe22
                 )
+            elif t == 4 and self.use_ct42:
+                head, biases, waes, maxes = (
+                    self.type_head_42, self._bias42, self._wae42, self._maxe42
+                )
             else:
                 continue
             logits = self._masked_type_logits(head(emb[node_idx]), c)
@@ -1998,11 +2192,12 @@ class CompressorRouting:
             v_src += f"    HA_no_carry {instance_name} (.a({a_wire}), .cin({b_wire}), .sum({sum_wire}));\n"
         return v_src, wire_set
 
-    def _declare_ct42(self, node_idx, wire_set: Set, node_wires: Dict):
+    def _declare_ct42(self, node_idx, wire_set: Set, node_wires: Dict, cell_map=None):
         stage_idx, col_idx, type_idx, idx = self.comp_graph.vertex_list[node_idx]
         assert type_idx == 4
         v_src = ""
         instance_name = f"ct42_{node_idx}"
+        cell = (cell_map or {}).get(node_idx) or "CT42"
 
         a_wire = self._input_wire(node_wires, node_idx, "a")
         b_wire = self._input_wire(node_wires, node_idx, "b")
@@ -2020,10 +2215,17 @@ class CompressorRouting:
             v, wire_set = self._declare_wire(wire, wire_set)
             v_src += v
         v_src += f"// ct42 node {(stage_idx, col_idx, type_idx, idx)}\n"
-        v_src += (
-            f"    CT42 {instance_name} (.a({a_wire}), .b({b_wire}), .c({c_wire}), "
-            f".d({d_wire}), .sum({sum_wire}), .carry({carry_wire}), .cout({cout_wire}));\n"
-        )
+        if cell == "CT42":
+            v_src += (
+                f"    CT42 {instance_name} (.a({a_wire}), .b({b_wire}), .c({c_wire}), "
+                f".d({d_wire}), .sum({sum_wire}), .carry({carry_wire}), .cout({cout_wire}));\n"
+            )
+        else:
+            v_src += (
+                f"    {cell} {instance_name} (.a({a_wire}), .b({b_wire}), .c({c_wire}), "
+                f".d({d_wire}), .cin(1'b0), .sum({sum_wire}), "
+                f".carry({carry_wire}), .cout({cout_wire}));\n"
+            )
         return v_src, wire_set
 
     def emit_assignment(self, samples_connection, cell_map=None):
@@ -2085,7 +2287,7 @@ class CompressorRouting:
             elif type_idx == 1:
                 v, wire_set = self._declare_ct22(node_idx, wire_set, node_wires, cell_map)
             elif type_idx == 4:
-                v, wire_set = self._declare_ct42(node_idx, wire_set, node_wires)
+                v, wire_set = self._declare_ct42(node_idx, wire_set, node_wires, cell_map)
             else:
                 raise ValueError("Invalid node type")
             v_src += v
