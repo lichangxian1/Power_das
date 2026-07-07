@@ -58,14 +58,15 @@ def main():
         med = measured.get("med")
         mred = measured.get("mred")
         n_approx = measured.get("n_approx")
-        jobs.append((kk, med, mred, n_approx, wrap_to_31b(open(mv).read())))
+        wce_mc = measured.get("wce_mc")
+        jobs.append((kk, med, mred, n_approx, wce_mc, wrap_to_31b(open(mv).read())))
 
     print(f"{base}: {len(jobs)} designs -> {[j[0] for j in jobs]}", flush=True)
     res = {}
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {
             ex.submit(evaluate_single_routing, i, content, 16, 1.5): (kk, med)
-            for i, (kk, med, _mred, _n_approx, content) in enumerate(jobs)
+            for i, (kk, med, _mred, _n_approx, _wce_mc, content) in enumerate(jobs)
         }
         for fut in as_completed(futs):
             kk, med = futs[fut]
@@ -80,8 +81,8 @@ def main():
     out = base / "reeval_xa.csv"
     with open(out, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["design", "med", "mred", "n_approx", "area_dc", "power_xa_mw", "delay", "success"])
-        for kk, med, mred, n_approx, _ in jobs:
+        w.writerow(["design", "med", "mred", "n_approx", "wce_mc", "area_dc", "power_xa_mw", "delay", "success"])
+        for kk, med, mred, n_approx, wce_mc, _ in jobs:
             med, r = res[kk]
             w.writerow(
                 [
@@ -89,6 +90,7 @@ def main():
                     med,
                     mred,
                     n_approx,
+                    wce_mc,
                     r.get("area"),
                     r.get("power_mw"),
                     r.get("delay"),
