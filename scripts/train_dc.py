@@ -67,6 +67,11 @@ def main():
     p.add_argument("--target_delay", type=float, default=1.5, help="DC 时钟周期 (ns)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default=None)
+    p.add_argument("--init_pool_best_info", default=None,
+                   help="温启动：用已有 run 的 best_info.json 作为初始训练池（替代默认 "
+                        "wallace/dadda 种子），并种 found_best_info；须同 k/口径")
+    p.add_argument("--outer_cell_search", action="store_true",
+                   help="外环 cell 搜索：类型进外环状态（解析提议+闭式过滤+resample-K），内环只采布线（Appr_Comp/OUTER_CELL_SEARCH.md）")
     p.add_argument("--use_ct42", action="store_true",
                    help="把 4:2 compressor 作为可搜索架构原语接入；use_approx_types=true 时 CT42 也可选近似 cell")
     p.add_argument("--approx42_library_path", default=None,
@@ -125,6 +130,10 @@ def main():
     )
     if args.use_ct42:
         tk["use_ct42"] = True
+    if args.init_pool_best_info is not None:
+        tk["init_pool_best_info"] = args.init_pool_best_info
+    if args.outer_cell_search:
+        tk["outer_cell_search"] = True
     if args.approx42_library_path is not None:
         tk["approx42_library_path"] = args.approx42_library_path
     if args.approx42_rtl_path is not None:

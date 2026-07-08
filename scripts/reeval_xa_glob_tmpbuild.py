@@ -41,7 +41,7 @@ def wrap_to_31b(src):
 
 def main():
     base = Path(sys.argv[1]).resolve()
-    max_workers = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.environ.get("REEVAL_WORKERS", "5"))
+    max_workers = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.environ.get("REEVAL_WORKERS", "10"))
     tmp = Path(os.environ.get("XA_LOCAL_TMP", "/tmp/power_das_xa_tmpbuild"))
     tmp.mkdir(parents=True, exist_ok=True)
     os.chdir(tmp)

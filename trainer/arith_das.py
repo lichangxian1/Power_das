@@ -537,6 +537,10 @@ class CompressorRouting:
         delay_violation_weight=2.0,
         power_source=None,
         gomil_path=None,
+        # 温启动：best_info.json 路径（str 或 list）。成功加载则替代默认 wallace/dadda
+        # 种子进池，且同时种 found_best_info（本 run 报告的 best 单调不劣于温启动点）。
+        # 要求与本 run 同 bit_width/encode_type/trunc_cols/objective 口径。
+        init_pool_best_info=None,
         synth="openroad",
         # ===== 阶段3 Phase B：近似压缩器类型搜索（全部默认关，关时行为不变）=====
         use_approx_types=False,
@@ -616,6 +620,17 @@ class CompressorRouting:
         # Exact 4:2 compressor architecture primitive. Default off for byte-level
         # compatibility with existing FA/HA-only runs.
         use_ct42=False,
+        # ===== 外环 cell 搜索（Appr_Comp/OUTER_CELL_SEARCH.md，默认关=行为不变）=====
+        # cell 类型进外环状态（进化：解析提议变异 + 闭式可行性过滤 + resample-K），
+        # 内环只采布线；每轮全部样本共用同一 cell 配置 → PPO 信用分配只含布线。
+        outer_cell_search=False,
+        outer_p_struct=0.4,          # 变异算子骰子：结构 4/6 动作
+        outer_p_cell=0.4,            # add/remove/swap 一个 cell（解析提议）
+        outer_p_resample=0.2,        # resample-K 大步（清空重摆 K 个）
+        outer_proposal_retries=50,   # 可行性过滤重试上限（闭式，微秒级）
+        outer_med_slack_scale=1.0,   # MRED 模式 MED 等效 slack 比例（<1 更保守）
+        outer_w_area=1.0,            # 提议打分：面积节省项权重
+        outer_w_err=1.0,             # 提议打分：误差代价项权重
         **kwargs,
     ):
         self.bit_width = bit_width
@@ -661,6 +676,9 @@ class CompressorRouting:
         self.disc_loss_weight_incr = disc_loss_weight_incr
 
         self.gomil_path = gomil_path
+        if isinstance(init_pool_best_info, str):
+            init_pool_best_info = [init_pool_best_info]
+        self.init_pool_best_info = init_pool_best_info
         self.synth = synth
         self.kwargs = kwargs
         self.fixed_target_delay = fixed_target_delay
@@ -756,6 +774,22 @@ class CompressorRouting:
         self._trunc_delta = 0.0    # E[Δ]（截断期望丢失值）
         self._trunc_wce = 0.0      # 截断最坏情况误差 max(C, Δmax−C)
         self._trunc_med = 0.0      # E[|C−Δ|]（截断残差 MED，P=1/4 一阶估计）
+        self._trunc_model_mred = None  # C* 处解析模型 MRED（外环 MRED-slack 过滤用）
+        # 外环 cell 搜索
+        self.outer_cell_search = bool(outer_cell_search)
+        self.outer_p_struct = float(outer_p_struct)
+        self.outer_p_cell = float(outer_p_cell)
+        self.outer_p_resample = float(outer_p_resample)
+        self.outer_proposal_retries = int(outer_proposal_retries)
+        self.outer_med_slack_scale = float(outer_med_slack_scale)
+        self.outer_w_area = float(outer_w_area)
+        self.outer_w_err = float(outer_w_err)
+        self._episode_cell_types = {}
+        if self.outer_cell_search and not use_approx_types:
+            logging.warning(
+                "[outer] outer_cell_search=True 但 use_approx_types=False：无类型表，"
+                "cell/resample 算子退化为纯结构变异"
+            )
         # P0：delay 约束化
         self.delay_as_constraint = bool(delay_as_constraint)
         self.delay_target_ns = delay_target_ns
@@ -1048,11 +1082,21 @@ class CompressorRouting:
 
     def _load_approx42_table(self, selected):
         lib_path = self._resolve_path(self.approx42_library_path)
-        lib42 = json.load(open(lib_path))["cells"]
+        lib42_full = json.load(open(lib_path))
+        lib42 = lib42_full["cells"]
         # 原生 4 输入 cell（无 cin 端口，gen_comp42_native.py 产出）：发射时不接 .cin
         self._ct42_native4_names = {
             n for n, c in lib42.items() if c.get("pattern_bits") == 4
         }
+        # exact CT42 锚点 PPA（外环 area_save_frac 打分需要）：
+        # selected_compressors42_native.json 存 meta.anchor_area；
+        # library42_native.json 存 meta.anchors.CT42_BAL.area。
+        meta = lib42_full.get("meta") or {}
+        self._ct42_exact_area = meta.get("anchor_area")
+        if self._ct42_exact_area is None:
+            self._ct42_exact_area = (
+                (meta.get("anchors") or {}).get("CT42_BAL") or {}
+            ).get("area")
         selected42_keys = [k for k, v in selected.items() if v.get("type") == "42"]
         if selected42_keys:
             exact_keys = [
@@ -1087,6 +1131,7 @@ class CompressorRouting:
                 "wae": 0.0,
                 "er": 0.0,
                 "maxe": 0.0,
+                "area": getattr(self, "_ct42_exact_area", None),
             }]
         max_types = self.approx42_max_types
         if max_types is not None:
@@ -1311,6 +1356,8 @@ class CompressorRouting:
     def _cell_type_log_prob(self, sample_info):
         type_sample_info = sample_info.get("cell_type_info") or {}
         mode = type_sample_info.get("mode")
+        if mode == "outer":
+            return None  # 外环模式：类型非采样所得，不进 PPO ratio
         if mode == "cardinality":
             return self._cardinality_cell_type_log_prob(
                 sample_info.get("cell_types") or {}, type_sample_info
@@ -1349,6 +1396,219 @@ class CompressorRouting:
             mask[0] = False
             logits = logits.masked_fill(mask, -1e9)
         return logits
+
+    # ===== 外环 cell 搜索（Appr_Comp/OUTER_CELL_SEARCH.md）=====
+    # state["cells"] = [[s, c, t, idx, k], ...]（slot 坐标 = assignment 顶点身份，跨结构
+    # 变异稳定；k = 类型表索引 ≥1）。变异 = 解析提议 + 闭式可行性过滤 + resample-K；
+    # 内环所有样本共用同一配置，PPO 只学布线。
+
+    def _cells_error_totals(self, cells):
+        items = [(int(e[1]), int(e[2]), int(e[4])) for e in (cells or [])]
+        return self._error_totals_from_cols(items)
+
+    def _outer_med_slack(self):
+        """cell 部分允许的 Σwae·2^col 总额度（LSB）；None = 该口径无闭式约束。
+        MRED 模式假设「cell 对 MRED 的推动 ≈ 对 MED 的相对推动」（一阶近似，
+        outer_med_slack_scale 留作保守化旋钮）；trunc=0 时无 MRED floor 可用 → 放行，
+        交给 verilator 闸门（诚实声明的空洞）。"""
+        if self.med_budget is not None:
+            med0, _b, _w = self._error_totals_from_cols([])
+            return max(0.0, float(self.med_budget) - med0)
+        if (getattr(self, "error_metric", "med") == "mred"
+                and getattr(self, "mred_budget", None)
+                and self.trunc_cols > 0 and self._trunc_model_mred):
+            ratio = float(self.mred_budget) / float(self._trunc_model_mred) - 1.0
+            return max(0.0, ratio * float(self._trunc_med) * self.outer_med_slack_scale)
+        return None
+
+    def _cells_budget_ok(self, cells):
+        med, _bias, wce = self._cells_error_totals(cells)
+        if self.med_budget is not None and med > float(self.med_budget):
+            return False
+        if self.wce_budget is not None and wce > float(self.wce_budget):
+            return False
+        if self.med_budget is None:
+            slack = self._outer_med_slack()
+            if slack is not None:
+                med0, _b0, _w0 = self._error_totals_from_cols([])
+                if med - med0 > slack:
+                    return False
+        return True
+
+    def _enumerate_type_slots(self, assignment):
+        """合法 cell slot 列表 [(s,c,t,idx)]：列在近似窗口内、该型类型表非平凡。"""
+        if not self.use_approx_types or not self.type_table_32:
+            return []
+        slots = []
+        for s in range(len(assignment)):
+            for c in range(len(assignment[s])):
+                if not self._is_approx_col_allowed(c):
+                    continue
+                for v in assignment[s][c]:
+                    t = int(v[2])
+                    if t not in (0, 1, 4) or (t == 4 and not self.use_ct42):
+                        continue
+                    _h, table = self._type_head_and_table(t)
+                    if len(table) <= 1:
+                        continue
+                    slots.append((int(v[0]), int(v[1]), t, int(v[3])))
+        return slots
+
+    def _cells_prune_stale(self, cells, assignment):
+        """结构变异后丢掉 slot 已消失的 cell（只减不增 → 误差只降，无需复检预算）。"""
+        valid = set(self._enumerate_type_slots(assignment))
+        kept = [e for e in (cells or [])
+                if (int(e[0]), int(e[1]), int(e[2]), int(e[3])) in valid]
+        n_drop = len(cells or []) - len(kept)
+        if n_drop:
+            logging.info("[outer] 结构变异后 %d 个 cell 的 slot 失效被丢弃", n_drop)
+        return kept
+
+    def _propose_cell_add(self, cells, slots, rng):
+        """解析提议加一个 cell；无可行候选返回 None。
+        符号偏好压残差偏置（正负抵消的硬逻辑）；softmax 打分 =
+        outer_w_area·省面积占比 − outer_w_err·误差代价/slack（保留随机性，非 argmax）。"""
+        occupied = {tuple(int(x) for x in e[:4]) for e in (cells or [])}
+        free = [sl for sl in slots if sl not in occupied]
+        if not free:
+            return None
+        med0, bias0, wce0 = self._cells_error_totals(cells)
+        med_base, _b, _w = self._error_totals_from_cols([])
+        slack = self._outer_med_slack()
+        remain = None if slack is None else max(0.0, slack - (med0 - med_base))
+        want = "P" if bias0 < -0.5 else ("N" if bias0 > 0.5 else None)
+
+        def _collect(want_sign):
+            cands, scores = [], []
+            for sl in free:
+                _s, c, t, _i = sl
+                _h, table = self._type_head_and_table(t)
+                ex_area = table[0].get("area")
+                w = float(1 << c)
+                for k in range(1, len(table)):
+                    entry = table[k]
+                    cost = entry["wae"] * w
+                    if remain is not None and cost > remain:
+                        continue
+                    if (self.wce_budget is not None
+                            and wce0 + entry.get("maxe", 0.0) * w > float(self.wce_budget)):
+                        continue
+                    if want_sign and entry.get("group") not in (want_sign, "Z"):
+                        continue
+                    area_frac = 0.0
+                    if ex_area and entry.get("area"):
+                        area_frac = (float(ex_area) - float(entry["area"])) / float(ex_area)
+                    denom = remain if (remain is not None and remain > 0) \
+                        else float(1 << max(self.trunc_cols, 1))
+                    score = (self.outer_w_area * area_frac
+                             - self.outer_w_err * cost / max(denom, 1e-9))
+                    cands.append((sl, k))
+                    scores.append(score)
+            return cands, scores
+
+        cands, scores = _collect(want)
+        if not cands and want is not None:
+            cands, scores = _collect(None)
+        if not cands:
+            return None
+        z = np.asarray(scores, dtype=np.float64)
+        z -= z.max()
+        p = np.exp(z)
+        p /= p.sum()
+        j = int(rng.choice(len(cands), p=p))
+        sl, k = cands[j]
+        return [sl[0], sl[1], sl[2], sl[3], int(k)]
+
+    def _propose_cell_remove(self, cells, rng):
+        if not cells:
+            return None
+        j = int(rng.integers(len(cells)))
+        return cells[:j] + cells[j + 1:]
+
+    def _propose_cell_swap(self, cells, slots, rng):
+        if not cells:
+            return None
+        j = int(rng.integers(len(cells)))
+        rest = cells[:j] + cells[j + 1:]
+        slot = tuple(int(x) for x in cells[j][:4])
+        add = self._propose_cell_add(rest, [slot], rng)
+        return None if add is None else rest + [add]
+
+    def _op_resample_k(self, slots, rng):
+        """大步：K~cardinality choices 均匀先验（mask 到 ≤ 空闲 slot 数），清空后串行
+        贪心加 K 个——每步重算残差偏置/slack 再提议下一个（正负抵消内建）；
+        无可行候选提前停（K_actual < K）。"""
+        choices = [k for k in self.approx_cardinality_choices if k <= len(slots)]
+        if not choices:
+            return []
+        K = int(choices[int(rng.integers(len(choices)))])
+        cells = []
+        for _ in range(K):
+            add = self._propose_cell_add(cells, slots, rng)
+            if add is None:
+                break
+            cells.append(add)
+        if len(cells) < K:
+            logging.info("[outer] resample-K 提前停：目标 K=%d 实际 %d（可行性耗尽）",
+                         K, len(cells))
+        return cells
+
+    def _current_assignment(self):
+        pp = get_initial_partial_product(self.bit_width, self.encode_type)
+        ct = CompressorTree(
+            pp, self.state["ct32"], self.state["ct22"], self.state.get("ct42")
+        )
+        return ct.compressor_assignment_fused()
+
+    def _outer_mutate(self):
+        """外环变异 v1.1：结构变异每轮必做（v1.0 的算子骰子把结构搜索强度砍到 40%，
+        v2align 验证显示同误差下 power 系统性劣化 ~16%——结构/布线搜索被饿着了）；
+        cell 层是闭式免费的叠加层，按 outer_p_struct/cell/resample 比例做
+        不动/单 cell op/resample-K。直接更新 self.state（含 cells）。"""
+        rng = np.random.default_rng(random.getrandbits(32))
+        cells = [list(e) for e in (self.state.get("cells") or [])]
+
+        # 1) 结构变异（必做，与非 outer 模式 reset 同强度同口径）
+        action_mask = self.get_action_mask()
+        action = random.choice(np.where(action_mask == 1)[0])
+        self.transition(action)
+        cells = self._cells_prune_stale(cells, self._current_assignment())
+
+        # 2) cell 叠加层：keep / 单 cell op / resample-K
+        has_types = bool(self.use_approx_types and self.type_table_32)
+        p = np.array([self.outer_p_struct,
+                      self.outer_p_cell if has_types else 0.0,
+                      self.outer_p_resample if has_types else 0.0], dtype=float)
+        p /= p.sum()
+        op = ("keep", "cell", "resample")[int(rng.choice(3, p=p))]
+
+        if op != "keep":
+            slots = self._enumerate_type_slots(self._current_assignment())
+            new_cells = None
+            for _ in range(self.outer_proposal_retries):
+                if op == "cell":
+                    dice = rng.random()
+                    if dice < 0.5 or not cells:
+                        add = self._propose_cell_add(cells, slots, rng)
+                        cand = None if add is None else cells + [add]
+                    elif dice < 0.75:
+                        cand = self._propose_cell_remove(cells, rng)
+                    else:
+                        cand = self._propose_cell_swap(cells, slots, rng)
+                else:
+                    cand = self._op_resample_k(slots, rng)
+                if cand is not None and self._cells_budget_ok(cand):
+                    new_cells = cand
+                    break
+            if new_cells is None:
+                logging.info("[outer] %s 提议 %d 次均不可行，本轮 cell 维度不变",
+                             op, self.outer_proposal_retries)
+                new_cells = cells
+            cells = new_cells
+        self.state["cells"] = [list(e) for e in cells]
+        med, bias, wce = self._cells_error_totals(cells)
+        logging.info("[outer] op=struct+%s n_cells=%d med=%.1f bias=%+.1f wce=%.0f",
+                     op, len(cells), med, bias, wce)
 
     def _setup_truncation(self):
         """Phase C ①：算截断 [0,k) 的校正常数 C（用低列槽位的常数 1 位表示）+ 误差量。
@@ -1401,6 +1661,7 @@ class CompressorRouting:
                 c_star, c_target, _mred_of(float(c_target)), vals[j0],
             )
             c_target = c_star
+            self._trunc_model_mred = float(vals[j0])  # 外环 MRED-slack 过滤的 floor
         bits, remaining = {}, c_target
         for c in range(k - 1, -1, -1):          # 高列→低列贪心填常数 1
             w = 1 << c
@@ -1460,28 +1721,37 @@ class CompressorRouting:
         nmed = med_lsb / maxprod  —— 标准 NMED，仅用于上报
         wce_lsb = Σ maxe·2^col  —— ④ WCE 可加上界（最坏情况输出误差，LSB；与传播无关恒成立）
         bias/wae 为 P=1/4 一阶估计；maxe 与概率无关（逐 cell 最坏），故 WCE 上界精确。"""
-        bias_total = 0.0
-        wae_total = 0.0
-        wce_total = 0.0
+        items = []
         for node_idx, (t, k) in type_choices.items():
             if k == 0:
                 continue
+            col = self.comp_graph.vertex_list[int(node_idx)][1]
+            items.append((col, t, k))
+        wae_total, bias_total, wce_total = self._error_totals_from_cols(items)
+        maxprod = float((2 ** self.bit_width - 1) ** 2)
+        return wae_total, abs(bias_total), wae_total / maxprod, wce_total
+
+    def _error_totals_from_cols(self, items):
+        """闭式误差核算（单一事实源）：items = [(col, t, k)]，k≥1（非 exact）。
+        返回 (med_lsb, signed_bias_lsb, wce_lsb)，均含截断项。
+        Phase C ①：截断的确定性误差。−E[Δ]+C 为净偏置（bias 项会驱动 cell 抵消残差）；
+        MED_trunc=E[|C−Δ|] 进 MED 上界（三角不等式：MED_total ≤ MED_trunc + Σ wae·2^col，
+        否则纯截断设计解析 MED=0 会骗过 med_budget）；WCE_trunc 进尾部上界（与 ④ 同口径）。"""
+        bias_total = 0.0
+        wae_total = 0.0
+        wce_total = 0.0
+        for col, t, k in items:
             _head, table = self._type_head_and_table(t)
             entry = table[k]
-            col = self.comp_graph.vertex_list[node_idx][1]
             w = float(1 << col)
             bias_total += entry["bias"] * w
             wae_total += entry["wae"] * w
             wce_total += entry.get("maxe", 0.0) * w
-        # Phase C ①：截断的确定性误差。−E[Δ]+C 为净偏置（bias 项会驱动 cell 抵消残差）；
-        # MED_trunc=E[|C−Δ|] 进 MED 上界（三角不等式：MED_total ≤ MED_trunc + Σ wae·2^col，
-        # 否则纯截断设计解析 MED=0 会骗过 med_budget）；WCE_trunc 进尾部上界（与 ④ 同口径）。
         if self.trunc_cols > 0:
             bias_total += (-self._trunc_delta + self._trunc_const)
             wae_total += self._trunc_med
             wce_total += self._trunc_wce
-        maxprod = float((2 ** self.bit_width - 1) ** 2)
-        return wae_total, abs(bias_total), wae_total / maxprod, wce_total
+        return wae_total, bias_total, wce_total
 
     def get_full_target_delay_result(self):
         build_dir = self.build_dir + "_full_ppa"
@@ -2576,11 +2846,18 @@ class CompressorRouting:
                 samples_connection, overall_log_prob = self.sample_from_logits(
                     Z_mat_dict
                 )
-                # Phase B：采样每个压缩器槽的 cell 类型（关时返回空，行为不变）
-                cell_map, type_choices, type_log_prob, type_sample_info = (
-                    self.sample_cell_types()
-                )
-                overall_log_prob += type_log_prob
+                if self.outer_cell_search:
+                    # 外环模式：cell 配置由外环决定、episode 内固定、全样本共用；
+                    # 不进 log_prob（PPO 只学布线）
+                    type_choices = dict(self._episode_cell_types)
+                    cell_map = self._cell_map_from_types(type_choices)
+                    type_sample_info = {"mode": "outer"}
+                else:
+                    # Phase B：采样每个压缩器槽的 cell 类型（关时返回空，行为不变）
+                    cell_map, type_choices, type_log_prob, type_sample_info = (
+                        self.sample_cell_types()
+                    )
+                    overall_log_prob += type_log_prob
                 assignment = self.emit_assignment(samples_connection, cell_map=cell_map)
 
                 ct = CompressorTree(
@@ -3170,7 +3447,20 @@ class CompressorRouting:
             info["n_over"] = sum(1 for m in _ms if m is not None and m > _bud)
             info["n_total"] = len(sample_info_list)
 
-        self.update_pool(sample_info_list[min_idx]["objective"], self.state)
+        if self.outer_cell_search:
+            # 变异配置与 all-exact 配对候选各以其最优 objective 入池（两个变体都保留；
+            # 好的 cell 摆放随状态继承，不再每轮丢失）
+            non_base = [s for s in sample_info_list if not s.get("baseline_only")]
+            if non_base:
+                self.update_pool(min(s["objective"] for s in non_base), self.state)
+            base = [s for s in sample_info_list
+                    if s.get("candidate_kind") == "all_exact"]
+            if base and (self.state.get("cells") or []):
+                exact_state = copy.deepcopy(self.state)
+                exact_state["cells"] = []
+                self.update_pool(min(s["objective"] for s in base), exact_state)
+        else:
+            self.update_pool(sample_info_list[min_idx]["objective"], self.state)
 
         logging.info(f"updating")
         for epoch_idx in range(self.num_epochs):
@@ -3198,9 +3488,11 @@ class CompressorRouting:
                 l_delay = self.get_delay_loss(Z_mat_dict)
                 l += self.delay_loss_weight * l_delay
                 loss_info["l_delay"] = l_delay.item()
-            if self.use_error_loss and self.use_approx_types and not self.error_as_metric:
+            if (self.use_error_loss and self.use_approx_types
+                    and not self.error_as_metric and not self.outer_cell_search):
                 # D2 可微误差 surrogate（权重已在 get_error_loss 内部乘好）。
-                # error_as_metric 模式下误差已作普通目标项进 reward，可微 surrogate 关闭。
+                # error_as_metric 模式下误差已作普通目标项进 reward，可微 surrogate 关闭；
+                # outer_cell_search 模式下类型不由类型头采样，surrogate 只会白推闲置的头，关闭。
                 l_error = self.get_error_loss()
                 l += l_error
                 loss_info["l_error"] = l_error.item()
@@ -3215,6 +3507,50 @@ class CompressorRouting:
         if episode_idx % self.log_freq == 0:
             self.log_episode(episode_idx, info)
         self.scheduler.step()
+
+    def _seed_pool_from_best_info(self, ref_shape):
+        """温启动：把已有 run 的 best_info.json 种进初始池 + found_best_info。
+        返回成功加载的条数；0 表示未启用/全失败（调用方回退默认种子）。
+        口径要求：同 bit_width/encode_type/trunc_cols/objective scales（objective 直接复用）。"""
+        if not self.init_pool_best_info:
+            return 0
+        n_loaded = 0
+        for path in self.init_pool_best_info:
+            try:
+                with open(self._resolve_path(path)) as f:
+                    bi = json.load(f)
+                for kk in ("ct32", "ct22", "ct42"):
+                    if bi["ct"].get(kk) is not None:
+                        bi["ct"][kk] = np.asarray(bi["ct"][kk], dtype=int)
+                if bi["ct"]["ct32"].shape != tuple(ref_shape):
+                    raise ValueError(
+                        f"ct32 shape {bi['ct']['ct32'].shape} != env {tuple(ref_shape)}"
+                        " (bit_width/encode_type/trunc_cols 不一致?)")
+                if isinstance(bi.get("assignment"), list):
+                    bi["assignment"] = [[[tuple(v) for v in col] for col in stage]
+                                        for stage in bi["assignment"]]
+                state = {"ct32": bi["ct"]["ct32"].copy(),
+                         "ct22": bi["ct"]["ct22"].copy()}
+                if self.use_ct42:
+                    state["ct42"] = (bi["ct"]["ct42"].copy()
+                                     if bi["ct"].get("ct42") is not None
+                                     else np.zeros_like(state["ct32"]))
+                if self.outer_cell_search:
+                    state["cells"] = [list(c) for c in (bi.get("cells") or [])]
+                objective = float(bi["objective"])
+                self.pool.add(objective, state)
+                # 种 found_best_info：本 run 的 best 单调不劣于温启动（rank 同 objective 口径）
+                if (bi.get("connection") is not None
+                        and objective < self.found_best_info["objective"]):
+                    bi["ct"] = dict(state)
+                    self.found_best_info = bi
+                n_loaded += 1
+                logging.info(
+                    f"warm-start pool <- {path}: objective={objective:.4f} "
+                    f"area={bi.get('area')} med={((bi.get('measured_error') or {}).get('med'))}")
+            except Exception as e:  # noqa: BLE001
+                logging.error(f"warm-start load failed {path}: {e}")
+        return n_loaded
 
     def _start_reset(self):
         self.initial_pp = get_initial_partial_product(
@@ -3243,7 +3579,11 @@ class CompressorRouting:
         }
         if self.use_ct42:
             init_state["ct42"] = np.zeros_like(ct.ct32, dtype=int)
-        self.pool.add(init_objective, init_state)
+        if self.outer_cell_search:
+            init_state["cells"] = []
+        n_warm = self._seed_pool_from_best_info(ct.ct32.shape)
+        if n_warm == 0:
+            self.pool.add(init_objective, init_state)
 
         if self.gomil_path is not None:
             logging.info(f"Loading gomil from {self.gomil_path}")
@@ -3262,6 +3602,8 @@ class CompressorRouting:
                             ),
                             dtype=int,
                         )
+                    if self.outer_cell_search:
+                        gomil_state["cells"] = []
                     gomil_objective = self.get_objective(
                         gomil_data["simulated_result_list"],
                         cell_types=gomil_data.get("cell_types"),
@@ -3280,9 +3622,13 @@ class CompressorRouting:
         random_objective, random_state = sampled_item
 
         self.state = copy.deepcopy(random_state)
-        action_mask = self.get_action_mask()
-        action = random.choice(np.where(action_mask == 1)[0])
-        self.transition(action)
+        if self.outer_cell_search:
+            self.state.setdefault("cells", [])
+            self._outer_mutate()
+        else:
+            action_mask = self.get_action_mask()
+            action = random.choice(np.where(action_mask == 1)[0])
+            self.transition(action)
 
         pp = get_initial_partial_product(self.bit_width, self.encode_type)
         ct = CompressorTree(pp, self.state["ct32"], self.state["ct22"], self.state.get("ct42"))
@@ -3290,6 +3636,20 @@ class CompressorRouting:
         self.comp_graph = CompressorGraph(
             pp, self.assignment, num_node_types=self.num_node_types
         )
+        if self.outer_cell_search:
+            # slot 坐标 → 本 episode 图的 node_idx（发射/objective/best 复用现有路径）
+            self._episode_cell_types = {}
+            unmapped = 0
+            for e in self.state.get("cells") or []:
+                key = (int(e[0]), int(e[1]), int(e[2]), int(e[3]))
+                node_idx = self.comp_graph.indice_map.get(key)
+                if node_idx is None:
+                    unmapped += 1
+                    continue
+                self._episode_cell_types[int(node_idx)] = (int(e[2]), int(e[4]))
+            if unmapped:
+                logging.warning("[outer] %d 个 cell 未映射到图节点（prune 应已保证为 0）",
+                                unmapped)
 
     def _ct42_effective_pp(self, ct42):
         """把固定的 ct42 背景折进等效初始列高：每列消耗 3、给下一列 2。
