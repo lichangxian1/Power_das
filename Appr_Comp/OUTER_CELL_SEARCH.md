@@ -54,6 +54,30 @@ wce  = WCE_trunc + Σ maxe(t,k)·2^col          （精确可加上界）
 是一阶近似（cell 落在高列时对小积的 1/p 加权可能超线性）；`outer_med_slack_scale`
 （默认 1.0）留作保守化旋钮，实测越界率高就调小。
 
+## 3.1 实测误差预筛门 `outer_errgate`（2026-07-09，默认关）
+
+上面的一阶近似在 MRED 模式下**实测严重失准**：07-09 rerun（`2026-07-09_06_mred_outer_rerun_np5`）
+k02–k12 有 25–64% 的 episode 整集实测超 budget（k06 77/120；99 个带 cell 集中 77 个超标，
+n_cells=0 集零超标），闭式过滤 0 次拒绝——每个超标集 8 次 DC（~200s/样本）全浪费，
+且把外环教育成"少放 cell"。
+
+预筛门（`--outer_errgate`）：`get_samples` 里 sample-0 RTL 发射后、进 DC 前，先用
+verilator MC（默认 2M 向量，秒级；门控只看均值型 med/mred，无需 16M）实测本集共用的
+cell 配置：
+
+- 判据与 `get_objective` 同口径（MRED 模式比 mred，MED 模式比 med，WCE 不进门）；
+- 超预算 → `_outer_drop_worst_cell` 贪心摘掉解析贡献 `wae·2^col` 最大的 cell（每步误差
+  严格降、尽量保留摆放）→ 更新 `state["cells"]`/映射 → 重发射 sample-0 → 复测；
+- 修复步数耗尽（默认 6）仍超 → 清空 cells 保底（floor 配置必可行）；
+- verilator 探测失败 → 放行（与 error_gate 回退策略一致，不因门故障丢整集）。
+
+注意：探测用 sample-0 的布线，其余样本布线不同、实测误差略有差异（旧日志有少数 5/9、3/9
+的部分超标集），门是强筛不是保证。每次探测顺带日志实测/解析比值，为后续修正 slack
+一阶近似积累标定数据。代码：`_outer_gate_active`/`_gate_budget_exceeded`/
+`_outer_drop_worst_cell`/`_refresh_episode_cell_types`/`_outer_errgate_screen`；
+冒烟：`scripts/smoke_outer_errgate.py`（假测量对拍控制流，A 摘除最坏/B 耗尽清空/
+C 失败放行/D 开关口径，全过）。
+
 ## 4. 解析提议（变异算子）
 
 外环 reset 变异先掷算子骰子（概率 `outer_p_struct / outer_p_cell / outer_p_resample`，
@@ -101,8 +125,12 @@ outer_proposal_retries: 50
 outer_med_slack_scale: 1.0
 outer_w_area: 1.0
 outer_w_err: 1.0
+outer_errgate: false            # §3.1 实测误差预筛门
+outer_errgate_vectors: 2000000
+outer_errgate_max_repairs: 6
 ```
-`scripts/train_dc.py` 加 `--outer_cell_search` CLI 开关。
+`scripts/train_dc.py` 加 `--outer_cell_search` / `--outer_errgate`
+（及 `--outer_errgate_vectors/--outer_errgate_max_repairs`）CLI 开关。
 
 ## 7. 回归保证
 

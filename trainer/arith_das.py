@@ -631,6 +631,15 @@ class CompressorRouting:
         outer_med_slack_scale=1.0,   # MRED 模式 MED 等效 slack 比例（<1 更保守）
         outer_w_area=1.0,            # 提议打分：面积节省项权重
         outer_w_err=1.0,             # 提议打分：误差代价项权重
+        # 外环实测误差预筛门（默认关=行为不变）：外环 cell 配置在进 DC 前，先用
+        # sample-0 布线发射的 RTL 做 verilator MC 实测（秒级 vs DC ~200s/样本）；
+        # 超预算 → 贪心摘掉解析误差贡献 wae·2^col 最大的 cell（每步误差严格降）
+        # 重发射重测，修复步数耗尽仍超则清空 cells 保底（floor 配置必可行）。
+        # 治 MRED 模式闭式 slack 一阶近似失准：07-09 rerun k02-k12 有 25-64% 的
+        # episode 整集实测超 budget（k06 达 77/120），8 次 DC 全浪费。
+        outer_errgate=False,
+        outer_errgate_vectors=2_000_000,   # 预筛 MC 向量数（门控只看均值型 med/mred，2M 足够）
+        outer_errgate_max_repairs=6,       # 贪心摘 cell 步数上限；超限清空 cells
         **kwargs,
     ):
         self.bit_width = bit_width
@@ -784,6 +793,9 @@ class CompressorRouting:
         self.outer_med_slack_scale = float(outer_med_slack_scale)
         self.outer_w_area = float(outer_w_area)
         self.outer_w_err = float(outer_w_err)
+        self.outer_errgate = bool(outer_errgate)
+        self.outer_errgate_vectors = int(outer_errgate_vectors)
+        self.outer_errgate_max_repairs = int(outer_errgate_max_repairs)
         self._episode_cell_types = {}
         if self.outer_cell_search and not use_approx_types:
             logging.warning(
@@ -1609,6 +1621,116 @@ class CompressorRouting:
         med, bias, wce = self._cells_error_totals(cells)
         logging.info("[outer] op=struct+%s n_cells=%d med=%.1f bias=%+.1f wce=%.0f",
                      op, len(cells), med, bias, wce)
+
+    def _outer_gate_active(self):
+        """预筛门只在有硬预算可判定时开：MRED 模式看 mred_budget，否则看 med_budget。
+        error_as_metric（无预算）没有"超标整集浪费"问题，不开。"""
+        if not (self.outer_cell_search and self.outer_errgate):
+            return False
+        if getattr(self, "error_metric", "med") == "mred":
+            return bool(getattr(self, "mred_budget", None))
+        return self.med_budget is not None
+
+    def _gate_budget_exceeded(self, measured):
+        """与 get_objective 的离散预算判据同口径：MRED 模式比 measured mred，MED 模式
+        比 measured med（均含截断 floor）。WCE 不进门（MC 尾部不收敛，沿用解析上界）。
+        实测字段缺失 → 判不超（回退旧行为，别误杀）。返回 (超标?, 描述串)。"""
+        if measured is None:
+            return False, "no-measurement"
+        if (getattr(self, "error_metric", "med") == "mred"
+                and getattr(self, "mred_budget", None)):
+            mred = measured.get("mred")
+            if mred is None:
+                return False, "mred-missing"
+            return (mred > float(self.mred_budget),
+                    f"mred={mred:.3e}/budget={float(self.mred_budget):.3e}")
+        if self.med_budget is not None:
+            med = measured.get("med")
+            if med is None:
+                return False, "med-missing"
+            return (med > float(self.med_budget),
+                    f"med={med:.1f}/budget={float(self.med_budget):.1f}")
+        return False, "no-budget"
+
+    def _outer_drop_worst_cell(self, cells):
+        """修复算子：摘掉解析误差贡献 wae·2^col 最大的 cell。每步总误差严格下降，
+        且尽量多保留 cell（相对清空重摆，保住外环已积累的摆放）。"""
+        if not cells:
+            return cells, None
+
+        def contrib(e):
+            _h, table = self._type_head_and_table(int(e[2]))
+            return float(table[int(e[4])]["wae"]) * float(1 << int(e[1]))
+
+        j = max(range(len(cells)), key=lambda i: contrib(cells[i]))
+        return cells[:j] + cells[j + 1:], cells[j]
+
+    def _refresh_episode_cell_types(self):
+        """state["cells"] → self._episode_cell_types {node_idx:(t,k)}（reset 同口径；
+        预筛修复摘 cell 后重建映射）。返回未映射条数（正常应为 0）。"""
+        self._episode_cell_types = {}
+        unmapped = 0
+        for e in self.state.get("cells") or []:
+            key = (int(e[0]), int(e[1]), int(e[2]), int(e[3]))
+            node_idx = self.comp_graph.indice_map.get(key)
+            if node_idx is None:
+                unmapped += 1
+                continue
+            self._episode_cell_types[int(node_idx)] = (int(e[2]), int(e[4]))
+        return unmapped
+
+    def _outer_errgate_screen(self, mul, samples_connection, rtl_path):
+        """外环实测误差预筛门：sample-0 RTL 已发射，先 verilator 实测再放行 DC。
+        超预算 → _outer_drop_worst_cell 修复 → 重发射重测；步数耗尽仍超 → 清空
+        cells（floor 配置必可行）。verilator 探测失败 → 放行（与 error_gate 回退
+        策略一致，不因门本身故障丢整集）。返回修复后的 (type_choices, cell_map)。"""
+        probe_build = os.path.join(self.build_dir, "outer_errgate_probe")
+        os.makedirs(probe_build, exist_ok=True)
+        for rep in range(self.outer_errgate_max_repairs + 1):
+            m = self._measure_error_verilator(
+                rtl_path, probe_build, self.outer_errgate_vectors
+            )
+            if m is None:
+                logging.warning("[outer-gate] verilator 探测失败，本轮跳过预筛")
+                break
+            over, detail = self._gate_budget_exceeded(m)
+            if rep == 0:
+                # 标定数据：解析 vs 实测（修 §3.1 slack 一阶近似用）
+                a_med, _ab, _aw = self._cells_error_totals(self.state.get("cells"))
+                logging.info(
+                    "[outer-gate] probe n_cells=%d %s | analytic_med=%.1f measured_med=%.1f",
+                    len(self.state.get("cells") or []), detail,
+                    a_med, m.get("med") if m.get("med") is not None else float("nan"),
+                )
+            if not over:
+                if rep:
+                    logging.info("[outer-gate] 修复 %d 步后可行 (%s)", rep, detail)
+                break
+            cells = [list(e) for e in (self.state.get("cells") or [])]
+            if rep >= self.outer_errgate_max_repairs or len(cells) <= 1:
+                new_cells, dropped = [], None  # 保底：清空必可行
+            else:
+                new_cells, dropped = self._outer_drop_worst_cell(cells)
+            self.state["cells"] = new_cells
+            logging.info(
+                "[outer-gate] 超budget(%s) → %s n_cells=%d→%d",
+                detail,
+                ("清空 cells 保底" if dropped is None else
+                 f"摘除 (s{int(dropped[0])},c{int(dropped[1])},t{int(dropped[2])},"
+                 f"#{int(dropped[3])},k{int(dropped[4])})"),
+                len(cells), len(new_cells),
+            )
+            self._refresh_episode_cell_types()
+            cell_map = self._cell_map_from_types(self._episode_cell_types)
+            mul.emit_verilog(
+                rtl_path,
+                assignment=self.emit_assignment(samples_connection, cell_map=cell_map),
+                extra_modules_src=self._approx_modules_src(cell_map),
+            )
+            if not new_cells:
+                break  # 空配置必可行，不再复测
+        type_choices = dict(self._episode_cell_types)
+        return type_choices, self._cell_map_from_types(type_choices)
 
     def _setup_truncation(self):
         """Phase C ①：算截断 [0,k) 的校正常数 C（用低列槽位的常数 1 位表示）+ 误差量。
@@ -2876,6 +2998,17 @@ class CompressorRouting:
                     assignment=assignment,
                     extra_modules_src=self._approx_modules_src(cell_map),
                 )
+                if (
+                    sample_idx == 0
+                    and self._outer_gate_active()
+                    and self._episode_cell_types
+                ):
+                    # 外环预筛门：DC 前实测本集共用的 cell 配置，超预算就地修复。
+                    # 修复会更新 self.state["cells"]/_episode_cell_types 并重发射
+                    # sample-0 RTL；后续样本自然沿用修复后的配置。
+                    type_choices, cell_map = self._outer_errgate_screen(
+                        mul, samples_connection, rtl_path
+                    )
                 sample_info.append(
                     {
                         "rtl_path": rtl_path,
@@ -3536,7 +3669,9 @@ class CompressorRouting:
                                      if bi["ct"].get("ct42") is not None
                                      else np.zeros_like(state["ct32"]))
                 if self.outer_cell_search:
-                    state["cells"] = [list(c) for c in (bi.get("cells") or [])]
+                    # 外环模式 cells 存在 ct["cells"]（state 整体 deepcopy 进 best_info["ct"]）
+                    cells_src = bi["ct"].get("cells") or bi.get("cells") or []
+                    state["cells"] = [list(c) for c in cells_src]
                 objective = float(bi["objective"])
                 self.pool.add(objective, state)
                 # 种 found_best_info：本 run 的 best 单调不劣于温启动（rank 同 objective 口径）
@@ -3638,15 +3773,7 @@ class CompressorRouting:
         )
         if self.outer_cell_search:
             # slot 坐标 → 本 episode 图的 node_idx（发射/objective/best 复用现有路径）
-            self._episode_cell_types = {}
-            unmapped = 0
-            for e in self.state.get("cells") or []:
-                key = (int(e[0]), int(e[1]), int(e[2]), int(e[3]))
-                node_idx = self.comp_graph.indice_map.get(key)
-                if node_idx is None:
-                    unmapped += 1
-                    continue
-                self._episode_cell_types[int(node_idx)] = (int(e[2]), int(e[4]))
+            unmapped = self._refresh_episode_cell_types()
             if unmapped:
                 logging.warning("[outer] %d 个 cell 未映射到图节点（prune 应已保证为 0）",
                                 unmapped)

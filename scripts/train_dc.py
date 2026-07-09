@@ -72,6 +72,13 @@ def main():
                         "wallace/dadda 种子），并种 found_best_info；须同 k/口径")
     p.add_argument("--outer_cell_search", action="store_true",
                    help="外环 cell 搜索：类型进外环状态（解析提议+闭式过滤+resample-K），内环只采布线（Appr_Comp/OUTER_CELL_SEARCH.md）")
+    p.add_argument("--outer_errgate", action="store_true",
+                   help="外环实测误差预筛门：DC 前先 verilator 实测本集 cell 配置，超预算贪心摘 cell 修复；"
+                        "治 MRED 闭式 slack 失准导致的整集浪费（07-09 rerun k02-k12 25-64%% episode 全员超budget）")
+    p.add_argument("--outer_errgate_vectors", type=int, default=None,
+                   help="预筛门 MC 向量数（默认 trainer 内置 2M；门控只看均值型 med/mred）")
+    p.add_argument("--outer_errgate_max_repairs", type=int, default=None,
+                   help="预筛门贪心摘 cell 步数上限（默认 trainer 内置 6；超限清空 cells 保底）")
     p.add_argument("--use_ct42", action="store_true",
                    help="把 4:2 compressor 作为可搜索架构原语接入；use_approx_types=true 时 CT42 也可选近似 cell")
     p.add_argument("--approx42_library_path", default=None,
@@ -134,6 +141,12 @@ def main():
         tk["init_pool_best_info"] = args.init_pool_best_info
     if args.outer_cell_search:
         tk["outer_cell_search"] = True
+    if args.outer_errgate:
+        tk["outer_errgate"] = True
+    if args.outer_errgate_vectors is not None:
+        tk["outer_errgate_vectors"] = args.outer_errgate_vectors
+    if args.outer_errgate_max_repairs is not None:
+        tk["outer_errgate_max_repairs"] = args.outer_errgate_max_repairs
     if args.approx42_library_path is not None:
         tk["approx42_library_path"] = args.approx42_library_path
     if args.approx42_rtl_path is not None:
