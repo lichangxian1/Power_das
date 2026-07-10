@@ -70,6 +70,11 @@ def main():
     p.add_argument("--init_pool_best_info", default=None,
                    help="温启动：用已有 run 的 best_info.json 作为初始训练池（替代默认 "
                         "wallace/dadda 种子），并种 found_best_info；须同 k/口径")
+    p.add_argument("--init_policy_from", default=None,
+                   help="策略持久化：从已有 run 的 save_iterNN 目录（或 gcn.pth）加载 "
+                        "GCN+类型头权重（组件级，形状不合逐项跳过）")
+    p.add_argument("--num_epochs", type=int, default=None,
+                   help="每轮 PPO 梯度 epoch 数（config 默认 1；调大=同批数据多走几步梯度）")
     p.add_argument("--outer_cell_search", action="store_true",
                    help="外环 cell 搜索：类型进外环状态（解析提议+闭式过滤+resample-K），内环只采布线（Appr_Comp/OUTER_CELL_SEARCH.md）")
     p.add_argument("--outer_errgate", action="store_true",
@@ -139,6 +144,10 @@ def main():
         tk["use_ct42"] = True
     if args.init_pool_best_info is not None:
         tk["init_pool_best_info"] = args.init_pool_best_info
+    if args.init_policy_from is not None:
+        tk["init_policy_from"] = args.init_policy_from
+    if args.num_epochs is not None:
+        tk["num_epochs"] = args.num_epochs
     if args.outer_cell_search:
         tk["outer_cell_search"] = True
     if args.outer_errgate:

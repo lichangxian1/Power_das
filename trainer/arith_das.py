@@ -541,6 +541,9 @@ class CompressorRouting:
         # 种子进池，且同时种 found_best_info（本 run 报告的 best 单调不劣于温启动点）。
         # 要求与本 run 同 bit_width/encode_type/trunc_cols/objective 口径。
         init_pool_best_info=None,
+        # 策略持久化 LOAD 侧（save 侧 = save_experiment 的 gcn.pth/type_heads.pth）：
+        # 指向 save_iterNN 目录（或 gcn.pth 文件）。组件级加载，形状不合逐项跳过并告警。
+        init_policy_from=None,
         synth="openroad",
         # ===== 阶段3 Phase B：近似压缩器类型搜索（全部默认关，关时行为不变）=====
         use_approx_types=False,
@@ -939,6 +942,10 @@ class CompressorRouting:
         self.scheduler: optim.lr_scheduler.LRScheduler = getattr(
             optim.lr_scheduler, scheduler_name
         )(self.optim, **scheduler_kwargs)
+
+        self.init_policy_from = init_policy_from
+        if init_policy_from:
+            self._load_policy(init_policy_from)
 
         self.comp_graph: CompressorGraph = None
         self.state: Dict[str, np.ndarray] = None
@@ -1944,6 +1951,45 @@ class CompressorRouting:
         pareto_indices = paretoset(points, sense=["min", "min"])
         pareto_points = points[pareto_indices]
         return pareto_points
+
+    def _load_policy(self, path):
+        """策略持久化 LOAD：path = save_iterNN 目录或 gcn.pth 文件。
+        组件级 try/except：GCN 必载（失败告警回退随机初始化）；类型头/基数 logits
+        仅当本 run 相应组件存在且形状匹配时载入（跨库表大小可能不同）。"""
+        p = self._resolve_path(path)
+        gcn_path = p if p.endswith(".pth") else os.path.join(p, "gcn.pth")
+        heads_path = os.path.join(os.path.dirname(gcn_path), "type_heads.pth")
+        try:
+            state = torch.load(gcn_path, map_location=self.device)
+            self.gcn.load_state_dict(state)
+            logging.info(f"policy warm-start: GCN <- {gcn_path}")
+        except Exception as e:  # noqa: BLE001
+            logging.error(f"policy warm-start GCN 加载失败(回退随机初始化): {e}")
+            return
+        if not (self.use_approx_types and os.path.exists(heads_path)):
+            return
+        try:
+            ts = torch.load(heads_path, map_location=self.device)
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"policy warm-start type_heads 读取失败(仅载 GCN): {e}")
+            return
+        for name in ("type_head_32", "type_head_22", "type_head_42"):
+            head = getattr(self, name, None)
+            if head is None or name not in ts:
+                continue
+            try:
+                head.load_state_dict(ts[name])
+                logging.info(f"policy warm-start: {name} <- {heads_path}")
+            except Exception as e:  # noqa: BLE001
+                logging.warning(f"policy warm-start {name} 形状不合跳过: {e}")
+        if (self.approx_cardinality_logits is not None
+                and "approx_cardinality_logits" in ts
+                and list(ts.get("approx_cardinality_choices", []))
+                == list(self.approx_cardinality_choices)):
+            with torch.no_grad():
+                self.approx_cardinality_logits.copy_(
+                    ts["approx_cardinality_logits"].to(self.device))
+            logging.info("policy warm-start: approx_cardinality_logits 已载入")
 
     def save_experiment(self, episode_idx):
         logging.info(f"saving experiment at episode {episode_idx}")

@@ -70,6 +70,28 @@
 2. 数据自然增长：reeval 时顺带覆盖各 iter 检查点（netlist 现成，只花 XA），n 可从 121 → 千级。
 3. 结构升级：GNN over CompressorGraph + **解析活动传播**特征（从 pp 的 p1=0.25 逐 cell 用真值表传播信号概率/toggle——cell 级实验已证明敏感度≈功耗），目标 run 内 >0.95，届时可作训练内环 objective，直接替换 DC report_power 的 20× 代理，消除「objective 降但 XA 升」的错位。
 
+## 第三部分：Q1 边际 ΔP 配对验证（2026-07-10，solver 路线图 Step 2）
+
+**问题**：standalone 表征的 Σ Δdyn 能否充当「换 cell 的 in-design 边际功耗」预言机
+（决定 cell solver 的 PPA 项能否用功耗预测器）？判据与结果（`q1_paired_regression.py`）：
+
+| 数据层 | n_pairs | Spearman | 符号一致率（>1% 噪声地板） | 判定 |
+|---|---|---|---|---|
+| A. 07-04 同布线 DC 配对（最干净） | 6（3 超地板） | 0.667 | 3/3 | tie-break 档 |
+| B. 121 设计 XA，run 内同 n_pp_active | 66 | **0.189** | **26/61=43%** | FAIL |
+| B'. 全部 run 内对 | 508 | 0.210 | 274/478=57% | FAIL |
+
+**裁决：功耗预测器不进 solver loss；PPA 项用精确 cell 面积和；预测器至多做离散化后
+tie-breaking。** 细节：
+- 量级完全失准：32-cell 包预测 −7.8mW 实测 −1.0mW（8× 高估——standalone p_one=0.25
+  高估 in-design 活动率）；k12 单 cell 预测 −0.15 实测 −0.57（4× 低估）。
+- **单 cell 粒度的边际 ΔP 全部低于 DC 1% 噪声地板**（|ΔP|=0.02–0.09mW vs 地板 0.13mW），
+  且 k06_sample02 同型 cell 换个 slot 符号翻转（−0.09 → +0.03mW）——边际效应在设计级
+  基本不可测，routing/glitch 盲区主导。
+- Part A 3/3 同号全靠多 cell 大包（方向 trivially 对）；决策粒度（单 cell）上无信号。
+- 与第二部分 S2 Ridge run 内 0.921 不矛盾：那是绝对功耗预测（area_dc 扛主信号），
+  此处测的是 Δ 预言机——sum_dyn_lib 单独作 Δ 信号时接近抛硬币。
+
 ## 复现
 
 ```bash
