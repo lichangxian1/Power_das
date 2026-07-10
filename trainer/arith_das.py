@@ -643,6 +643,18 @@ class CompressorRouting:
         outer_errgate=False,
         outer_errgate_vectors=2_000_000,   # 预筛 MC 向量数（门控只看均值型 med/mred，2M 足够）
         outer_errgate_max_repairs=6,       # 贪心摘 cell 步数上限；超限清空 cells
+        # 外环 cell 维度求解器（默认 None=进化变异不变）。"greedy" = 每 episode 在
+        # sample-0 布线上用张量化仿真器实测 Δmred 打分做 lazy-greedy + 升级扫描解 cell
+        # 包（Appr_Comp/cellsolver），替代进化 cell 变异；结构搜索仍归外环 struct 变异。
+        # 多架构真实 DC+XA 验证（OUTER_CELL_SEARCH.md §3.2.4）：深截断 k12/14 greedy 面积
+        # 稳赢 GA、功耗打平。求解在 self.device(GPU)上,~5% episode 开销（DC 主导）。
+        outer_cell_solver=None,
+        outer_solver_vectors=16_000_000,   # 求解器 MC 向量池（MRED 重尾需 16M 校准）
+        outer_solver_cache=None,           # 向量池缓存目录（跨 episode 复用,None=build_dir下）
+        # 求解余量：解到 budget×margin。greedy 的 cell 选择利用 sample-0 布线特有的
+        # 误差抵消,包在其余布线上系统性偏高(+3~5%,07-10 首集 3 个 k 全部 7/9 越线),
+        # 贴线填充(≈99%)必然大面积报废;0.9 → 其余样本落线内。
+        outer_solver_margin=0.9,
         **kwargs,
     ):
         self.bit_width = bit_width
@@ -799,7 +811,15 @@ class CompressorRouting:
         self.outer_errgate = bool(outer_errgate)
         self.outer_errgate_vectors = int(outer_errgate_vectors)
         self.outer_errgate_max_repairs = int(outer_errgate_max_repairs)
+        self.outer_cell_solver = outer_cell_solver  # None | "greedy"
+        self.outer_solver_vectors = int(outer_solver_vectors)
+        self.outer_solver_cache = outer_solver_cache
+        self.outer_solver_margin = float(outer_solver_margin)
+        self._cell_solver_pool = None   # 惰性加载的 (a,b) 向量池,跨 episode 复用
         self._episode_cell_types = {}
+        if self.outer_cell_solver and not self.outer_cell_search:
+            logging.warning("[outer] outer_cell_solver 需 outer_cell_search=True，已忽略")
+            self.outer_cell_solver = None
         if self.outer_cell_search and not use_approx_types:
             logging.warning(
                 "[outer] outer_cell_search=True 但 use_approx_types=False：无类型表，"
@@ -1738,6 +1758,125 @@ class CompressorRouting:
                 break  # 空配置必可行，不再复测
         type_choices = dict(self._episode_cell_types)
         return type_choices, self._cell_map_from_types(type_choices)
+
+    def _cell_solver_active(self):
+        """greedy 求解器是否生效：需 outer_cell_search + solver="greedy" + MRED 预算模式。"""
+        return bool(
+            self.outer_cell_search
+            and self.outer_cell_solver == "greedy"
+            and getattr(self, "error_metric", None) == "mred"
+            and self.mred_budget
+            and self.trunc_cols > 0
+        )
+
+    def _outer_greedy_solve_robust(self, connections):
+        """外环 greedy 求解器（鲁棒版,替代进化 cell 变异）：在 sample-0 布线上用张量化
+        仿真器实测 Δmred 打分解 cell 包(到 budget×margin),再对整集**全部布线**复测
+        (sim 与 verilator gate 同 16M 流逐位一致 → sim 全合规 = gate 必过),任一布线
+        超全额 budget → 摘解析贡献 wae·2^col 最大的 cell,直至全布线合规。
+        动机:密集包(50~65 cell)的误差抵消强依赖布线,只按 sample-0 解会跨布线偏高
+        10%+,07-10 首集 3 个 k 全部 7/9 样本越线报废。
+        成功后更新 state["cells"]/_episode_cell_types(发射由 get_samples 主循环做);
+        求解失败/无 slot → 空 cells 放行(纯截断必可行),不丢整集。"""
+        self.state["cells"] = []
+        self._refresh_episode_cell_types()
+        try:
+            import torch as _torch
+            from Appr_Comp.cellsolver import sim as _cs
+            from Appr_Comp.cellsolver.solver import GradientCellSolver
+        except Exception as e:  # noqa: BLE001
+            logging.warning("[outer-solver] 导入 cellsolver 失败,跳过求解: %s", e)
+            return
+        dev = getattr(self, "device", "cpu")
+        if isinstance(dev, str) and dev.startswith("cuda") and not _torch.cuda.is_available():
+            dev = "cpu"
+        try:
+            ct = CompressorTree(
+                self.initial_pp, self.state["ct32"], self.state["ct22"],
+                self.state.get("ct42"),
+            )
+            if self.trunc_cols > 0:
+                ct.trunc_cols = self.trunc_cols
+                ct.trunc_bits = self._trunc_bits
+            mul = Mul(self.bit_width, self.encode_type, ct)
+            specs = _cs.parse_pp_specs(mul.emit_pp_encoder())
+            trees = [_cs.TreeSim(self.comp_graph, conn, specs, dev)
+                     for conn in connections]
+            cache = self.outer_solver_cache or os.path.join(self.build_dir, "solver_pool")
+            os.makedirs(cache, exist_ok=True)
+            solver = GradientCellSolver(
+                self, trees[0], specs,
+                float(self.mred_budget) * self.outer_solver_margin, device=dev,
+                pool_vectors=self.outer_solver_vectors, cache_dir=cache,
+                est=getattr(self, "_cell_solver_est", None),  # 跨 episode 复用池/分层
+            )
+            self._cell_solver_est = solver.est
+            if not solver.space.slots:
+                logging.info("[outer-solver] 无合法 slot（资格带空）→ 纯截断")
+                return
+            # 鲁棒模式跳过升级扫描：贴线换面积的增量会被跨布线修复摘掉,白做
+            cfg = solver.greedy_add(log=lambda *a, **k: None, upgrade=False)
+            # 鲁棒修复：全布线合规（对全额 budget,非 margin 后的）。
+            # 二分批量摘除：按解析贡献 wae·2^col 降序排出摘除顺序,二分最小前缀
+            # (log2(n)×trees 次 gate,替代逐个摘的 n×trees 次);非单调兜底逐摘。
+            budget = float(self.mred_budget)
+            colmap = {n: c for n, _t, c in solver.space.slots}
+
+            def _contrib(n):
+                return solver.space.wae_of(*cfg_full[n]) * (2 ** colmap.get(n, 0))
+
+            def _worst(c):
+                luts = solver.space.cell_luts_of(c)
+                return max(solver.est.gate(t, specs, self.bit_width, luts)
+                           for t in trees)
+
+            cfg_full = dict(cfg)
+            drops = 0
+            worst_val = _worst(cfg)
+            if worst_val > budget and cfg:
+                order = sorted(cfg_full, key=_contrib, reverse=True)
+
+                def _drop_prefix(m):
+                    c = dict(cfg_full)
+                    for n in order[:m]:
+                        c.pop(n)
+                    return c
+
+                lo, hi = 1, len(order)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if _worst(_drop_prefix(mid)) <= budget:
+                        hi = mid
+                    else:
+                        lo = mid + 1
+                cfg = _drop_prefix(lo)
+                drops = lo
+                worst_val = _worst(cfg)
+                while cfg and worst_val > budget:  # 非单调兜底
+                    node = max(cfg, key=lambda n: solver.space.wae_of(*cfg[n])
+                               * (2 ** colmap.get(n, 0)))
+                    cfg.pop(node)
+                    drops += 1
+                    worst_val = _worst(cfg)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("[outer-solver] 求解异常,空 cells 放行: %s", e)
+            self.state["cells"] = []
+            self._refresh_episode_cell_types()
+            return
+        # cfg {node_idx:(t,k)} → state["cells"] [[s,c,t,idx,k]]（vertex_list 反查坐标）
+        vlist = self.comp_graph.vertex_list
+        cells = []
+        for node, (t, k) in cfg.items():
+            s, c, _t, idx = vlist[int(node)]
+            cells.append([int(s), int(c), int(t), int(idx), int(k)])
+        self.state["cells"] = cells
+        self._refresh_episode_cell_types()
+        logging.info(
+            "[outer-solver] robust greedy n_cells=%d(摘%d) worst_mred=%.3e "
+            "worst_util=%.1f%% slots=%d trees=%d",
+            len(cfg), drops, worst_val, worst_val / budget * 100,
+            len(solver.space.slots), len(trees),
+        )
 
     def _setup_truncation(self):
         """Phase C ①：算截断 [0,k) 的校正常数 C（用低列槽位的常数 1 位表示）+ 误差量。
@@ -3010,10 +3149,22 @@ class CompressorRouting:
         with torch.no_grad():
             sample_info = []
             Z_mat_dict = self.get_Z_mat()
+            pre_samples = None
+            if self._cell_solver_active():
+                # 求解器模式：先采完整集布线,greedy 包对全部布线做鲁棒修复后再发射
+                # （只按 sample-0 解会跨布线偏高 10%+ → 7/9 越线报废,07-10 实测）
+                pre_samples = [
+                    self.sample_from_logits(Z_mat_dict)
+                    for _ in range(self.num_samples)
+                ]
+                self._outer_greedy_solve_robust([c for c, _lp in pre_samples])
             for sample_idx in range(self.num_samples):
-                samples_connection, overall_log_prob = self.sample_from_logits(
-                    Z_mat_dict
-                )
+                if pre_samples is not None:
+                    samples_connection, overall_log_prob = pre_samples[sample_idx]
+                else:
+                    samples_connection, overall_log_prob = self.sample_from_logits(
+                        Z_mat_dict
+                    )
                 if self.outer_cell_search:
                     # 外环模式：cell 配置由外环决定、episode 内固定、全样本共用；
                     # 不进 log_prob（PPO 只学布线）
@@ -3048,6 +3199,7 @@ class CompressorRouting:
                     sample_idx == 0
                     and self._outer_gate_active()
                     and self._episode_cell_types
+                    and not self._cell_solver_active()
                 ):
                     # 外环预筛门：DC 前实测本集共用的 cell 配置，超预算就地修复。
                     # 修复会更新 self.state["cells"]/_episode_cell_types 并重发射
@@ -3806,6 +3958,10 @@ class CompressorRouting:
         if self.outer_cell_search:
             self.state.setdefault("cells", [])
             self._outer_mutate()
+            if self.outer_cell_solver == "greedy":
+                # cells 由 get_samples 在 sample-0 布线上 greedy 求解填充；
+                # 结构变异照常（外环仍搜结构），cell 维度交给求解器。
+                self.state["cells"] = []
         else:
             action_mask = self.get_action_mask()
             action = random.choice(np.where(action_mask == 1)[0])

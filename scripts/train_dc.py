@@ -84,6 +84,17 @@ def main():
                    help="预筛门 MC 向量数（默认 trainer 内置 2M；门控只看均值型 med/mred）")
     p.add_argument("--outer_errgate_max_repairs", type=int, default=None,
                    help="预筛门贪心摘 cell 步数上限（默认 trainer 内置 6；超限清空 cells 保底）")
+    p.add_argument("--outer_cell_solver", type=str, default=None, choices=["greedy"],
+                   help="外环 cell 维度求解器：greedy=每 episode 在 sample-0 布线上用张量化仿真器"
+                        "实测 Δmred 打分做 lazy-greedy+升级扫描解 cell 包（替代进化变异，需 MRED 预算模式）；"
+                        "多架构真实 DC+XA 验证深截断 k12/14 面积稳赢 GA（OUTER_CELL_SEARCH.md §3.2.4）")
+    p.add_argument("--outer_solver_vectors", type=int, default=None,
+                   help="求解器 MC 向量池（默认 16M；MRED 重尾需 16M 校准）")
+    p.add_argument("--outer_solver_cache", type=str, default=None,
+                   help="求解器向量池缓存目录（跨 episode 复用；默认 build_dir/solver_pool）")
+    p.add_argument("--outer_solver_margin", type=float, default=None,
+                   help="求解余量：解到 budget×margin（默认 0.9）。greedy 包对 sample-0 布线过拟合"
+                        "(+3~5%%),贴线填充会让其余样本大面积越线报废")
     p.add_argument("--use_ct42", action="store_true",
                    help="把 4:2 compressor 作为可搜索架构原语接入；use_approx_types=true 时 CT42 也可选近似 cell")
     p.add_argument("--approx42_library_path", default=None,
@@ -156,6 +167,14 @@ def main():
         tk["outer_errgate_vectors"] = args.outer_errgate_vectors
     if args.outer_errgate_max_repairs is not None:
         tk["outer_errgate_max_repairs"] = args.outer_errgate_max_repairs
+    if args.outer_cell_solver is not None:
+        tk["outer_cell_solver"] = args.outer_cell_solver
+    if args.outer_solver_vectors is not None:
+        tk["outer_solver_vectors"] = args.outer_solver_vectors
+    if args.outer_solver_cache is not None:
+        tk["outer_solver_cache"] = args.outer_solver_cache
+    if args.outer_solver_margin is not None:
+        tk["outer_solver_margin"] = args.outer_solver_margin
     if args.approx42_library_path is not None:
         tk["approx42_library_path"] = args.approx42_library_path
     if args.approx42_rtl_path is not None:

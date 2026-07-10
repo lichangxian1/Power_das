@@ -161,14 +161,19 @@ class MredEstimator:
 
 class GradientCellSolver:
     def __init__(self, exp, tree, pp_specs, budget, device="cpu",
-                 pool_vectors=16_000_000, seed=12345, cache_dir=None):
+                 pool_vectors=16_000_000, seed=12345, cache_dir=None, est=None):
         self.exp, self.tree, self.budget = exp, tree, float(budget)
         self.device = device
         self.space = SlotSpace(exp, tree, device)
         self.pp_specs = pp_specs
-        a, b = S.xorshift_ab(pool_vectors, seed=seed, cache_dir=cache_dir)
-        self.pool_a, self.pool_b = a, b
-        self.est = MredEstimator(a, b, device)
+        if est is not None:
+            # 复用外部估计器（池/分层与设备绑定,与结构无关——训练内跨 episode 缓存）
+            self.est = est
+            self.pool_a, self.pool_b = est.pool_a, est.pool_b
+        else:
+            a, b = S.xorshift_ab(pool_vectors, seed=seed, cache_dir=cache_dir)
+            self.pool_a, self.pool_b = a, b
+            self.est = MredEstimator(a, b, device)
         n_slots = len(self.space.slots)
         kmax = max((self.space.stacks[t][0].shape[0]
                     for _n, t, _c in self.space.slots), default=0)
@@ -312,10 +317,12 @@ class GradientCellSolver:
         return cfg, hist
 
     # -------------------------------------------------------- ③ 贪心加法基线
-    def greedy_add(self, log=print, rescore_tol=0.7):
+    def greedy_add(self, log=print, rescore_tol=0.7, upgrade=True):
         """实测口径的 lazy greedy：从 floor 出发，按 面积节省/实测Δmred 性价比加 cell。
         打分用 gate_fast（S12-only，秒级），验收用完整 gate；lazy 堆——弹出堆顶先
-        用当前配置重测其 Δ，仍居前才接受（捕捉 cell 间交互）。"""
+        用当前配置重测其 Δ，仍居前才接受（捕捉 cell 间交互）。
+        upgrade=False 跳过升级扫描（训练内鲁棒模式用：贴线换面积的增量会被跨布线
+        修复摘除,白做,省 ~1/3 求解时间）。"""
         import heapq
         cfg = {}
         gm = self.gate_mred(cfg)
@@ -357,7 +364,8 @@ class GradientCellSolver:
         log(f"[greedy] 填充完 n_cells={len(cfg)} mred={gm:.3e} "
             f"util={gm/self.budget:6.1%} saving={self.area_saving(cfg):.2f} "
             f"(gate evals≈{n_eval})")
-        cfg = self.greedy_upgrade(cfg, log=log)
+        if upgrade:
+            cfg = self.greedy_upgrade(cfg, log=log)
         return cfg
 
     def greedy_upgrade(self, cfg, log=print, sweeps=2):

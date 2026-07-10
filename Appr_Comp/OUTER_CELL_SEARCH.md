@@ -263,6 +263,41 @@ save_iter 检查点取 **多个不同结构**(k02–k14,iter39/59/99,greedy 在 
 4. 高 k 独立结构少(k12/k14 各仅 2 个,训练早收敛),面积趋势清晰但功耗统计力弱,
    结论 1(面积 k 依赖)比结论 2(功耗)证据更硬。
 
+### 3.2.5 greedy 求解器训练接入与上线(2026-07-10)
+
+**接入**(`--outer_cell_solver greedy`,默认 None=行为不变):
+- 新 trainer 参数 `outer_cell_solver/outer_solver_vectors(16M)/outer_solver_cache`;
+  `_cell_solver_active()` 门 = outer_cell_search + greedy + MRED 预算模式;
+- `_outer_greedy_solve()`:get_samples 里 sample-0 发射后、DC 前(与 errgate 同钩子、
+  solver 分支优先),在 sample-0 布线上建 TreeSim+GradientCellSolver → greedy_add →
+  cfg 经 vertex_list 反查写回 `state["cells"]` → 重发射;异常/无 slot → 空 cells 放行;
+- `reset()`:solver 模式下 `_outer_mutate` 后清空 cells(结构变异保留,cell 维度全权
+  交求解器);每 episode 解一次,episode 内全样本共用;
+- 冒烟 `scripts/smoke_outer_greedy.py`(A 开关口径/B 端到端状态同步+坐标反查+RTL/
+  C 默认关回归)本地+远端全过。**坑**:远端 CPU 跑 torch 必须 OMP_NUM_THREADS=4~8,
+  否则线程超订抖动假死(0% CPU,老 pwrpred 坑复发)。
+
+**上线过程踩坑与修复(07-10 晚,三连击)**:
+1. **PATH 毒点复发**:非交互 ssh 启动不带 vtool PATH → verilator 静默回退解析
+   (`[errgate] ... No such file or directory: 'verilator'`),整批作废级事故;
+   launch 脚本 env 加 `PATH=~/anaconda3/envs/vtool/bin:$PATH` 修复。
+2. **跨布线越线**:密集包(54-65 cell)误差抵消强依赖 sample-0 布线,其余布线系统性
+   偏高 10%+,margin=0.9 仍 3 个 k 首集全部 7/9 样本越线报废——margin 猜不动。
+3. **鲁棒修复(终版)**:get_samples 先采完整集 8 条布线 → sample-0 解包(budget×0.9)
+   → 张量化 sim 对**全部布线**复测(与 verilator 闸门同 16M 同流逐位一致 → sim 合规
+   = 门必过)→ 任一布线超全额预算摘 wae·2^col 最大 cell 至全体合规 → 再发射。
+   `_outer_greedy_solve_robust`;**over_budget=0 是构造保证**。
+   代价(重要观察):全布线合规把包从 54-65 cell 削到 **11-16 cell**(摘 39-47)——
+   离线单布线实验的密集包优势,在"整集共用包"约束下大幅缩水;剩余包仍 ~2× GA 规模。
+
+**上线 run(终版)**:`outputs/2026-07-10_22_mred_greedy_np4`(远端 22:55 北京时间起),
+k12/k14/k16,**逐字镜像 warm240eg 配方**(同 config max_col=30/window6/num_epochs=1、
+同 seed42、同 warm 池 07-09_06、ep240/s8/np4)+ `--outer_cell_solver greedy
+--outer_solver_margin 0.9`;**对照 = warm240eg 终局(已完成 ep240)**。
+k12/k14→cuda:0,k16→cuda:2。首集:三 k 全部 **over_budget=0/9**、verilator 零失败;
+robust 包 k12 15cell(worst_util 99.9%)/k14 11(85.8%)/k16 16(99.7%)。
+注意:同机 epo4/noinh 系列(max_col=16、num_epochs=4)口径不同,不作对照。
+
 ## 4. 解析提议（变异算子）
 
 外环 reset 变异先掷算子骰子（概率 `outer_p_struct / outer_p_cell / outer_p_resample`，
