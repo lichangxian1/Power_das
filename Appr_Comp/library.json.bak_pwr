@@ -150,9 +150,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0,
-   "delay_ns": 0.0
+   }
   },
   "comp22_51": {
    "type": "22",
@@ -299,8 +297,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0
+   }
   },
   "comp22_60": {
    "type": "22",
@@ -937,9 +934,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0,
-   "delay_ns": 0.0
+   }
   },
   "comp22_a1": {
    "type": "22",
@@ -1625,9 +1620,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0,
-   "delay_ns": 0.0
+   }
   },
   "comp22_e5": {
    "type": "22",
@@ -37300,9 +37293,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0,
-   "delay_ns": 0.0
+   }
   },
   "comp32_fa51": {
    "type": "32",
@@ -42745,8 +42736,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0
+   }
   },
   "comp22_01": {
    "type": "22",
@@ -48038,9 +48028,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0,
-   "delay_ns": 0.0
+   }
   },
   "comp22_f1": {
    "type": "22",
@@ -59687,9 +59675,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0,
-   "delay_ns": 0.0
+   }
   },
   "comp32_5510": {
    "type": "32",
@@ -60247,8 +60233,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0
+   }
   },
   "comp32_5580": {
    "type": "32",
@@ -121380,9 +121365,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0,
-   "delay_ns": 0.0
+   }
   },
   "comp32_aa10": {
    "type": "32",
@@ -171106,9 +171089,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0,
-   "delay_ns": 0.0
+   }
   },
   "comp32_ff10": {
    "type": "32",
@@ -237634,9 +237615,7 @@
     "Tbc": null,
     "Tcs": null,
     "Tcc": null
-   },
-   "power_mw": 0.0,
-   "delay_ns": 0.0
+   }
   },
   "comp32_ff65": {
    "type": "32",

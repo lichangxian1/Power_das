@@ -162,6 +162,15 @@ def _env_int(name, default, min_value=1, max_value=1000000):
     return max(min_value, min(max_value, value))
 
 
+def _env_vector_set(bit_width):
+    """Return a shell-safe fixed XA vector-set name, or an empty override."""
+    default = "uniform16_medoid_4096_v1" if int(bit_width) == 16 else ""
+    value = str(os.environ.get("XA_VECTOR_SET", default)).strip()
+    if value and not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+        raise ValueError(f"invalid XA_VECTOR_SET: {value!r}")
+    return value
+
+
 def _parse_float(value):
     try:
         return float(value)
@@ -248,7 +257,11 @@ def evaluate_single_routing(idx, verilog_content, bit_width=8, target_delay=1.5)
 
             ssh_run_cmd = [
                 "ssh", "-p", EDA_PORT, f"{EDA_USER}@{EDA_HOST}",
-                f"cd {remote_sandbox} && LC_ALL=C LANG=C DUMP_SAIF={_env_flag('DUMP_SAIF')} MAX_LIMIT={_env_int('MAX_LIMIT', 4096)} bash scripts/run_all.sh {top_module} {bit_width} {target_delay}"
+                f"cd {remote_sandbox} && LC_ALL=C LANG=C "
+                f"XA_VECTOR_SET={_shq(_env_vector_set(bit_width))} "
+                f"DUMP_SAIF={_env_flag('DUMP_SAIF')} "
+                f"MAX_LIMIT={_env_int('MAX_LIMIT', 4096)} "
+                f"bash scripts/run_all.sh {top_module} {bit_width} {target_delay}"
             ]
             result = subprocess.run(
                 ssh_run_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

@@ -36,6 +36,7 @@ from utils import (
     lse_gamma,
     convert_to_serializable,
     BoundedParetoPool,
+    ParetoArchive,
 )
 
 try:
@@ -545,6 +546,9 @@ class CompressorRouting:
         # 指向 save_iterNN 目录（或 gcn.pth 文件）。组件级加载，形状不合逐项跳过并告警。
         init_policy_from=None,
         synth="openroad",
+        # v5 前沿回放颗粒度：每 N ep 把档案 snapshot 落到 logs/front_hist/（KB 级，
+        # 独立于 save_freq 的全量存档；gen_v5_front_viewer.py 会扫）。0/None=关。
+        front_dump_freq=5,
         # ===== 阶段3 Phase B：近似压缩器类型搜索（全部默认关，关时行为不变）=====
         use_approx_types=False,
         approx_lib_path="Appr_Comp/selected_compressors.json",
@@ -655,6 +659,17 @@ class CompressorRouting:
         # 误差抵消,包在其余布线上系统性偏高(+3~5%,07-10 首集 3 个 k 全部 7/9 越线),
         # 贴线填充(≈99%)必然大面积报废;0.9 → 其余样本落线内。
         outer_solver_margin=0.9,
+        # ===== M2（PARETO_ARITH_PLAN.md §7.2，默认关=行为不变）=====
+        # 批量 ZERO 算子：zero-col 把最低未清列整列填 ZERO（= 分数截断一步）、
+        # unzero-col 反向。解析模型对边界列 ZERO 失真（实测 bias 是解析 3.7×）→
+        # 该算子跳过闭式预算过滤，可行性交给 TT oracle / errgate / v5 档案准入。
+        outer_zero_ops=False,
+        outer_p_zero=0.15,           # 变异骰子里 zero 算子的权重
+        # TT oracle：sample-0 布线上用 cellsolver 张量化仿真器实测 cell 配置 mred
+        # （与 16M verilator 闸门同流逐位一致，秒级），替代 verilator 预筛门；
+        # 超上限按解析贡献降序二分前缀摘除。v5 上限 = 档案 mred 上限（超伪预算
+        # 只是落松箱，不摘）；预算模式上限 = mred_budget。
+        outer_tt_oracle=False,
         **kwargs,
     ):
         self.bit_width = bit_width
@@ -670,6 +685,7 @@ class CompressorRouting:
         self.device = device
         self.save_freq = save_freq
         self.log_freq = log_freq
+        self.front_dump_freq = front_dump_freq
         self.num_samples = num_samples
         self.num_epochs = num_epochs
         self.n_processing = n_processing
@@ -815,6 +831,13 @@ class CompressorRouting:
         self.outer_solver_vectors = int(outer_solver_vectors)
         self.outer_solver_cache = outer_solver_cache
         self.outer_solver_margin = float(outer_solver_margin)
+        self.outer_zero_ops = bool(outer_zero_ops)
+        self.outer_p_zero = float(outer_p_zero)
+        self.outer_tt_oracle = bool(outer_tt_oracle)
+        if self.outer_zero_ops or self.outer_tt_oracle:
+            logging.info("[outer] M2: zero_ops=%s p_zero=%.2f tt_oracle=%s",
+                         self.outer_zero_ops, self.outer_p_zero,
+                         self.outer_tt_oracle)
         self._cell_solver_pool = None   # 惰性加载的 (a,b) 向量池,跨 episode 复用
         self._episode_cell_types = {}
         if self.outer_cell_solver and not self.outer_cell_search:
@@ -956,6 +979,7 @@ class CompressorRouting:
                 opt_params += list(self.type_head_42.parameters())
             if self.approx_cardinality_logits is not None:
                 opt_params.append(self.approx_cardinality_logits)
+        self._opt_params = opt_params   # 梯度裁剪要盖全（含类型头/cardinality logits）
         self.optim: optim.Optimizer = getattr(optim, optim_name)(
             opt_params, **optim_kwargs
         )
@@ -994,6 +1018,12 @@ class CompressorRouting:
 
     # ===================== Phase B：近似类型搜索辅助 =====================
     _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # M2 锚点口径：exact cell 的在环境面积（T28 12T40P140：FA1D0=2.856、HA1D0=2.184、
+    # CT42≈2×FA=5.712）。菜单 meta 的 standalone SOP 锚点虚高 ~4×（FA=10.92），会把
+    # "比在环境 exact 更贵"的 cell 也标成省面积。cellsolver 侧 07-11 已切此口径
+    # （cash-in 从 24-35% 修到 60-158%），提议打分对齐。
+    _EXACT_AREA_INCTX = {0: 2.856, 1: 2.184, 4: 5.712}
 
     def _resolve_path(self, p):
         """相对路径按仓库根解析（pipeline 会 chdir 到 output 目录）。"""
@@ -1075,6 +1105,8 @@ class CompressorRouting:
             "area": cell.get("area"),
             "power_mw": cell.get("power_mw"),
             "delay_ns": cell.get("delay_ns"),
+            # M2 恒零标志随条目走（_zero_entry_of 靠它挑真恒零 cell）
+            "const_zero": bool(cell.get("const_zero", False)),
         }
         patterns = cell.get("patterns")
         if patterns and "sum_lut" in cell and "carry_lut" in cell and "cout_lut" in cell:
@@ -1522,7 +1554,8 @@ class CompressorRouting:
             for sl in free:
                 _s, c, t, _i = sl
                 _h, table = self._type_head_and_table(t)
-                ex_area = table[0].get("area")
+                # M2：省面积用在环境锚点（standalone 锚点虚高 ~4× 会排错序）
+                ex_area = self._EXACT_AREA_INCTX.get(t) or table[0].get("area")
                 w = float(1 << c)
                 for k in range(1, len(table)):
                     entry = table[k]
@@ -1535,7 +1568,8 @@ class CompressorRouting:
                     if want_sign and entry.get("group") not in (want_sign, "Z"):
                         continue
                     area_frac = 0.0
-                    if ex_area and entry.get("area"):
+                    # is not None：ZERO cell 的 area=0.0 是合法表征（省下整个 exact cell）
+                    if ex_area and entry.get("area") is not None:
                         area_frac = (float(ex_area) - float(entry["area"])) / float(ex_area)
                     denom = remain if (remain is not None and remain > 0) \
                         else float(1 << max(self.trunc_cols, 1))
@@ -1592,6 +1626,67 @@ class CompressorRouting:
                          K, len(cells))
         return cells
 
+    def _zero_entry_of(self, t):
+        """type t 的恒零输出 cell（=槽位级截断）表索引；无则 None。
+        检测：菜单 const_zero 标志（add_zero_cells_unified.py 注入）或名字 *_zero 兜底。
+        ⚠ 不能用 group=='Z'——N/Z/P 是偏置符号分组（Z=零偏置的功能 cell），恒零 cell
+        因丢值恒为负偏置、按库约定挂 N 组（07-13 双评审发现 #1）。"""
+        _h, table = self._type_head_and_table(t)
+        zs = [(k, e) for k, e in enumerate(table)
+              if k > 0 and (e.get("const_zero")
+                            or str(e.get("name", "")).endswith("_zero"))]
+        if not zs:
+            return None
+        return int(min(zs, key=lambda kv: float(kv[1].get("wae", 0.0)))[0])
+
+    def _op_zero_col(self, cells, slots, rng):
+        """M2 批量算子 zero-col：把最低的未清列（近似窗口内）整列填 ZERO
+        = 分数截断一步，k 与 k+2 之间的连续插值（budget_sweep 证明 ZERO 是
+        离线密集包主力，每包 3~23 个）。返回新 cells；无可操作列返回 None。
+        注意：调用方跳过闭式预算过滤——解析模型对边界列 ZERO 失真
+        （实测 bias 是解析 3.7×），可行性交给 TT oracle/errgate/v5 档案准入。"""
+        occupied = {tuple(int(x) for x in e[:4]): int(e[4]) for e in (cells or [])}
+        bycol = {}
+        for sl in slots:
+            bycol.setdefault(int(sl[1]), []).append(sl)
+        for c in sorted(bycol):
+            todo = []
+            for sl in bycol[c]:
+                kz = self._zero_entry_of(int(sl[2]))
+                if kz is None:
+                    continue
+                if occupied.get(tuple(int(x) for x in sl)) != kz:
+                    todo.append((sl, kz))
+            if not todo:
+                continue   # 该列已清满（或无 Z 型），看更高一列
+            drop = {tuple(int(x) for x in sl) for sl, _ in todo}
+            new = [list(e) for e in (cells or [])
+                   if tuple(int(x) for x in e[:4]) not in drop]
+            new += [[int(sl[0]), int(sl[1]), int(sl[2]), int(sl[3]), kz]
+                    for sl, kz in todo]
+            logging.info("[outer] zero-col c=%d：+%d ZERO（列清空），n_cells %d→%d",
+                         c, len(todo), len(cells or []), len(new))
+            return new
+        return None
+
+    def _op_unzero_col(self, cells, rng):
+        """M2 反向算子 unzero-col：撤掉最低的成组 ZERO 列（误差只降，免检）。"""
+        zero_cols = {}
+        for e in (cells or []):
+            kz = self._zero_entry_of(int(e[2]))
+            if kz is not None and int(e[4]) == kz:
+                zero_cols.setdefault(int(e[1]), []).append(
+                    tuple(int(x) for x in e[:4]))
+        if not zero_cols:
+            return None
+        c = min(zero_cols)
+        drop = set(zero_cols[c])
+        new = [list(e) for e in cells
+               if tuple(int(x) for x in e[:4]) not in drop]
+        logging.info("[outer] unzero-col c=%d：-%d ZERO，n_cells %d→%d",
+                     c, len(drop), len(cells), len(new))
+        return new
+
     def _current_assignment(self):
         pp = get_initial_partial_product(self.bit_width, self.encode_type)
         ct = CompressorTree(
@@ -1613,15 +1708,28 @@ class CompressorRouting:
         self.transition(action)
         cells = self._cells_prune_stale(cells, self._current_assignment())
 
-        # 2) cell 叠加层：keep / 单 cell op / resample-K
+        # 2) cell 叠加层：keep / 单 cell op / resample-K / M2 批量 zero
         has_types = bool(self.use_approx_types and self.type_table_32)
+        use_zero = bool(getattr(self, "outer_zero_ops", False)) and has_types
         p = np.array([self.outer_p_struct,
                       self.outer_p_cell if has_types else 0.0,
-                      self.outer_p_resample if has_types else 0.0], dtype=float)
+                      self.outer_p_resample if has_types else 0.0,
+                      self.outer_p_zero if use_zero else 0.0], dtype=float)
         p /= p.sum()
-        op = ("keep", "cell", "resample")[int(rng.choice(3, p=p))]
+        op = ("keep", "cell", "resample", "zero")[int(rng.choice(4, p=p))]
 
-        if op != "keep":
+        if op == "zero":
+            # M2：批量 ZERO 跳过闭式预算过滤（解析对边界列 ZERO 失真 3.7×）；
+            # 超标由 TT oracle/errgate 修、v5 里只是落进更松的箱去竞争。
+            slots = self._enumerate_type_slots(self._current_assignment())
+            cand = self._op_zero_col(cells, slots, rng)
+            if cand is None:
+                cand = self._op_unzero_col(cells, rng)
+            if cand is None:
+                logging.info("[outer] zero 算子无可操作列，本轮 cell 维度不变")
+            else:
+                cells = cand
+        elif op != "keep": 
             slots = self._enumerate_type_slots(self._current_assignment())
             new_cells = None
             for _ in range(self.outer_proposal_retries):
@@ -1669,8 +1777,12 @@ class CompressorRouting:
             mred = measured.get("mred")
             if mred is None:
                 return False, "mred-missing"
-            return (mred > float(self.mred_budget),
-                    f"mred={mred:.3e}/budget={float(self.mred_budget):.3e}")
+            # v5：超伪预算不是废样本（落进更松的箱竞争），门/修复只挡真出界
+            # （mred > 档案上限 = 无箱可落）。预算模式维持旧语义。
+            bud = (float(self._v5_archive.hi)
+                   if getattr(self, "pareto_v5", False)
+                   else float(self.mred_budget))
+            return (mred > bud, f"mred={mred:.3e}/limit={bud:.3e}")
         if self.med_budget is not None:
             med = measured.get("med")
             if med is None:
@@ -1759,14 +1871,121 @@ class CompressorRouting:
         type_choices = dict(self._episode_cell_types)
         return type_choices, self._cell_map_from_types(type_choices)
 
+    def _outer_tt_oracle_screen(self, mul, samples_connection, rtl_path):
+        """M2 TT oracle 预筛（PARETO_ARITH_PLAN.md §7.2）：sample-0 布线上用 cellsolver
+        张量化仿真器 + 分层估计器实测本集 cell 配置 mred——与 16M verilator 闸门同流
+        逐位一致（oracle 说可行 ⇒ 闸门必过），秒级；治解析一阶 slack 对密集 ZERO 包
+        的误杀与边界列 bias 3.7× 失真。超上限按解析贡献 wae·2^col 降序二分前缀摘除
+        （robust greedy 同款）。上限：v5 = 档案 mred 上限（伪预算内外都放行、落箱
+        竞争）；预算模式 = mred_budget。oracle 异常回退 errgate（若开）或放行。"""
+        def _current():
+            tc = dict(self._episode_cell_types)
+            return tc, self._cell_map_from_types(tc)
+
+        if getattr(self, "pareto_v5", False):
+            limit = float(self._v5_archive.hi)
+        elif getattr(self, "mred_budget", None):
+            limit = float(self.mred_budget)
+        else:
+            return _current()
+        if not self._episode_cell_types:
+            return _current()
+        try:
+            import torch as _torch
+            from Appr_Comp.cellsolver import sim as _cs
+            from Appr_Comp.cellsolver.solver import GradientCellSolver
+
+            dev = getattr(self, "device", "cpu")
+            if (isinstance(dev, str) and dev.startswith("cuda")
+                    and not _torch.cuda.is_available()):
+                dev = "cpu"
+            specs = _cs.parse_pp_specs(mul.emit_pp_encoder())
+            tree = _cs.TreeSim(self.comp_graph, samples_connection, specs, dev)
+            cache = self.outer_solver_cache or os.path.join(
+                self.build_dir, "solver_pool")
+            os.makedirs(cache, exist_ok=True)
+            solver = GradientCellSolver(
+                self, tree, specs, limit, device=dev,
+                pool_vectors=self.outer_solver_vectors, cache_dir=cache,
+                est=getattr(self, "_cell_solver_est", None),
+            )
+            self._cell_solver_est = solver.est
+            cfg = {int(n): (int(t), int(k))
+                   for n, (t, k) in self._episode_cell_types.items()}
+
+            def _mred_of(c):
+                return solver.est.gate(tree, specs, self.bit_width,
+                                       solver.space.cell_luts_of(c))
+
+            mred0 = _mred_of(cfg)
+            a_med, _ab, _aw = self._cells_error_totals(self.state.get("cells"))
+            logging.info(
+                "[tt-oracle] n_cells=%d mred_sim=%.3e limit=%.3e (util=%.0f%%) "
+                "analytic_med=%.1f", len(cfg), mred0, limit,
+                mred0 / limit * 100, a_med,
+            )
+            if mred0 <= limit or not cfg:
+                return _current()
+            colmap = {n: c for n, _t, c in solver.space.slots}
+
+            def _contrib(n):
+                return solver.space.wae_of(*cfg[n]) * (2 ** colmap.get(n, 0))
+
+            order = sorted(cfg, key=_contrib, reverse=True)
+
+            def _prefix(m):
+                c = dict(cfg)
+                for n in order[:m]:
+                    c.pop(n)
+                return c
+
+            lo, hi = 1, len(order)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if _mred_of(_prefix(mid)) <= limit:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            cfg = _prefix(lo)
+            drops = lo
+            while cfg and _mred_of(cfg) > limit:   # 非单调兜底
+                node = max(cfg, key=_contrib)
+                cfg.pop(node)
+                drops += 1
+        except Exception as e:  # noqa: BLE001
+            logging.warning("[tt-oracle] 异常(%s)，回退 %s", e,
+                            "errgate" if self._outer_gate_active() else "放行")
+            if self._outer_gate_active():
+                return self._outer_errgate_screen(mul, samples_connection, rtl_path)
+            return _current()
+        # 修剪写回 + 重发射 sample-0 RTL（后续样本自然沿用修剪后的配置）
+        vlist = self.comp_graph.vertex_list
+        cells = []
+        for node, (t, k) in cfg.items():
+            s, c, _t, idx = vlist[int(node)]
+            cells.append([int(s), int(c), int(t), int(idx), int(k)])
+        self.state["cells"] = cells
+        self._refresh_episode_cell_types()
+        type_choices, cell_map = _current()
+        mul.emit_verilog(
+            rtl_path,
+            assignment=self.emit_assignment(samples_connection, cell_map=cell_map),
+            extra_modules_src=self._approx_modules_src(cell_map),
+        )
+        logging.info("[tt-oracle] 超上限修剪：摘 %d 个 → n_cells=%d", drops, len(cells))
+        return type_choices, cell_map
+
     def _cell_solver_active(self):
-        """greedy 求解器是否生效：需 outer_cell_search + solver="greedy" + MRED 预算模式。"""
+        """greedy 求解器是否生效：需 outer_cell_search + solver="greedy" + MRED 预算模式。
+        v5 种子集（_v5_seeding）不生效——种子是纯截断 Dadda 基线本体，greedy 填 cell 会
+        破坏可复现基线（与 GA 变体种子集不变异对等）。"""
         return bool(
             self.outer_cell_search
             and self.outer_cell_solver == "greedy"
             and getattr(self, "error_metric", None) == "mred"
             and self.mred_budget
             and self.trunc_cols > 0
+            and not getattr(self, "_v5_seeding", False)
         )
 
     def _outer_greedy_solve_robust(self, connections):
@@ -2156,6 +2375,28 @@ class CompressorRouting:
             json.dump(
                 self.found_best_info, f, indent=4, default=convert_to_serializable
             )
+        if getattr(self, "pareto_v5", False):
+            with open(os.path.join(save_dir, "front.json"), "w") as f:
+                json.dump(self._v5_archive.snapshot(), f, indent=2,
+                          default=convert_to_serializable)
+            # 双评审发现 #4 修复：滚动全量档案（含 payload），崩溃后可收割/重播；
+            # tmp+rename 原子写，单文件滚动不膨胀磁盘
+            state_path = os.path.join(self.log_dir, "front_state.json")
+            tmp = state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(
+                    {"episode": episode_idx,
+                     "seed_queue": list(getattr(self, "_v5_seed_queue", [])),
+                     "bins": {str(b): es for b, es in self._v5_archive.bins.items()}},
+                    f, default=convert_to_serializable)
+            os.replace(tmp, state_path)
+            if len(self._v5_archive) == 0:
+                logging.info("[v5] 档案空，跳过 full-PPA 诊断")
+                return
+            # 代表设计可能来自任意 k：full-PPA 发射前激活其截断档
+            self._activate_trunc_profile(
+                int(self.found_best_info["ct"].get("k", self.trunc_cols))
+            )
 
         self.state = self.found_best_info["ct"]
         self.assignment = self.found_best_info["assignment"]
@@ -2223,9 +2464,24 @@ class CompressorRouting:
     def run_experiment(self):
         for episode_idx in range(self.num_episodes):
             self.run_episode(episode_idx)
+            if (getattr(self, "pareto_v5", False) and self.front_dump_freq
+                    and (episode_idx + 1) % self.front_dump_freq == 0):
+                self._dump_front_snapshot(episode_idx)
             if (episode_idx + 1) % self.save_freq == 0:
                 self.save_experiment(episode_idx)
         self.save_experiment(self.num_episodes)
+
+    def _dump_front_snapshot(self, episode_idx):
+        """轻量前沿快照：与 save_experiment 的 front.json 同构（不含 payload），
+        tmp+rename 原子写，rsync 半途拉不到残文件。"""
+        d = os.path.join(self.log_dir, "front_hist")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, f"front_ep{episode_idx + 1:04d}.json")
+        tmp = p + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self._v5_archive.snapshot(), f, indent=1,
+                      default=convert_to_serializable)
+        os.replace(tmp, p)
 
     DELAY_CONSTANT = {
         "FA": {
@@ -3065,6 +3321,14 @@ class CompressorRouting:
             or r.get("power_mw") is None
         ):
             return None
+        # 07-11 deepk k28 事故：DC 报告偶发解析成 area=0.0/delay=0.1，0.0 过得了 None 检查
+        # → 荒谬 objective 抢占 best 并冻结其后所有轮。物理下界兜底（16-bit 乘法器不可能 <10µm²）。
+        if float(r["area"]) <= 10.0 or float(r["power_mw"]) <= 0.0:
+            logging.warning(
+                f"[dc] worker {worker_id} 异常 PPA 读数 area={r.get('area')} "
+                f"power={r.get('power_mw')} → 按失败丢弃"
+            )
+            return None
         delay = r.get("delay")
         if delay is None:
             delay = target_delay
@@ -3171,6 +3435,11 @@ class CompressorRouting:
                     type_choices = dict(self._episode_cell_types)
                     cell_map = self._cell_map_from_types(type_choices)
                     type_sample_info = {"mode": "outer"}
+                elif getattr(self, "pareto_v5", False) and self._v5_seeding:
+                    # 双评审发现 #2 修复：非 outer 模式的 v5 种子集不做类型采样——
+                    # 种子必须是纯截断 Dadda（可复现基线）；"outer" 模式标记复用
+                    # PPO 侧"无类型 log_prob"处理
+                    cell_map, type_choices, type_sample_info = {}, {}, {"mode": "outer"}
                 else:
                     # Phase B：采样每个压缩器槽的 cell 类型（关时返回空，行为不变）
                     cell_map, type_choices, type_log_prob, type_sample_info = (
@@ -3197,16 +3466,21 @@ class CompressorRouting:
                 )
                 if (
                     sample_idx == 0
-                    and self._outer_gate_active()
                     and self._episode_cell_types
                     and not self._cell_solver_active()
                 ):
-                    # 外环预筛门：DC 前实测本集共用的 cell 配置，超预算就地修复。
-                    # 修复会更新 self.state["cells"]/_episode_cell_types 并重发射
-                    # sample-0 RTL；后续样本自然沿用修复后的配置。
-                    type_choices, cell_map = self._outer_errgate_screen(
-                        mul, samples_connection, rtl_path
-                    )
+                    if getattr(self, "outer_tt_oracle", False):
+                        # M2：TT oracle 预筛（同流位精确、秒级）取代 verilator 门
+                        type_choices, cell_map = self._outer_tt_oracle_screen(
+                            mul, samples_connection, rtl_path
+                        )
+                    elif self._outer_gate_active():
+                        # 外环预筛门：DC 前实测本集共用的 cell 配置，超预算就地修复。
+                        # 修复会更新 self.state["cells"]/_episode_cell_types 并重发射
+                        # sample-0 RTL；后续样本自然沿用修复后的配置。
+                        type_choices, cell_map = self._outer_errgate_screen(
+                            mul, samples_connection, rtl_path
+                        )
                 sample_info.append(
                     {
                         "rtl_path": rtl_path,
@@ -3479,15 +3753,17 @@ class CompressorRouting:
         violation = summary["area_violation"] + summary["delay_violation"]
         return (0 if feasible else 1, violation, summary["power"])
 
-    def _best_info_metadata(self):
-        if self.found_best_info["simulated_result"] is None:
+    def _best_info_metadata(self, info=None):
+        info = info if info is not None else self.found_best_info
+        if info["simulated_result"] is None:
             return {}
-        summary = self._summarize_result(self.found_best_info["simulated_result"])
-        summary["objective"] = self.found_best_info["objective"]
+        summary = self._summarize_result(info["simulated_result"])
+        summary["objective"] = info["objective"]
         return summary
 
-    def export_best_candidate(self, export_dir):
-        if self.found_best_info["connection"] is None:
+    def export_best_candidate(self, export_dir, info=None):
+        info = info if info is not None else self.found_best_info
+        if info["connection"] is None:
             raise ValueError("No best candidate has been found; run training first")
 
         os.makedirs(export_dir, exist_ok=True)
@@ -3495,18 +3771,23 @@ class CompressorRouting:
         old_assignment = self.assignment
         old_comp_graph = self.comp_graph
         try:
-            self.state = copy.deepcopy(self.found_best_info["ct"])
-            self.assignment = copy.deepcopy(self.found_best_info["assignment"])
+            if getattr(self, "pareto_v5", False):
+                # v5：条目可能来自任意 k，发射前激活其截断档
+                self._activate_trunc_profile(
+                    int((info.get("ct") or {}).get("k", self.trunc_cols))
+                )
+            self.state = copy.deepcopy(info["ct"])
+            self.assignment = copy.deepcopy(info["assignment"])
             self.comp_graph = CompressorGraph(
                 self.initial_pp,
                 self.assignment,
                 num_node_types=self.num_node_types,
             )
             # Phase B：从最优设计的 cell_types 复原近似 cell（comp_graph 同序，node_idx 一致）
-            cell_types = self.found_best_info.get("cell_types") or {}
+            cell_types = info.get("cell_types") or {}
             cell_map = self._cell_map_from_types(cell_types)
             routing_assignment = self.emit_assignment(
-                self.found_best_info["connection"], cell_map=cell_map
+                info["connection"], cell_map=cell_map
             )
             ct = CompressorTree(
                 self.initial_pp,
@@ -3526,19 +3807,19 @@ class CompressorRouting:
             )
 
             best_info = {
-                **self._best_info_metadata(),
-                "connection": self.found_best_info["connection"],
-                "ct": self.found_best_info["ct"],
-                "assignment": self.found_best_info["assignment"],
+                **self._best_info_metadata(info),
+                "connection": info["connection"],
+                "ct": info["ct"],
+                "assignment": info["assignment"],
                 "cell_types": cell_types,
-                "cell_type_info": self.found_best_info.get("cell_type_info"),
+                "cell_type_info": info.get("cell_type_info"),
                 "approx_cells": {str(k): v for k, v in cell_map.items()},
                 "routing_assignment": routing_assignment,
                 "rtl_path": rtl_path,
-                "simulated_result": self.found_best_info["simulated_result"],
+                "simulated_result": info["simulated_result"],
                 # 误差闸门审计：该最优点用的是 verilator 实测还是解析回退
-                "error_source": self.found_best_info.get("error_source"),
-                "measured_error": self.found_best_info.get("measured_error"),
+                "error_source": info.get("error_source"),
+                "measured_error": info.get("measured_error"),
             }
             with open(os.path.join(export_dir, "best_info.json"), "w") as f:
                 json.dump(best_info, f, indent=4, default=convert_to_serializable)
@@ -3557,6 +3838,11 @@ class CompressorRouting:
         # 点1：advantage 归一。把 A 从原始 -obj 改成 -(obj-mean)/(std+eps)，
         # 减均值给出"比本批平均好/差多少"的相对信号，除标准差把量纲压到 O(1)，
         # 使学习信号不再被 obj 绝对大小（误差尺度）主导。normalize_advantage=False 时为旧行为。
+        if self.normalize_advantage and len(sample_info_list) < 2:
+            # 单样本无相对信号（A≡0，梯度为零）——显式跳过并说明，而非静默零更新
+            logging.info("[ppo] 本批仅 %d 个策略样本，normalize_advantage 无相对信号，"
+                         "跳过 PPO 更新", len(sample_info_list))
+            return l
         if self.normalize_advantage:
             _objs = np.array(
                 [si["objective"] for si in sample_info_list], dtype=np.float64
@@ -3620,6 +3906,10 @@ class CompressorRouting:
         return l
 
     def update_found_best_info(self, sample_info_list):
+        if getattr(self, "pareto_v5", False):
+            # v5：标量 rank 不再决定存活，全部样本走档案支配准入
+            self._v5_admit_samples(sample_info_list)
+            return
         for sample_info in sample_info_list:
             is_better = self.found_best_info["connection"] is None
             if not is_better:
@@ -3745,6 +4035,8 @@ class CompressorRouting:
 
     def run_episode(self, episode_idx):
         logging.info(f"Episode {episode_idx} start")
+        if getattr(self, "pareto_v5", False):
+            self._v5_begin_episode(episode_idx)
 
         logging.info(f"sampling")
         self.reset()
@@ -3830,7 +4122,9 @@ class CompressorRouting:
 
             self.optim.zero_grad()
             l.backward()
-            torch.nn.utils.clip_grad_norm_(self.gcn.parameters(), self.max_grad_norm)
+            # 双评审发现 #7 修复：裁剪盖全部被训参数（原来只裁 GCN，类型头/
+            # cardinality logits 无界——Phase B 以来的老洞）
+            torch.nn.utils.clip_grad_norm_(self._opt_params, self.max_grad_norm)
             self.optim.step()
 
             loss_info["l"] = l.item()
@@ -3884,6 +4178,250 @@ class CompressorRouting:
             except Exception as e:  # noqa: BLE001
                 logging.error(f"warm-start load failed {path}: {e}")
         return n_loaded
+
+    # ===================== v5 多目标：混合 k 种群 + 非支配档案 =====================
+    # PARETO_ARITH_PLAN.md。默认关（不调 enable_pareto_v5 = 逐位旧行为）。
+    # 选择层零系数：存活/亲代只由 ParetoArchive 支配关系决定；标量 objective 退到
+    # PPO 提议启发层（伪预算 = 亲代箱上沿，铰链无量纲化，不再决定谁存活）。
+
+    @property
+    def found_best_info(self):
+        if getattr(self, "pareto_v5", False):
+            rep = self._v5_representative()
+            if rep is not None:
+                return rep
+        return self._found_best_info
+
+    @found_best_info.setter
+    def found_best_info(self, value):
+        self._found_best_info = value
+
+    def _capture_trunc_profile(self):
+        return {
+            "bits": dict(self._trunc_bits),
+            "const": self._trunc_const,
+            "delta": self._trunc_delta,
+            "wce": self._trunc_wce,
+            "med": self._trunc_med,
+            "model_mred": self._trunc_model_mred,
+            # 双评审发现 #5 修复：error_as_metric+pow2k/sqrt2k/floor 模式下
+            # _setup_truncation 会按 k 改 error_scale——必须随档存取，否则切回
+            # 缓存 k 时 error_scale 是"上一个新算 k"的（访问历史依赖）
+            "error_scale": self.error_scale,
+        }
+
+    def _restore_trunc_profile(self, p):
+        self._trunc_bits = dict(p["bits"])
+        self._trunc_const = p["const"]
+        self._trunc_delta = p["delta"]
+        self._trunc_wce = p["wce"]
+        self._trunc_med = p["med"]
+        self._trunc_model_mred = p["model_mred"]
+        if "error_scale" in p:
+            self.error_scale = p["error_scale"]
+
+    def _activate_trunc_profile(self, k):
+        """M0 k 线程化：把全局截断状态切到深度 k。TruncProfile 逐 k lazy 缓存
+        （C*/floor 的确定性 MC 每个 k 只算一次，秒级）。k 不改树结构——截断列压缩器
+        照常实例化、DC 常数传播扫掉，k 只换 (常数 PP, C*, 资格窗, 误差 floor)。"""
+        k = int(k)
+        if not hasattr(self, "_trunc_profiles"):
+            self._trunc_profiles = {}
+            if self.trunc_cols > 0 and self._trunc_bits:
+                self._trunc_profiles[self.trunc_cols] = self._capture_trunc_profile()
+        if k in self._trunc_profiles:
+            if self.trunc_cols != k or not (k == 0 or self._trunc_bits):
+                self.trunc_cols = k
+                self._restore_trunc_profile(self._trunc_profiles[k])
+            return
+        self.trunc_cols = k
+        if k == 0:
+            self._trunc_bits, self._trunc_const = {}, 0
+            self._trunc_delta = self._trunc_wce = self._trunc_med = 0.0
+            self._trunc_model_mred = None
+        else:
+            self._trunc_bits = {}
+            self._trunc_model_mred = None
+            self._setup_truncation()
+        self._trunc_profiles[k] = self._capture_trunc_profile()
+
+    def enable_pareto_v5(self, mred_lo=1e-7, mred_hi=2e-1, bin_ratio=2.0,
+                         bin_cap=6, eps_power=0.01, seed_ks=None):
+        """v5 入口（train_dc.py 在 error_metric=mred 接线后调用）。
+        seed_ks = 初始种群的截断深度集合（不同 k 截断的 Dadda 树，论文可复现基线）。"""
+        if getattr(self, "error_metric", "med") != "mred":
+            raise ValueError("pareto_v5 需要 error_metric='mred'")
+        self.pareto_v5 = True
+        self._v5_archive = ParetoArchive(
+            mred_lo=mred_lo, mred_hi=mred_hi, bin_ratio=bin_ratio,
+            bin_cap=bin_cap, eps_power=eps_power,
+        )
+        if seed_ks is not None and not list(seed_ks):
+            raise ValueError("pareto_v5 seed_ks 为空（解析失败？）——显式传 None 用默认 2-30")
+        self._v5_seed_queue = sorted({int(k) for k in (seed_ks or range(2, 31))})
+        self._v5_seed_tries = {}
+        self._v5_state_override = None
+        self._v5_seeding = False
+        self._v5_seed_k = None
+        self._v5_bin = 0
+        if not hasattr(self, "_trunc_profiles"):
+            self._trunc_profiles = {}
+            if self.trunc_cols > 0 and self._trunc_bits:
+                self._trunc_profiles[self.trunc_cols] = self._capture_trunc_profile()
+        logging.info(
+            "[v5] enabled: bins=%d [%.1e, %.1e] ratio=%.2f cap=%d eps_pwr=%.3f "
+            "seed_ks=%s", self._v5_archive.n_bins, mred_lo, mred_hi, bin_ratio,
+            bin_cap, eps_power, self._v5_seed_queue,
+        )
+
+    def _v5_dadda_state(self, k):
+        """初始种群个体：标准 Dadda 树 + 截断 k + 零近似 cell（从零确定性构造）。"""
+        ct = CompressorTree.dadda(self.initial_pp)
+        st = {"ct32": ct.ct32.astype(int), "ct22": ct.ct22.astype(int)}
+        if self.use_ct42:
+            st["ct42"] = np.zeros_like(st["ct32"])
+        if self.outer_cell_search:
+            st["cells"] = []
+        st["k"] = int(k)
+        return st
+
+    def _v5_begin_episode(self, episode_idx):
+        """每集编排：种子集（初始种群逐 k 评估，不变异）优先，之后箱轮询。
+        伪预算 = 本集箱上沿；mred_scale = 伪预算（铰链无量纲化，跨箱同尺度）。"""
+        self._v5_state_override = None
+        self._v5_seeding = False
+        self._v5_seed_k = None
+        arch = self._v5_archive
+        while self._v5_seed_queue:
+            # 双评审发现 #3 修复：peek 不 pop——种子只在评估成功（_v5_admit_samples
+            # 至少 1 个入档）后才出队；全批 DC/verilator 失败 → 下集自动重试（上限 3 次）
+            k = self._v5_seed_queue[0]
+            self._activate_trunc_profile(k)
+            floor = self._trunc_model_mred
+            if floor is not None and floor > arch.hi:
+                logging.info("[v5] seed k=%d 模型floor=%.3e 超档案上限 %.1e，跳过",
+                             k, floor, arch.hi)
+                self._v5_seed_queue.pop(0)
+                continue
+            tries = self._v5_seed_tries.get(k, 0)
+            if tries >= 3:
+                logging.error("[v5] seed k=%d 连续 %d 次评估失败，放弃该基线", k, tries)
+                self._v5_seed_queue.pop(0)
+                continue
+            self._v5_seed_tries[k] = tries + 1
+            b = arch.bin_of(floor if floor is not None else arch.lo)
+            self._v5_bin = arch.n_bins - 1 if b is None else b
+            self._v5_state_override = self._v5_dadda_state(k)
+            self._v5_seeding = True
+            self._v5_seed_k = k
+            break
+        if not self._v5_seeding:
+            self._v5_bin = episode_idx % arch.n_bins
+        _lo_e, hi_e = arch.bin_edges(self._v5_bin)
+        self.mred_budget = hi_e
+        self.mred_scale = hi_e
+        logging.info(
+            "[v5] ep %d bin=%d/%d pseudo_budget=%.3e%s archive=%d pts/%d bins",
+            episode_idx, self._v5_bin, arch.n_bins, hi_e,
+            f" SEED(dadda k={self._v5_seed_k})" if self._v5_seeding else "",
+            len(arch), arch.n_nonempty(),
+        )
+
+    def _v5_sample_parent_state(self):
+        """亲代：种子覆写优先；否则本集箱（空则最近非空箱）均匀取。档案全空返回 None
+        （reset 回退旧池路径，池里有初始 Dadda）。"""
+        if self._v5_state_override is not None:
+            st, self._v5_state_override = self._v5_state_override, None
+            return copy.deepcopy(st)
+        ent = self._v5_archive.sample_parent(self._v5_bin, random)
+        if ent is None:
+            return None
+        st = copy.deepcopy(ent["payload"]["ct"])
+        for kk in ("ct32", "ct22", "ct42"):
+            if st.get(kk) is not None:
+                st[kk] = np.asarray(st[kk], dtype=int)
+        return st
+
+    def _v5_admit_samples(self, sample_info_list):
+        """支配准入（替代 legacy found_best 标量更新）：每个实测过 mred 的样本按
+        (mred→箱, area, power) 进档案；无实测 mred（verilator 失败）不入箱。"""
+        arch = self._v5_archive
+        n_ok, n_skip = 0, 0
+        admitted_bins = []
+        for s in sample_info_list:
+            me = s.get("measured_error")
+            mred = (me or {}).get("mred")
+            if mred is None:
+                n_skip += 1
+                continue
+            summary = self._summarize_result(s["result"])
+            payload = {
+                "objective": s["objective"],
+                "connection": s["connection"],
+                "ct": copy.deepcopy(self.state),
+                "assignment": copy.deepcopy(self.assignment),
+                "simulated_result": s["result"],
+                "cell_types": copy.deepcopy(s.get("cell_types")),
+                "cell_type_info": copy.deepcopy(s.get("cell_type_info")),
+                "measured_error": copy.deepcopy(me),
+                "error_source": me.get("source", "verilator"),
+            }
+            payload["ct"]["k"] = int(self.trunc_cols)
+            if not s.get("cell_types"):
+                # exact-inject 基线等无 cell 样本：payload 结构如实反映该设计
+                # （state 的 cells 不属于它，作亲代复用时不应复活）
+                payload["ct"]["cells"] = []
+            payload.update({k2: summary[k2] for k2 in ("area", "delay", "power")})
+            ok, b = arch.add(mred, summary["area"], summary["power"], payload)
+            if ok:
+                n_ok += 1
+                admitted_bins.append(b)
+        if self._v5_seeding and self._v5_seed_k is not None and n_ok > 0:
+            # 种子评估成功 → 此刻才正式出队（配合 begin 的 peek+重试）
+            try:
+                self._v5_seed_queue.remove(self._v5_seed_k)
+            except ValueError:
+                pass
+        logging.info(
+            "[v5] admit %d/%d (no-mred skip %d) -> bins %s | archive=%d pts/%d bins",
+            n_ok, len(sample_info_list), n_skip, sorted(set(admitted_bins)),
+            len(arch), arch.n_nonempty(),
+        )
+
+    def _v5_representative(self):
+        """箱代表（供 legacy 日志/save/export 路径读 found_best_info）：当前箱内最小
+        面积条目，箱空则全档案最小面积条目。档案空返回 None（回退 _found_best_info）。"""
+        arch = getattr(self, "_v5_archive", None)
+        if arch is None or len(arch) == 0:
+            return None
+        ents = arch.bins.get(getattr(self, "_v5_bin", 0)) or []
+        ent = min(ents, key=lambda e: e["area"]) if ents else arch.global_min_area()
+        return ent["payload"] if ent is not None else None
+
+    def export_front(self, export_dir):
+        """导出整个前沿：每条目一个 k*/ 子目录（MUL.v + best_info.json），目录名以 k
+        开头以兼容 reeval_xa_glob_tmpbuild.py 的 k* glob；外加 front.json 清单。"""
+        assert getattr(self, "pareto_v5", False)
+        os.makedirs(export_dir, exist_ok=True)
+        n_exp = 0
+        for b in range(self._v5_archive.n_bins):
+            for j, e in enumerate(
+                sorted(self._v5_archive.bins[b], key=lambda x: x["area"])
+            ):
+                kk = int((e["payload"].get("ct") or {}).get("k", self.trunc_cols))
+                name = f"k{kk:02d}_bin{b:02d}_{j}"
+                try:
+                    self.export_best_candidate(
+                        os.path.join(export_dir, name), info=e["payload"]
+                    )
+                    n_exp += 1
+                except Exception as ex:  # noqa: BLE001
+                    logging.error("[v5] export %s failed: %s", name, ex)
+        with open(os.path.join(export_dir, "front.json"), "w") as f:
+            json.dump(self._v5_archive.snapshot(), f, indent=2,
+                      default=convert_to_serializable)
+        logging.info("[v5] front exported: %d designs -> %s", n_exp, export_dir)
+        return n_exp
 
     def _start_reset(self):
         self.initial_pp = get_initial_partial_product(
@@ -3947,15 +4485,28 @@ class CompressorRouting:
                 logging.error(f"Failed to load gomil: {e}")
 
     def reset(self):
-        pool_list = self.pool.get_pool()
-        logging.info(f"pool size: {len(pool_list)}")
-        if len(pool_list) == 0:
-            raise ValueError("Pool is empty, cannot reset environment.")
-        sampled_item = random.choice(pool_list)
-        random_objective, random_state = sampled_item
-
-        self.state = copy.deepcopy(random_state)
-        if self.outer_cell_search:
+        v5 = getattr(self, "pareto_v5", False)
+        v5_state = self._v5_sample_parent_state() if v5 else None
+        if v5_state is not None:
+            self.state = v5_state          # 已 deepcopy（种子覆写或档案亲代）
+        else:
+            pool_list = self.pool.get_pool()
+            logging.info(f"pool size: {len(pool_list)}")
+            if len(pool_list) == 0:
+                raise ValueError("Pool is empty, cannot reset environment.")
+            sampled_item = random.choice(pool_list)
+            random_objective, random_state = sampled_item
+            self.state = copy.deepcopy(random_state)
+        if v5:
+            # M0 k 线程化：k 是设计属性（state["k"]），激活其截断档（常数/资格窗/floor）
+            self.state.setdefault("k", int(self.trunc_cols))
+            self._activate_trunc_profile(self.state["k"])
+        if v5 and self._v5_seeding:
+            # 初始种群个体（不同 k 截断的 Dadda 树）：原样评估不变异——
+            # 这是论文可复现基线点本体，第 0 遍课程 = 逐 k 建阶梯
+            if self.outer_cell_search:
+                self.state.setdefault("cells", [])
+        elif self.outer_cell_search:
             self.state.setdefault("cells", [])
             self._outer_mutate()
             if self.outer_cell_solver == "greedy":

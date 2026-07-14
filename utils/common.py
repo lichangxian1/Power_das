@@ -128,5 +128,133 @@ class BoundedParetoPool:
         return not self._pool
 
 
+class ParetoArchive:
+    """v5 多目标档案（PARETO_ARITH_PLAN.md）：MRED 对数分箱 + 箱内 (area,power) 支配准入。
+
+    选择层零人工系数：谁存活只由支配关系决定。分箱 = mred 轴的 ε-支配网格（容量控制 +
+    全轴覆盖保证）；eps_power 是 DC 复跑噪声地板（测量分辨率，非偏好系数）——功耗差
+    落在分辨率内视为同值、由面积裁决。容量超限按 NSGA-II 拥挤度淘汰（两端极值保留）。
+    条目 = {"mred","area","power","payload"}；payload 与 found_best_info 同构（可导出）。"""
+
+    def __init__(self, mred_lo=1e-7, mred_hi=2e-1, bin_ratio=2.0, bin_cap=6,
+                 eps_power=0.01):
+        import math
+        if not (0 < mred_lo < mred_hi and bin_ratio > 1.0 and bin_cap >= 1):
+            raise ValueError(
+                f"ParetoArchive 参数非法: lo={mred_lo} hi={mred_hi} "
+                f"ratio={bin_ratio} cap={bin_cap}（cap 最小 1）")
+        self.lo, self.hi = float(mred_lo), float(mred_hi)
+        self.ratio, self.cap = float(bin_ratio), int(bin_cap)
+        self.eps = float(eps_power)
+        self.n_bins = max(1, int(math.ceil(
+            math.log(self.hi / self.lo) / math.log(self.ratio) - 1e-9)))
+        self.bins = {i: [] for i in range(self.n_bins)}
+
+    def bin_of(self, mred):
+        """mred → 箱号；超上限返回 None（档案范围外），低于下限归 0 箱。"""
+        import math
+        if mred is None or mred > self.hi:
+            return None
+        if mred <= self.lo:
+            return 0
+        b = int(math.log(mred / self.lo) / math.log(self.ratio))
+        return min(b, self.n_bins - 1)
+
+    def bin_edges(self, b):
+        return (self.lo * self.ratio ** b,
+                min(self.hi, self.lo * self.ratio ** (b + 1)))
+
+    def _dominates(self, a, c):
+        """a 支配 c？功耗轴按 eps 相对量化（分辨率内=同值）。"""
+        tol = self.eps * min(a["power"], c["power"])
+        if not (a["area"] <= c["area"] and a["power"] <= c["power"] + tol):
+            return False
+        return a["area"] < c["area"] or a["power"] < c["power"] - tol
+
+    def add(self, mred, area, power, payload):
+        """支配准入。返回 (admitted, bin)；bin=None 表示 mred 超范围/指标非法。
+        area<=0 或 power<0 视为异常测量拒收（负 power 会使 ε 容差为负，
+        重复点无限入档——07-13 双评审发现）。"""
+        if area is None or power is None or area <= 0 or power < 0:
+            return False, None
+        b = self.bin_of(mred)
+        if b is None:
+            return False, None
+        cand = {"mred": float(mred), "area": float(area),
+                "power": float(power), "payload": payload}
+        for e in self.bins[b]:
+            if self._dominates(e, cand):
+                return False, b
+            if (e["area"] == cand["area"]
+                    and abs(e["power"] - cand["power"]) <= self.eps * cand["power"]):
+                return False, b   # 分辨率内重复点
+        kept = [e for e in self.bins[b] if not self._dominates(cand, e)]
+        kept.append(cand)
+        while len(kept) > self.cap:
+            kept = self._evict_most_crowded(kept)
+        self.bins[b] = kept
+        return any(e is cand for e in kept), b
+
+    @staticmethod
+    def _evict_most_crowded(ents):
+        """NSGA-II 拥挤度淘汰：按 area 排序，两端极值免死，删中间最挤的。
+        cap=1 时（仅剩 2 个极值仍超容量）保面积最小者，避免死循环。"""
+        ents = sorted(ents, key=lambda e: (e["area"], e["power"]))
+        if len(ents) <= 2:
+            return ents[:1]
+        ar = max(ents[-1]["area"] - ents[0]["area"], 1e-12)
+        pw = [e["power"] for e in ents]
+        pr = max(max(pw) - min(pw), 1e-12)
+        crowd = {
+            i: (ents[i + 1]["area"] - ents[i - 1]["area"]) / ar
+               + abs(ents[i - 1]["power"] - ents[i + 1]["power"]) / pr
+            for i in range(1, len(ents) - 1)
+        }
+        j = min(crowd, key=lambda i: (crowd[i], i))
+        return ents[:j] + ents[j + 1:]
+
+    def nearest_nonempty(self, b):
+        """b 空则向外找最近非空箱（同距先取更紧/更低 mred 的一侧）。"""
+        if self.bins.get(b):
+            return b
+        for d in range(1, self.n_bins):
+            for bb in (b - d, b + d):
+                if 0 <= bb < self.n_bins and self.bins[bb]:
+                    return bb
+        return None
+
+    def sample_parent(self, b, rng):
+        """从箱 b（空则最近非空箱）均匀取一个条目；档案全空返回 None。"""
+        bb = self.nearest_nonempty(b)
+        if bb is None:
+            return None
+        return rng.choice(self.bins[bb])
+
+    def global_min_area(self):
+        ents = [e for es in self.bins.values() for e in es]
+        return min(ents, key=lambda e: e["area"]) if ents else None
+
+    def snapshot(self):
+        """front.json 用的轻量快照（不含 payload 大字段）。"""
+        out = []
+        for b in range(self.n_bins):
+            lo, hi = self.bin_edges(b)
+            for e in sorted(self.bins[b], key=lambda x: x["area"]):
+                ct = (e["payload"] or {}).get("ct") or {}
+                out.append({
+                    "bin": b, "edge_lo": lo, "edge_hi": hi,
+                    "mred": e["mred"], "area": e["area"], "power": e["power"],
+                    "k": int(ct.get("k", -1)),
+                    "n_cells": len(ct.get("cells") or []),
+                })
+        return out
+
+    def n_nonempty(self):
+        return sum(1 for es in self.bins.values() if es)
+
+    def __len__(self):
+        return sum(len(es) for es in self.bins.values())
+
+
 def lse_gamma(x: torch.Tensor, gamma: float, dim: int = -1):
     return gamma * torch.logsumexp(x / gamma, dim=dim)

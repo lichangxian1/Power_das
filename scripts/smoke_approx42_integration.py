@@ -49,7 +49,7 @@ def build_trainer(extra):
         "use_ct42": True,
         "approx42_library_path": SEL42,
         "approx42_rtl_path": RTL42,
-        "approx42_max_types": 13,
+        "approx42_max_types": 20,
         "trunc_cols": K,
         "num_episodes": 3, "num_samples": 2, "n_processing": 1,
     })
@@ -91,14 +91,14 @@ def promote_ct42(exp, n_target=3):
 # ============ A. loader ============
 exp = build_trainer({})
 t42 = exp.type_table_42
-assert len(t42) == 13, f"T42 size {len(t42)}"
+assert len(t42) == 20, f"T42 size {len(t42)}"
 assert t42[0]["group"] == "exact" and t42[0]["name"] == "CT42"
 assert abs(t42[0]["area"] - 17.304) < 1e-6, f"exact anchor area {t42[0]['area']}"
-assert all(e["name"].startswith("comp42n_") for e in t42[1:])
+assert all(e["name"].startswith("comp42") for e in t42[1:])
 assert exp._ct42_native4_names.issuperset({e["name"] for e in t42[1:]})
 waes = [e["wae"] for e in t42[1:]]
 assert waes == sorted(waes), "approx42 应按 wae 升序"
-print(f"A. loader OK: 13 types, exact area={t42[0]['area']}, wae∈[{waes[0]:.3f},{waes[-1]:.3f}]")
+print(f"A. loader OK: 20 types, exact area={t42[0]['area']}, wae∈[{waes[0]:.3f},{waes[-1]:.3f}]")
 
 # ============ B. 内环 ============
 n42 = promote_ct42(exp, 3)

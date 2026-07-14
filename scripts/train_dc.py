@@ -38,6 +38,24 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def _parse_ks(spec):
+    """'2-30' / '2,4,8' / 混合 '2-6,12' → 排序去重的 int 列表。
+    空串/反向区间直接报错（否则会静默退回默认全集 k2-30，改变实验语义）。"""
+    ks = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = (int(x) for x in part.split("-"))
+            if a > b:
+                raise SystemExit(f"--pareto_seed_ks 反向区间: {part!r}")
+            ks.update(range(a, b + 1))
+        elif part:
+            ks.add(int(part))
+    if not ks:
+        raise SystemExit(f"--pareto_seed_ks 解析为空: {spec!r}")
+    return sorted(ks)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="configs/config_groups/mul_16_and_approx_p2p1.yaml")
@@ -46,6 +64,8 @@ def main():
     p.add_argument("--samples", type=int, default=None)
     p.add_argument("--save_freq", type=int, default=None,
                    help="每多少轮存一次 best 结构 checkpoint（防中途停丢结构；默认用 config 的 100）")
+    p.add_argument("--front_dump_freq", type=int, default=None,
+                   help="v5 前沿回放快照频率（每 N ep 写 logs/front_hist/front_epNNNN.json，trainer 默认 5，0=关）")
     p.add_argument("--n_processing", type=int, default=None)
     p.add_argument("--med_budget", type=float, default=None)
     p.add_argument("--error_scale", type=float, default=None,
@@ -64,6 +84,17 @@ def main():
                    help="MRED 软罚预算(分数，如 0.005=0.5%%)；error_metric=mred 时生效")
     p.add_argument("--mred_scale", type=float, default=0.01,
                    help="MRED 软罚归一分母(默认 0.01，使超额 0.01 → 罚 1.0)")
+    # ── v5 多目标（PARETO_ARITH_PLAN.md）：混合 k 种群 + 非支配档案。需 --error_metric mred。
+    p.add_argument("--pareto_v5", action="store_true",
+                   help="v5：mred 对数分箱 + 箱内(area,power)支配准入，初始种群=不同k截断Dadda树")
+    p.add_argument("--pareto_mred_lo", type=float, default=1e-7, help="v5 档案 mred 下限")
+    p.add_argument("--pareto_mred_hi", type=float, default=2e-1, help="v5 档案 mred 上限")
+    p.add_argument("--pareto_bin_ratio", type=float, default=2.0, help="v5 分箱对数间距")
+    p.add_argument("--pareto_bin_cap", type=int, default=6, help="v5 每箱容量（拥挤度淘汰）")
+    p.add_argument("--pareto_eps_power", type=float, default=0.01,
+                   help="v5 功耗支配分辨率（DC 复跑噪声地板，非偏好系数）")
+    p.add_argument("--pareto_seed_ks", default="2-30",
+                   help="v5 初始种群截断深度集合，如 '2-30' 或 '2,4,8,12'")
     p.add_argument("--target_delay", type=float, default=1.5, help="DC 时钟周期 (ns)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--device", default=None)
@@ -92,6 +123,18 @@ def main():
                    help="求解器 MC 向量池（默认 16M；MRED 重尾需 16M 校准）")
     p.add_argument("--outer_solver_cache", type=str, default=None,
                    help="求解器向量池缓存目录（跨 episode 复用；默认 build_dir/solver_pool）")
+    p.add_argument("--outer_zero_ops", action="store_true",
+                   help="M2 批量 ZERO 算子：zero-col 整列填 ZERO（=分数截断一步）/unzero-col 反向；"
+                        "跳过闭式预算过滤（解析对边界列 ZERO 失真 3.7×），可行性交给 TT oracle/errgate/v5 档案")
+    p.add_argument("--outer_p_zero", type=float, default=None,
+                   help="变异骰子里 zero 算子权重（默认 trainer 内置 0.15）")
+    p.add_argument("--outer_tt_oracle", action="store_true",
+                   help="M2 TT oracle 预筛：sample-0 布线上张量化仿真器实测 cell 配置 mred"
+                        "（与 16M 闸门同流位精确，秒级）取代 verilator 预筛门；超上限二分前缀摘除。"
+                        "v5 上限=档案 mred 上限（伪预算内外都放行落箱竞争），预算模式上限=mred_budget")
+    p.add_argument("--approx_cardinality_choices", type=str, default=None,
+                   help="resample-K 基数集合（逗号分隔，默认 0,1,2,4,8,16；"
+                        "v5+M2 建议扩到 0,1,2,4,8,16,32,64 解锁密集包）")
     p.add_argument("--outer_solver_margin", type=float, default=None,
                    help="求解余量：解到 budget×margin（默认 0.9）。greedy 包对 sample-0 布线过拟合"
                         "(+3~5%%),贴线填充会让其余样本大面积越线报废")
@@ -169,6 +212,16 @@ def main():
         tk["outer_errgate_max_repairs"] = args.outer_errgate_max_repairs
     if args.outer_cell_solver is not None:
         tk["outer_cell_solver"] = args.outer_cell_solver
+    if args.outer_zero_ops:
+        tk["outer_zero_ops"] = True
+    if args.outer_p_zero is not None:
+        tk["outer_p_zero"] = args.outer_p_zero
+    if args.outer_tt_oracle:
+        tk["outer_tt_oracle"] = True
+    if args.approx_cardinality_choices is not None:
+        tk["approx_cardinality_choices"] = [
+            int(x) for x in args.approx_cardinality_choices.split(",")
+        ]
     if args.outer_solver_vectors is not None:
         tk["outer_solver_vectors"] = args.outer_solver_vectors
     if args.outer_solver_cache is not None:
@@ -188,6 +241,8 @@ def main():
         tk["num_samples"] = args.samples
     if args.save_freq is not None:
         tk["save_freq"] = args.save_freq
+    if args.front_dump_freq is not None:
+        tk["front_dump_freq"] = args.front_dump_freq
     if args.n_processing is not None:
         tk["n_processing"] = args.n_processing
         tk["n_full_target_delay_processing"] = args.n_processing
@@ -246,7 +301,20 @@ def main():
         if getattr(exp, "trunc_cols", 0) > 0:
             exp._trunc_bits = {}
             exp._setup_truncation()
+    if args.pareto_v5:
+        if args.error_metric != "mred":
+            raise SystemExit("--pareto_v5 需要 --error_metric mred")
+        exp.enable_pareto_v5(
+            mred_lo=args.pareto_mred_lo,
+            mred_hi=args.pareto_mred_hi,
+            bin_ratio=args.pareto_bin_ratio,
+            bin_cap=args.pareto_bin_cap,
+            eps_power=args.pareto_eps_power,
+            seed_ks=_parse_ks(args.pareto_seed_ks),
+        )
     exp.run_experiment()
+    if args.pareto_v5:
+        exp.export_front(os.path.join(run_dir, "front"))
     rtl = exp.export_best_candidate(run_dir)
     logging.info("done. best RTL -> %s", rtl)
 

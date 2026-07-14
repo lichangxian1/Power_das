@@ -4,6 +4,7 @@ from .common import (
     one_hot_encoder,
     convert_to_serializable,
     BoundedParetoPool,
+    ParetoArchive,
     lse_gamma,
 )
 from .template import *

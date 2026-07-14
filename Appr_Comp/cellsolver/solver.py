@@ -38,13 +38,11 @@ class SlotSpace:
     def __init__(self, exp, tree, device="cpu"):
         self.device = device
         lib, lib42 = load_libs()
-        self.exact_area = {}
-        for name, c in lib.items():
-            if c.get("is_exact"):
-                self.exact_area[{"32": 0, "22": 1}[c["type"]]] = float(c["area"])
-        anchors = (lib42.get("meta") or {}).get("anchors") or {}
-        if "CT42_BAL" in anchors:
-            self.exact_area[4] = float(anchors["CT42_BAL"].get("area") or 0.0)
+        # exact 锚点用**原生标准单元**口径(T28 LEF: FA1D0/HA1D0;CT42≈2×FA1D0)。
+        # standalone 表征锚点(FA=10.92/HA=8.74)是 SOP 单独综合口径,虚高 3.8-4×,
+        # 会把面积节省放大同倍(H1 定罪,OUTER_CELL_SEARCH.md §3.2.6);greedy 的
+        # saving 打分/日志自此为真实口径(近似侧仍为 standalone 标称,略保守)。
+        self.exact_area = {0: 2.856, 1: 2.184, 4: 5.712}
 
         tables = {0: exp.type_table_32, 1: exp.type_table_22,
                   4: exp.type_table_42 or []}
@@ -61,9 +59,9 @@ class SlotSpace:
                 else:
                     cell = (lib42["cells"] if t == 4 else lib)[entry["name"]]
                     luts = S.approx_luts_from_lib(t, cell)
-                    area = float(entry.get("area") or cell.get("area") or 0.0)
-                    if not area:
-                        area = self.exact_area.get(t, 0.0)  # 无表征 → 零收益中性
+                    # 区分"未表征"(None→exact 锚点中性) 与"真 0 面积"(ZERO cell 合法)
+                    raw = entry.get("area", cell.get("area"))
+                    area = self.exact_area.get(t, 0.0) if raw is None else float(raw)
                 outs = [luts["sum"], luts["carry"]] + ([luts["cout"]] if t == 4 else [])
                 tts.append(np.stack(outs, axis=1))  # [2^n, n_out]
                 areas.append(area)
@@ -71,6 +69,15 @@ class SlotSpace:
                 torch.from_numpy(np.stack(tts)).to(torch.float32).to(device),
                 torch.tensor(areas, dtype=torch.float64, device=device),
             )
+
+        # 锥体清扫标记：输出对全部输入模式恒定的 cell（sum/carry/cout 全常数）——
+        # DC 常数传播会删掉其上游逻辑锥→省功耗。功耗贪心内部打不了分(Q1),此标记
+        # 只作 greedy_add 的 pref_const 偏好权重(面积↔功耗旋钮),真实功耗差由 DC+XA 揭示。
+        self.const_kind = {}
+        for t, (tt, _areas) in self.stacks.items():
+            for k in range(tt.shape[0]):
+                block = tt[k]  # [2^n, n_out]
+                self.const_kind[(t, k)] = bool((block == block[0:1]).all())
 
         # 合法 slot：树上 t∈{0,1,4} 且列在近似资格带、有候选表
         self.slots = []
@@ -317,17 +324,20 @@ class GradientCellSolver:
         return cfg, hist
 
     # -------------------------------------------------------- ③ 贪心加法基线
-    def greedy_add(self, log=print, rescore_tol=0.7, upgrade=True):
+    def greedy_add(self, log=print, rescore_tol=0.7, upgrade=True, pref_const=1.0):
         """实测口径的 lazy greedy：从 floor 出发，按 面积节省/实测Δmred 性价比加 cell。
         打分用 gate_fast（S12-only，秒级），验收用完整 gate；lazy 堆——弹出堆顶先
         用当前配置重测其 Δ，仍居前才接受（捕捉 cell 间交互）。
         upgrade=False 跳过升级扫描（训练内鲁棒模式用：贴线换面积的增量会被跨布线
-        修复摘除,白做,省 ~1/3 求解时间）。"""
+        修复摘除,白做,省 ~1/3 求解时间）。
+        pref_const>1 = 面积↔功耗旋钮：把锥体清扫型 cell(const_kind)的性价比乘以此
+        权重,推动 greedy 优先选恒定输出 cell(面积略大但 DC 删锥体省功耗);=1 为面积最优。"""
         import heapq
         cfg = {}
         gm = self.gate_mred(cfg)
         base_fast = self.gate_fast(cfg)
-        log(f"[greedy] floor mred={gm:.3e} util={gm/self.budget:6.1%}")
+        log(f"[greedy] floor mred={gm:.3e} util={gm/self.budget:6.1%} "
+            f"pref_const={pref_const:g}")
         heap = []
         for node, t, _col in self.space.slots:
             _tt, areas = self.space.stacks[t]
@@ -337,6 +347,8 @@ class GradientCellSolver:
                     continue
                 dm = self.gate_fast({node: (t, k)}) - base_fast
                 ratio = saving / max(dm, 1e-12) if dm > 0 else float("inf")
+                if pref_const != 1.0 and self.space.const_kind.get((t, k)):
+                    ratio *= pref_const
                 heapq.heappush(heap, (-ratio, dm, node, t, k, saving))
         n_eval = len(heap)
         used = set()
@@ -348,6 +360,8 @@ class GradientCellSolver:
             cur_fast = self.gate_fast(cfg)
             dm_new = self.gate_fast({**cfg, node: (t, k)}) - cur_fast
             ratio_new = saving / max(dm_new, 1e-12) if dm_new > 0 else float("inf")
+            if pref_const != 1.0 and self.space.const_kind.get((t, k)):
+                ratio_new *= pref_const
             if heap and dm_new > 0 and ratio_new < -heap[0][0] * rescore_tol:
                 heapq.heappush(heap, (-ratio_new, dm_new, node, t, k, saving))
                 continue
