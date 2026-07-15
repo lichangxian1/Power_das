@@ -95,9 +95,12 @@ def dadda_staircase(runs):
     return sorted(ks.values())
 
 
-def pack_run(name, group, cl, cd, snaps):
+def pack_run(name, group, cl, cd, snaps, static=False):
+    if static:                      # 只保留最终快照，且回放全程恒显（静态参照）
+        last = max(snaps)
+        snaps = {last: snaps[last]}
     return {
-        "name": name, "group": group, "cl": cl, "cd": cd,
+        "name": name, "group": group, "cl": cl, "cd": cd, "static": static,
         "snaps": [{"ep": ep,
                    "pts": [[e["mred"], e["area"], e["power"],
                             e.get("k", -1), e.get("n_cells", -1), e.get("bin", -1)]
@@ -112,7 +115,15 @@ def main():
     ap.add_argument("out", nargs="?", default=None)
     ap.add_argument("--compare", action="append", default=[],
                     metavar="LABEL=PATH", help="叠加对照 run（可重复），如 greedy=outputs/xxx")
+    ap.add_argument("--compare_final", action="append", default=[],
+                    metavar="LABEL=PATH",
+                    help="叠加对照 run 但只画其最终前沿（静态参照线，回放全程恒显）")
     ap.add_argument("--trunc_dir", default="outputs/2026-07-09_mred_trunc_baseline")
+    ap.add_argument("--dadda_json", default="outputs/dadda_seed_staircase.json",
+                    help="持久化种子阶梯 JSON（种子=教科书构造，跨战役通用；温启动 run"
+                         "自己不评种子，一律从这里取。空串=退回从快照提取。新冷启动战役"
+                         "覆盖新 k 时用 README 里的导出命令重生成，不自动写回——温启动"
+                         "run 的零 cell 点是搜索成果，混入会污染种子口径）")
     a = ap.parse_args()
     out = a.out or os.path.join(a.root, "front_viewer.html")
 
@@ -120,8 +131,11 @@ def main():
     if not main_runs:
         raise SystemExit(f"未在 {a.root} 下找到任何 front.json / front_ep*.json")
 
-    data = {"title": os.path.basename(a.root.rstrip("/")), "runs": [],
-            "groups": [{"key": "GA", "label": "v5 GA 合并前沿 (seg 并集非支配)",
+    title = os.path.basename(a.root.rstrip("/"))
+    main_label = title.split("_")[-2] if "_" in title else title   # 如 v6/v5r2
+    data = {"title": title, "runs": [],
+            "groups": [{"key": "GA",
+                        "label": f"{main_label} 合并前沿 (seg 并集非支配)",
                         "cl": MAIN_FRONT[0], "cd": MAIN_FRONT[1]}],
             "baselines": []}
     for i, (name, snaps) in enumerate(main_runs):
@@ -129,28 +143,43 @@ def main():
         data["runs"].append(pack_run(name, "GA", cl, cd, snaps))
         print(f"  GA/{name}: {len(snaps)} snapshots, ep {min(snaps)}..{max(snaps)}")
 
-    for j, spec in enumerate(a.compare):
+    all_for_dadda = list(main_runs)
+    specs = ([(s, False) for s in a.compare]
+             + [(s, True) for s in a.compare_final])
+    for j, (spec, final_only) in enumerate(specs):
         label, _, path = spec.partition("=")
         if not path:
             raise SystemExit(f"--compare 需要 LABEL=PATH 形式，收到: {spec}")
         cl, cd = CMP_COLORS[j % len(CMP_COLORS)]
-        data["groups"].append({"key": label, "label": f"{label} 前沿",
+        data["groups"].append({"key": label,
+                               "label": f"{label} 最终前沿" if final_only
+                               else f"{label} 前沿",
                                "cl": cl, "cd": cd})
         cruns = collect_runs(path)
         if not cruns:
             print(f"  [warn] 对照 {label} 目录无快照，跳过: {path}")
             continue
+        all_for_dadda.extend(cruns)
         for name, snaps in cruns:
             rname = label if len(cruns) == 1 else f"{label}:{name}"
-            data["runs"].append(pack_run(rname, label, cl, cd, snaps))
+            data["runs"].append(pack_run(rname, label, cl, cd, snaps,
+                                         static=final_only))
             print(f"  {label}/{name}: {len(snaps)} snapshots, "
-                  f"ep {min(snaps)}..{max(snaps)}")
+                  f"ep {min(snaps)}..{max(snaps)}"
+                  + ("  [仅最终]" if final_only else ""))
 
-    dd = dadda_staircase(main_runs)
+    # 种子阶梯：持久化 JSON 为准（种子 = 教科书确定性构造，跨战役通用；温启动 run
+    # 自己不评种子）。不从当前快照自动并入——温启动 run 的零 cell 点是搜索成果，
+    # 不是种子，混入即污染口径。JSON 缺失才退回从快照提取（冷启动 run 可用）。
+    if a.dadda_json and os.path.exists(a.dadda_json):
+        dd = sorted(json.load(open(a.dadda_json))["pts"], key=lambda p: p[0])
+    else:
+        dd = dadda_staircase(all_for_dadda)
     if dd:
         data["baselines"].append({"name": "纯截断 Dadda 种子 (首次入档)", "kind": "dadda",
                                   "cl": GRAY[0], "cd": GRAY[1], "pts": dd})
-        print(f"  baseline Dadda: {len(dd)} pts")
+        print(f"  baseline Dadda: {len(dd)} pts "
+              f"(k{dd[0][3]:02d}..k{dd[-1][3]:02d})")
     ta = load_trunc_arith(a.trunc_dir)
     if ta:
         data["baselines"].append({"name": "纯截断 arith (mred C*)", "kind": "arith",
@@ -261,9 +290,14 @@ const col = r => dark.matches ? r.cd : r.cl;
 document.getElementById("title").textContent = "v5 前沿回放 — " + DATA.title;
 document.title = "v5 front replay — " + DATA.title;
 
-/* ---- ep 轴：全系列快照 ep 的并集；每系列取 <=当前ep 的最新快照 ---- */
-const epList = [...new Set(DATA.runs.flatMap(r => r.snaps.map(s => s.ep)))].sort((a,b)=>a-b);
-const snapAt = (r, ep) => { let s = null; for (const x of r.snaps) { if (x.ep <= ep) s = x; else break; } return s; };
+/* ---- ep 轴：非静态系列快照 ep 的并集；每系列取 <=当前ep 的最新快照；
+        static 系列（仅最终参照）恒显最后一帧、不参与时间轴 ---- */
+const epList = [...new Set(DATA.runs.filter(r => !r.static)
+  .flatMap(r => r.snaps.map(s => s.ep)))].sort((a,b)=>a-b);
+const snapAt = (r, ep) => {
+  if (r.static) return r.snaps[r.snaps.length - 1];
+  let s = null; for (const x of r.snaps) { if (x.ep <= ep) s = x; else break; } return s;
+};
 const groupRuns = g => DATA.runs.filter(r => r.group === g.key);
 const mergedPts = (g, ep) => groupRuns(g).flatMap(r => { const s = snapAt(r, ep); return s ? s.pts : []; });
 
@@ -363,6 +397,7 @@ function drawGhost() {
     p.ghostG.textContent = "";
     if (!showGhost.checked) continue;
     for (const g of DATA.groups) {
+      if (groupRuns(g).every(r => r.static)) continue;   // 静态组本体即最终前沿
       const env = envelope(mergedPts(g, last), p.yi);
       if (!env.length) continue;
       el("polyline", { points: env.map(q => X(q[0]) + "," + p.Y(q[p.yi])).join(" "),
@@ -385,16 +420,19 @@ function draw(idx) {
       if (!s) continue;
       for (const q of s.pts) {
         const x = X(q[0]), y = p.Y(q[p.yi]);
-        el("circle", { cx: x, cy: y, r: 3.5, fill: col(r),
-          stroke: css("--ring"), "stroke-width": 1.5 }, p.dataG);
+        el("circle", { cx: x, cy: y, r: r.static ? 3 : 3.5, fill: col(r),
+          stroke: css("--ring"), "stroke-width": 1.5,
+          opacity: r.static ? 0.4 : 1 }, p.dataG);       // 历史参照淡显
         hitPts.push({ svg: p.svg, x, y, run: r, pt: q, panel: p });
       }
     }
     for (const g of DATA.groups) {                 // 前沿线压在点上，不被圆点遮挡
       const env = envelope(mergedPts(g, ep), p.yi);
       if (!env.length) continue;
+      const isStatic = groupRuns(g).every(r => r.static);
       el("polyline", { points: env.map(q => X(q[0]) + "," + p.Y(q[p.yi])).join(" "),
-        fill: "none", stroke: col(g), "stroke-width": 2.5,
+        fill: "none", stroke: col(g), "stroke-width": isStatic ? 2 : 2.5,
+        opacity: isStatic ? 0.4 : 1,
         "stroke-linejoin": "round", "stroke-linecap": "round",
         "pointer-events": "none" }, p.dataG);
     }
@@ -422,7 +460,12 @@ function legend() {
   const lg = document.getElementById("legend"); lg.textContent = "";
   const item = (node, label) => { const s = document.createElement("span"); s.append(node, label); lg.appendChild(s); };
   const key = c => { const k = document.createElement("span"); k.className = "key"; k.style.borderTopColor = c; return k; };
-  for (const g of DATA.groups) item(key(col(g)), g.label);
+  for (const g of DATA.groups) {
+    const k = key(col(g));
+    const gr = groupRuns(g);
+    if (gr.length && gr.every(r => r.static)) k.style.opacity = 0.45;
+    item(k, g.label);
+  }
   for (const r of DATA.runs) {
     if (DATA.groups.some(g => g.key === r.group && g.key !== "GA")) continue;  // 对照组点色=线色，不重复列
     const d = document.createElement("span"); d.className = "dot"; d.style.background = col(r);

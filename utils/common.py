@@ -174,8 +174,14 @@ class ParetoArchive:
     def add(self, mred, area, power, payload):
         """支配准入。返回 (admitted, bin)；bin=None 表示 mred 超范围/指标非法。
         area<=0 或 power<0 视为异常测量拒收（负 power 会使 ε 容差为负，
-        重复点无限入档——07-13 双评审发现）。"""
-        if area is None or power is None or area <= 0 or power < 0:
+        重复点无限入档——07-13 双评审发现）。NaN/Inf 一律拒收（r2 审查 #2：
+        NaN 会在 bin_of 的 int(log) 处直接抛异常打崩训练，必须挡在门外）。"""
+        import math
+        if area is None or power is None or mred is None:
+            return False, None
+        if not all(math.isfinite(float(x)) for x in (mred, area, power)):
+            return False, None
+        if mred < 0 or area <= 0 or power < 0:
             return False, None
         b = self.bin_of(mred)
         if b is None:
@@ -254,6 +260,58 @@ class ParetoArchive:
 
     def __len__(self):
         return sum(len(es) for es in self.bins.values())
+
+
+class OpBandit:
+    """V6-R2：按 (箱, 臂) 条件化的 Thompson 采样骰子（Beta-Bernoulli + 滑动窗口）。
+
+    观测 = 该 (箱, 臂) 的一个 episode 是否产生 ≥1 入档（二值；admit 数不进观测，
+    避免种子期大丰收把先验拉爆）。窗口 W 丢弃陈旧观测——箱会饱和，产出非平稳。
+    保底探索：以 floor×len(可用臂) 概率均匀抽臂，保证每臂选中概率 ≥floor。
+    r2 依据：keep 臂 33% 预算 ↔ 20% 产出；zero 臂尾箱冠军/低箱必亏——臂的好坏
+    强依赖箱位置，静态概率必然全局次优（V6_SEARCH_PLAN.md §R2）。"""
+
+    def __init__(self, arms, window=12, floor=0.05):
+        if not arms or window < 1 or not (0 <= floor * len(arms) < 1):
+            raise ValueError(f"OpBandit 参数非法: arms={arms} window={window} floor={floor}")
+        self.arms = list(arms)
+        self.window = int(window)
+        self.floor = float(floor)
+        self.hist = {}   # (bin, arm) -> [0/1,...] 最近 window 个
+
+    def choose(self, b, available, rng):
+        """rng = np.random.Generator。available 为本轮可用臂子集（如箱内无同 k
+        第二亲本时 crossover 不可用）。返回臂名；无可用臂返回 None。"""
+        avail = [a for a in self.arms if a in available]
+        if not avail:
+            return None
+        if rng.random() < self.floor * len(avail):
+            return avail[int(rng.integers(len(avail)))]
+        best, best_v = None, -1.0
+        for a in avail:
+            h = self.hist.get((int(b), a), [])
+            wins = sum(h)
+            v = float(rng.beta(1 + wins, 1 + len(h) - wins))
+            if v > best_v:
+                best, best_v = a, v
+        return best
+
+    def update(self, b, arm, success):
+        h = self.hist.setdefault((int(b), str(arm)), [])
+        h.append(1 if success else 0)
+        del h[:-self.window]
+
+    def stats_of(self, b, arm):
+        h = self.hist.get((int(b), str(arm)), [])
+        return sum(h), len(h)
+
+    def to_json(self):
+        return {f"{b}|{a}": h for (b, a), h in self.hist.items()}
+
+    def load(self, d):
+        for key, h in (d or {}).items():
+            b, a = key.split("|", 1)
+            self.hist[(int(b), a)] = [int(x) for x in h][-self.window:]
 
 
 def lse_gamma(x: torch.Tensor, gamma: float, dim: int = -1):

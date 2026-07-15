@@ -5,6 +5,7 @@ from .common import (
     convert_to_serializable,
     BoundedParetoPool,
     ParetoArchive,
+    OpBandit,
     lse_gamma,
 )
 from .template import *

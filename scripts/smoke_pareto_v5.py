@@ -22,8 +22,8 @@ import torch
 from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from trainer.arith_das import CompressorRouting  # noqa: E402
-from utils.common import ParetoArchive  # noqa: E402
+from trainer.arith_das_v5 import CompressorRouting  # noqa: E402  # v6 起以 v5 精简模块为准
+from utils.common import OpBandit, ParetoArchive  # noqa: E402
 from utils.compressor_tree import CompressorTree  # noqa: E402
 
 PD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -319,6 +319,248 @@ def t5():
     exp.pareto_v5 = True
 
 
+# ────────────────────────── T6 V6-R2 OpBandit 单元 ──────────────────────────
+def t6():
+    b = OpBandit(["a", "b", "c"], window=5, floor=0.05)
+    rng = np.random.default_rng(0)
+    picks = {b.choose(0, ["a", "b", "c"], rng) for _ in range(60)}
+    check("T6.explore_all", picks == {"a", "b", "c"}, f"{picks}")
+    for _ in range(5):
+        b.update(0, "a", True)
+        b.update(0, "b", False)
+    wins = sum(1 for _ in range(200) if b.choose(0, ["a", "b"], rng) == "a")
+    check("T6.exploit", wins > 140, f"a_wins={wins}/200")
+    for _ in range(9):
+        b.update(1, "a", False)
+    check("T6.window_trim", b.stats_of(1, "a") == (0, 5))
+    picks2 = [b.choose(0, ["a", "c"], rng) for _ in range(300)]
+    check("T6.floor_explores", picks2.count("c") >= 3, f"c={picks2.count('c')}")
+    b2 = OpBandit(["a", "b", "c"], window=5, floor=0.05)
+    b2.load(b.to_json())
+    check("T6.persist_roundtrip",
+          b2.stats_of(0, "a") == b.stats_of(0, "a")
+          and b2.stats_of(1, "a") == (0, 5))
+    # 箱条件化：bin0 的统计不该泄漏到 bin7
+    check("T6.per_bin", b.stats_of(7, "a") == (0, 0))
+
+
+# ────────────────────────── T7 V6-R3 crossover 算子 ──────────────────────────
+def t7():
+    exp = build_trainer({"outer_cell_search": True, "outer_zero_ops": True,
+                         "outer_crossover": True, "outer_bandit": True,
+                         **MENU_SUBSTD}, "t7_xover")
+    exp.enable_pareto_v5(mred_lo=1e-7, mred_hi=2e-1, bin_ratio=2.0,
+                         bin_cap=4, eps_power=0.01, seed_ks=[12])
+    check("T7.bandit_built", exp._v5_bandit is not None
+          and set(exp._v5_bandit.arms) == {"keep", "cell", "resample", "zero",
+                                           "crossover"})
+    st = exp._v5_dadda_state(12)
+    exp.state = st
+    exp._activate_trunc_profile(12)
+    exp._v5_bin = 0
+    slots = sorted(exp._enumerate_type_slots(exp._current_assignment()))
+    check("T7.slots", len(slots) >= 3, f"n={len(slots)}")
+    cells_a = [list(slots[0]) + [1]]
+    cells_b = [list(slots[1]) + [1], list(slots[2]) + [1]]
+    ct_pl = {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in st.items()}
+    rng = np.random.default_rng(1)
+    # 克隆拒绝：唯一亲本与 A 同 cell 配置 → 任何掷法子代==A → None
+    ok, _ = exp._v5_archive.add(1.2e-7, 800.0, 9e-3,
+                                {"ct": {**ct_pl, "cells": [list(e) for e in cells_a]}})
+    check("T7.seed_entry_a", ok)
+    check("T7.clone_rejected",
+          exp._op_crossover([list(e) for e in cells_a], rng) is None)
+    # 异配置亲本：有限次掷骰内必产出合法且 ≠A 的子代
+    ok2, _ = exp._v5_archive.add(1.5e-7, 790.0, 9.1e-3,
+                                 {"ct": {**ct_pl, "cells": [list(e) for e in cells_b]}})
+    check("T7.seed_entry_b", ok2)
+    check("T7.candidates_same_k", len(exp._v5_crossover_candidates()) == 2)
+    slotset = {tuple(int(x) for x in s[:4]) for s in slots}
+    child = None
+    for sd in range(30):
+        child = exp._op_crossover([list(e) for e in cells_a],
+                                  np.random.default_rng(sd))
+        if child is not None:
+            break
+    check("T7.child_found", child is not None)
+    if child is not None:
+        check("T7.child_slots_legal",
+              all(tuple(int(x) for x in e[:4]) in slotset for e in child))
+        check("T7.child_not_clone",
+              {tuple(int(x) for x in e) for e in child}
+              != {tuple(int(x) for x in e) for e in cells_a})
+    # 零 cell 判定 helper
+    kz = exp._zero_entry_of(0)
+    check("T7.is_zero_cell", exp._is_zero_cell(list(slots[0][:4]) + [kz])
+          and not exp._is_zero_cell(list(slots[0][:4]) + [1]))
+    # 三级放宽（07-15）：②同箱近 k（异 k 亲本列坐标重映射）③相邻箱近 k
+    ok3, _ = exp._v5_archive.add(9e-7, 780.0, 8.9e-3,
+                                 {"ct": {**ct_pl, "k": 13,
+                                         "cells": [list(e) for e in cells_b]}})
+    check("T7.seed_entry_k13_bin3", ok3)
+    exp._v5_bin = 3   # 箱内只有 k13 条目，A 仍是 k12 → 走 tier2
+    t2 = exp._v5_crossover_candidates()
+    check("T7.tier2_near_k", len(t2) == 1 and t2[0][1] == 13)
+    child2 = None
+    for sd in range(30):
+        child2 = exp._op_crossover([list(e) for e in cells_a],
+                                   np.random.default_rng(sd))
+        if child2 is not None:
+            break
+    check("T7.tier2_child_legal", child2 is not None
+          and all(tuple(int(x) for x in e[:4]) in slotset for e in child2))
+    exp._v5_bin = 2   # 空箱 → 相邻箱(1,3)里找 → tier3 命中 bin3 的 k13
+    t3 = exp._v5_crossover_candidates()
+    check("T7.tier3_adjacent_bin", len(t3) == 1 and t3[0][1] == 13)
+    exp._v5_bin = 0
+    # 骰子接入：bandit 路径整轮 _outer_mutate 可跑，臂归因落位
+    exp.state = exp._v5_dadda_state(12)
+    exp._activate_trunc_profile(12)
+    exp._outer_mutate()
+    check("T7.mutate_attributed",
+          exp._outer_last_op in ("keep", "cell", "resample", "zero", "crossover"),
+          f"op={exp._outer_last_op}")
+    # 归因回填：admit 后 bandit 该臂有观测（fake_sample 需重建图——reset 同款）
+    from trainer.arith_das_v5 import CompressorGraph  # noqa: E402
+    exp.assignment = exp._current_assignment()
+    exp.comp_graph = CompressorGraph(exp.initial_pp, exp.assignment,
+                                     num_node_types=exp.num_node_types)
+    exp._refresh_episode_cell_types()
+    s1 = fake_sample(exp, 1.8e-7, 780.0, 8.9e-3)
+    exp._v5_seeding = False
+    exp.update_found_best_info([s1])
+    w, n = exp._v5_bandit.stats_of(exp._v5_bin, exp._outer_last_op)
+    check("T7.bandit_updated", n >= 1, f"(w,n)=({w},{n})")
+
+
+# ────────────────────────── T8 V6 温启动 front_state 加载 ──────────────────────────
+def t8():
+    import json as _json
+    exp = build_trainer({"outer_cell_search": True, "outer_bandit": True,
+                         **MENU_SUBSTD}, "t8_warm")
+    exp.enable_pareto_v5(mred_lo=1e-7, mred_hi=2e-1, bin_ratio=2.0,
+                        bin_cap=4, eps_power=0.01, seed_ks=[2, 8, 12])
+    st8 = exp._v5_dadda_state(8)
+    ct_pl = {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in st8.items()}
+    blob = {"episode": 479,
+            "bins": {"3": [{"mred": 5.0e-6, "area": 800.0, "power": 9e-3,
+                            "payload": {"ct": ct_pl}}]},
+            "bandit": {"0|cell": [1, 1, 0]}}
+    p = os.path.join(SP, "t8_warm", "front_state.json")
+    with open(p, "w") as f:
+        _json.dump(blob, f)
+    n = exp.v5_load_front_state(p)
+    check("T8.loaded", n == 1 and len(exp._v5_archive) == 1)
+    check("T8.seed_pruned", exp._v5_seed_queue == [2, 12],
+          f"{exp._v5_seed_queue}")
+    check("T8.bandit_restored", exp._v5_bandit.stats_of(0, "cell") == (2, 3))
+    # 温启动亲本可直接采样（JSON 数组→np 还原）
+    exp._v5_bin = 3
+    st = exp._v5_sample_parent_state()
+    check("T8.parent_sampleable", st is not None
+          and isinstance(st["ct32"], np.ndarray) and st["k"] == 8)
+    # isfinite 防线（r2 审查 #2）：NaN/Inf 一律拒收且不抛异常
+    ok_nan, _ = exp._v5_archive.add(float("nan"), 700.0, 8e-3, {})
+    ok_inf, _ = exp._v5_archive.add(1e-5, float("inf"), 8e-3, {})
+    check("T8.nan_rejected", not ok_nan and not ok_inf)
+    # 真实 r2 档案全量载入（本地已拉取的 480ep 战果）
+    real = f"{PD}/outputs/2026-07-13_v5r2_np2/seg_hi/logs/front_state.json"
+    if os.path.exists(real):
+        e2 = build_trainer({"outer_cell_search": True, **MENU_SUBSTD}, "t8_real")
+        e2.enable_pareto_v5(mred_lo=2.5e-4, mred_hi=2e-1, bin_ratio=2.0,
+                            bin_cap=8, eps_power=0.01,
+                            seed_ks=list(range(12, 25)))
+        n2 = e2.v5_load_front_state(real)
+        check("T8.real_load", n2 >= 10 and e2._v5_archive.n_nonempty() >= 8,
+              f"n={n2} bins={e2._v5_archive.n_nonempty()}")
+        # 忠实续跑：r2 收官时 seed_queue=[]（课程已完成），r3 不复活已判定种子
+        check("T8.real_seeds_inherited", e2._v5_seed_queue == [],
+              f"{e2._v5_seed_queue}")
+        e2._v5_bin = 5
+        stq = e2._v5_sample_parent_state()
+        check("T8.real_parent", stq is not None and "cells" in stq
+              and isinstance(stq["ct32"], np.ndarray))
+        # r3 首个 save 实测回归：温启动 payload 的 assignment 必须可哈希
+        # （save 期 CompressorGraph / 终局 export 同路径）
+        from trainer.arith_das_v5 import CompressorGraph  # noqa: E402
+        ent = next(e for es in e2._v5_archive.bins.values() for e in es
+                   if (e["payload"] or {}).get("assignment"))
+        cg = CompressorGraph(e2.initial_pp, ent["payload"]["assignment"],
+                             num_node_types=e2.num_node_types)
+        check("T8.warm_assignment_hashable", cg.vertex_list is not None)
+        exp_dir = os.path.join(SP, "t8_real", "export_one")
+        e2.export_best_candidate(exp_dir, info=ent["payload"])
+        check("T8.warm_export_rtl",
+              os.path.exists(os.path.join(exp_dir, "MUL.v")))
+    else:
+        print("  (skip T8.real_*: 本地无 r2 front_state)")
+
+
+# ────────────────────────── T9 V6-R1 单集多配置 ──────────────────────────
+def t9():
+    # 静态骰子锁死 cell 臂（p 其余为 0），多掷必然全走同一算子
+    exp = build_trainer({"outer_cell_search": True, "outer_multi_config": 4,
+                         "outer_p_struct": 0.0, "outer_p_cell": 1.0,
+                         "outer_p_resample": 0.0, "outer_p_zero": 0.0,
+                         **MENU_SUBSTD}, "t9_multi")
+    exp.enable_pareto_v5(mred_lo=1e-7, mred_hi=2e-1, bin_ratio=2.0,
+                         bin_cap=4, eps_power=0.01, seed_ks=[12])
+    exp.state = exp._v5_dadda_state(12)
+    exp._activate_trunc_profile(12)
+    exp._v5_bin = 0
+    exp._v5_seeding = False
+    exp._outer_mutate()
+    cfgs = exp._episode_cell_configs
+    keys = [frozenset(tuple(int(x) for x in e) for e in c) for c in cfgs]
+    check("T9.multi_rolled", 2 <= len(cfgs) <= 4, f"G={len(cfgs)}")
+    check("T9.distinct", len(set(keys)) == len(cfgs))
+    check("T9.state_is_cfg0",
+          [list(map(int, e)) for e in exp.state["cells"]]
+          == [list(map(int, e)) for e in cfgs[0]])
+    # 逐组映射：reset 同款建图后各组独立成映射，组0 = 兼容视图
+    from trainer.arith_das_v5 import CompressorGraph  # noqa: E402
+    exp.assignment = exp._current_assignment()
+    exp.comp_graph = CompressorGraph(exp.initial_pp, exp.assignment,
+                                     num_node_types=exp.num_node_types)
+    unmapped = exp._refresh_episode_cell_groups()
+    check("T9.groups_mapped", unmapped == 0
+          and len(exp._episode_ct_groups) == len(cfgs)
+          and exp._episode_cell_types == exp._episode_ct_groups[0])
+    # keep 臂恒单组（多掷无意义）
+    exp2 = build_trainer({"outer_cell_search": True, "outer_multi_config": 4,
+                          "outer_p_struct": 1.0, "outer_p_cell": 0.0,
+                          "outer_p_resample": 0.0, "outer_p_zero": 0.0,
+                          **MENU_SUBSTD}, "t9_keep")
+    exp2.enable_pareto_v5(mred_lo=1e-7, mred_hi=2e-1, bin_ratio=2.0,
+                          bin_cap=4, eps_power=0.01, seed_ks=[12])
+    exp2.state = exp2._v5_dadda_state(12)
+    exp2._activate_trunc_profile(12)
+    exp2._v5_bin = 0
+    exp2._v5_seeding = False
+    exp2._outer_mutate()
+    check("T9.keep_single", len(exp2._episode_cell_configs) == 1)
+    # admit 保真：分组样本的 payload ct.cells = 本组配置（非 state 组0）
+    exp._v5_seeding = False
+    s1 = fake_sample(exp, 3.0e-7, 780.0, 8.9e-3)
+    s1["cell_types"] = {"9": (0, 1)}
+    s1["cell_type_info"] = {"mode": "outer", "cfg_group": 1}
+    s1["outer_cells"] = [list(map(int, e)) for e in cfgs[min(1, len(cfgs) - 1)]]
+    exp._v5_admit_samples([s1])
+    ent = next(e for es in exp._v5_archive.bins.values() for e in es)
+    check("T9.payload_group_cells",
+          [list(map(int, e)) for e in ent["payload"]["ct"]["cells"]]
+          == s1["outer_cells"])
+    # advantage 组内归一：组间位差不得进相对信号；单样本组回退全批
+    fake = [{"objective": o, "cell_type_info": {"mode": "outer", "cfg_group": g}}
+            for g, o in [(0, 1.0), (0, 3.0), (1, 10.0), (1, 14.0), (2, 99.0)]]
+    st = exp._adv_group_stats(fake)
+    check("T9.adv_groupwise",
+          abs(st[0][0] - 2.0) < 1e-9 and abs(st[1][0] - 12.0) < 1e-9)
+    allv = np.array([1.0, 3.0, 10.0, 14.0, 99.0])
+    check("T9.adv_singleton_fallback",
+          abs(st[2][0] - float(allv.mean())) < 1e-9)
+
+
 if __name__ == "__main__":
     t0()
     t1()
@@ -326,5 +568,9 @@ if __name__ == "__main__":
     t3()
     t4()
     t5()
+    t6()
+    t7()
+    t8()
+    t9()
     print("\n" + ("ALL PASS ✅" if not FAILS else f"FAILED ❌: {FAILS}"))
     sys.exit(1 if FAILS else 0)

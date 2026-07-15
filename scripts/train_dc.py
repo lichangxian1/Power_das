@@ -123,6 +123,20 @@ def main():
                    help="求解器 MC 向量池（默认 16M；MRED 重尾需 16M 校准）")
     p.add_argument("--outer_solver_cache", type=str, default=None,
                    help="求解器向量池缓存目录（跨 episode 复用；默认 build_dir/solver_pool）")
+    p.add_argument("--outer_crossover", action="store_true",
+                   help="V6-R3 档案内杂交臂：同箱同 k 取第二亲本，cell 配置逐槽位均匀重组；"
+                        "含零 cell 子代跳过闭式预算（同 M2 语义），交 TT oracle/档案准入")
+    p.add_argument("--outer_p_crossover", type=float, default=None,
+                   help="静态骰子下 crossover 臂权重（默认 0.2；--outer_bandit 时无效）")
+    p.add_argument("--outer_bandit", action="store_true",
+                   help="V6-R2 bandit 骰子：按 (箱,臂) Thompson 采样自适应选变异臂"
+                        "（观测=该臂 episode 是否 ≥1 入档，滑窗 12，每臂保底 5%%）")
+    p.add_argument("--outer_multi_config", type=int, default=None,
+                   help="V6-R1 单集多配置：被选臂多掷产出 G 个去重 cell 配置，布线样本"
+                        "按组均分逐组过 TT 门，advantage 组内归一（默认 1=旧行为）")
+    p.add_argument("--v5_warm_state", default=None,
+                   help="V6 温启动：已完成 run 的 logs/front_state.json——全量档案重准入，"
+                        "已覆盖 k 的种子不再重评（须同 bit_width/encode_type/菜单）")
     p.add_argument("--outer_zero_ops", action="store_true",
                    help="M2 批量 ZERO 算子：zero-col 整列填 ZERO（=分数截断一步）/unzero-col 反向；"
                         "跳过闭式预算过滤（解析对边界列 ZERO 失真 3.7×），可行性交给 TT oracle/errgate/v5 档案")
@@ -216,6 +230,14 @@ def main():
         tk["outer_zero_ops"] = True
     if args.outer_p_zero is not None:
         tk["outer_p_zero"] = args.outer_p_zero
+    if args.outer_crossover:
+        tk["outer_crossover"] = True
+    if args.outer_p_crossover is not None:
+        tk["outer_p_crossover"] = args.outer_p_crossover
+    if args.outer_bandit:
+        tk["outer_bandit"] = True
+    if args.outer_multi_config is not None:
+        tk["outer_multi_config"] = args.outer_multi_config
     if args.outer_tt_oracle:
         tk["outer_tt_oracle"] = True
     if args.approx_cardinality_choices is not None:
@@ -312,6 +334,10 @@ def main():
             eps_power=args.pareto_eps_power,
             seed_ks=_parse_ks(args.pareto_seed_ks),
         )
+        if args.v5_warm_state:
+            exp.v5_load_front_state(args.v5_warm_state)
+    elif args.v5_warm_state:
+        raise SystemExit("--v5_warm_state 需要 --pareto_v5")
     exp.run_experiment()
     if args.pareto_v5:
         exp.export_front(os.path.join(run_dir, "front"))
