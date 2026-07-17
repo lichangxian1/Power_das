@@ -142,6 +142,9 @@ def main():
         cl, cd = DOT_COLORS[i % len(DOT_COLORS)]
         data["runs"].append(pack_run(name, "GA", cl, cd, snaps))
         print(f"  GA/{name}: {len(snaps)} snapshots, ep {min(snaps)}..{max(snaps)}")
+    if not any(s["pts"] for r in data["runs"] for s in r["snaps"]):
+        print("  [warn] 主战役全部快照为空（档案 0 条目）——图里不会有主前沿线/档案点，"
+              "先查训练日志的 admit 行是否恒 0")
 
     all_for_dadda = list(main_runs)
     specs = ([(s, False) for s in a.compare]

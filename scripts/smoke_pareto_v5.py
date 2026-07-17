@@ -431,6 +431,16 @@ def t7():
     exp.update_found_best_info([s1])
     w, n = exp._v5_bandit.stats_of(exp._v5_bin, exp._outer_last_op)
     check("T7.bandit_updated", n >= 1, f"(w,n)=({w},{n})")
+    # codex 弱点1回归：仅 all-exact 保底样本入档的一集 → 臂记输不记赢
+    # （旧口径 n_ok>0 会把 baseline 的入档算成臂的胜利）
+    w0, n0 = exp._v5_bandit.stats_of(exp._v5_bin, exp._outer_last_op)
+    sb = fake_sample(exp, 1.2e-7, 700.0, 8.0e-3)   # 支配 s1，必入档
+    sb["baseline_only"] = True
+    sb["candidate_kind"] = "all_exact"
+    exp._v5_admit_samples([sb])
+    w1, n1 = exp._v5_bandit.stats_of(exp._v5_bin, exp._outer_last_op)
+    check("T7.baseline_not_arm_win", (w1, n1) == (w0, n0 + 1),
+          f"({w0},{n0})→({w1},{n1})")
 
 
 # ────────────────────────── T8 V6 温启动 front_state 加载 ──────────────────────────
@@ -561,6 +571,52 @@ def t9():
           abs(st[2][0] - float(allv.mean())) < 1e-9)
 
 
+# ────────────────────────── T10 binless 无箱消融 ──────────────────────────
+def t10():
+    from utils.common import ParetoArchive
+    a = ParetoArchive(mred_lo=1e-7, mred_hi=2e-1, bin_ratio=2.0, bin_cap=4,
+                      eps_power=0.01, binless=True)
+    check("T10.single_bin", a.n_bins == 1 and a.bin_edges(0) == (1e-7, 2e-1))
+    # 3 目标支配：低误差大面积 与 高误差小面积 互不支配（分箱前提下会互杀）
+    ok1, _ = a.add(1e-6, 900.0, 13e-3, {"ct": {"k": 4}})
+    ok2, _ = a.add(1e-2, 300.0, 4e-3, {"ct": {"k": 18}})
+    check("T10.incomparable_coexist", ok1 and ok2 and len(a) == 2)
+    # 全维劣势被拒；mred 更优不算"重复点"
+    ok3, _ = a.add(2e-6, 950.0, 14e-3, {})          # 全劣于第一条
+    ok4, _ = a.add(5e-7, 900.0, 13e-3, {"ct": {}})  # 同 area/power 但 mred 更优
+    check("T10.dominated_rejected", not ok3)
+    check("T10.better_mred_not_dup", ok4)
+    # 容量淘汰：3D 拥挤度 log-mred 归一——各轴极值免死
+    for i in range(30):
+        a.add(10 ** (-6.5 + i * 0.15), 880.0 - i * 18.0, (13 - i * 0.3) * 1e-3,
+              {"ct": {"k": i}})
+    ents = [e for es in a.bins.values() for e in es]
+    check("T10.cap_respected", len(ents) <= 4, f"n={len(ents)}")
+    ms = sorted(e["mred"] for e in ents)
+    check("T10.extremes_survive", ms[0] <= 1e-6 and ms[-1] >= 1e-2,
+          f"[{ms[0]:.1e}, {ms[-1]:.1e}]")
+    # 调度：binless begin_episode 伪预算跟亲代 mred 走
+    exp = build_trainer({"outer_cell_search": True, "outer_bandit": True,
+                         **MENU_SUBSTD}, "t10_binless")
+    exp.enable_pareto_v5(mred_lo=1e-7, mred_hi=2e-1, bin_ratio=2.0,
+                         bin_cap=40, eps_power=0.01, seed_ks=[12],
+                         binless=True)
+    check("T10.enabled", exp._v5_binless and exp._v5_archive.binless)
+    st12 = exp._v5_dadda_state(12)
+    ct_pl = {k: (v.tolist() if hasattr(v, "tolist") else v)
+             for k, v in st12.items()}
+    exp._v5_seed_queue = []          # 跳过种子集，直测亲代路径
+    okp, _ = exp._v5_archive.add(3e-4, 700.0, 9e-3, {"ct": ct_pl})
+    check("T10.parent_seeded", okp)
+    exp._v5_begin_episode(0)
+    check("T10.budget_follows_parent",
+          abs(exp.mred_budget - 6e-4) < 1e-9, f"budget={exp.mred_budget:.3e}")
+    check("T10.parent_override_set", exp._v5_state_override is not None
+          and int(exp._v5_state_override["k"]) == 12)
+    stp = exp._v5_sample_parent_state()
+    check("T10.parent_np", isinstance(stp["ct32"], np.ndarray))
+
+
 if __name__ == "__main__":
     t0()
     t1()
@@ -572,5 +628,6 @@ if __name__ == "__main__":
     t7()
     t8()
     t9()
+    t10()
     print("\n" + ("ALL PASS ✅" if not FAILS else f"FAILED ❌: {FAILS}"))
     sys.exit(1 if FAILS else 0)

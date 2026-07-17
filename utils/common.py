@@ -137,7 +137,7 @@ class ParetoArchive:
     条目 = {"mred","area","power","payload"}；payload 与 found_best_info 同构（可导出）。"""
 
     def __init__(self, mred_lo=1e-7, mred_hi=2e-1, bin_ratio=2.0, bin_cap=6,
-                 eps_power=0.01):
+                 eps_power=0.01, binless=False):
         import math
         if not (0 < mred_lo < mred_hi and bin_ratio > 1.0 and bin_cap >= 1):
             raise ValueError(
@@ -146,8 +146,14 @@ class ParetoArchive:
         self.lo, self.hi = float(mred_lo), float(mred_hi)
         self.ratio, self.cap = float(bin_ratio), int(bin_cap)
         self.eps = float(eps_power)
-        self.n_bins = max(1, int(math.ceil(
-            math.log(self.hi / self.lo) / math.log(self.ratio) - 1e-9)))
+        # binless 消融（07-16 用户裁定实验）：单箱 + 支配升维到 (mred,area,power)
+        # 三目标 + 3D 拥挤度淘汰。cap 语义变为全档案总容量（对照组 = n_bins×cap）。
+        self.binless = bool(binless)
+        if self.binless:
+            self.n_bins = 1
+        else:
+            self.n_bins = max(1, int(math.ceil(
+                math.log(self.hi / self.lo) / math.log(self.ratio) - 1e-9)))
         self.bins = {i: [] for i in range(self.n_bins)}
 
     def bin_of(self, mred):
@@ -155,20 +161,29 @@ class ParetoArchive:
         import math
         if mred is None or mred > self.hi:
             return None
-        if mred <= self.lo:
+        if self.binless or mred <= self.lo:
             return 0
         b = int(math.log(mred / self.lo) / math.log(self.ratio))
         return min(b, self.n_bins - 1)
 
     def bin_edges(self, b):
+        if self.binless:
+            return (self.lo, self.hi)
         return (self.lo * self.ratio ** b,
                 min(self.hi, self.lo * self.ratio ** (b + 1)))
 
     def _dominates(self, a, c):
-        """a 支配 c？功耗轴按 eps 相对量化（分辨率内=同值）。"""
+        """a 支配 c？功耗轴按 eps 相对量化（分辨率内=同值）。
+        binless：mred 作为第三目标进支配（分箱模式下 mred 由箱离散化承担，
+        不进箱内比较；无箱后必须显式比，否则低误差端会被小面积设计灭绝）。"""
         tol = self.eps * min(a["power"], c["power"])
         if not (a["area"] <= c["area"] and a["power"] <= c["power"] + tol):
             return False
+        if self.binless:
+            if a["mred"] > c["mred"]:
+                return False
+            return (a["mred"] < c["mred"] or a["area"] < c["area"]
+                    or a["power"] < c["power"] - tol)
         return a["area"] < c["area"] or a["power"] < c["power"] - tol
 
     def add(self, mred, area, power, payload):
@@ -192,12 +207,14 @@ class ParetoArchive:
             if self._dominates(e, cand):
                 return False, b
             if (e["area"] == cand["area"]
-                    and abs(e["power"] - cand["power"]) <= self.eps * cand["power"]):
-                return False, b   # 分辨率内重复点
+                    and abs(e["power"] - cand["power"]) <= self.eps * cand["power"]
+                    and (not self.binless or e["mred"] <= cand["mred"])):
+                return False, b   # 分辨率内重复点（binless：mred 更优不算重复）
         kept = [e for e in self.bins[b] if not self._dominates(cand, e)]
         kept.append(cand)
         while len(kept) > self.cap:
-            kept = self._evict_most_crowded(kept)
+            kept = (self._evict_most_crowded_3d(kept) if self.binless
+                    else self._evict_most_crowded(kept))
         self.bins[b] = kept
         return any(e is cand for e in kept), b
 
@@ -218,6 +235,33 @@ class ParetoArchive:
         }
         j = min(crowd, key=lambda i: (crowd[i], i))
         return ents[:j] + ents[j + 1:]
+
+    def _evict_most_crowded_3d(self, ents):
+        """binless 淘汰：NSGA-II 拥挤度在 (log10 mred, area, power) 三维上计算。
+        mred 取对数（跨 6 个数量级，线性拥挤度会把整个低误差端挤成一个点——
+        binless 消融的成败就在这一处归一化）。每个目标的两端极值拥挤度 = inf
+        免死，删总拥挤度最小者；全 inf（≤6 点）退化为保面积序前缀。"""
+        import math
+        if len(ents) <= 2:
+            return ents[:1] if len(ents) > self.cap else ents
+        keys = {
+            "m": lambda e: math.log10(max(e["mred"], self.lo * 1e-3)),
+            "a": lambda e: e["area"],
+            "p": lambda e: e["power"],
+        }
+        crowd = {id(e): 0.0 for e in ents}
+        for kf in keys.values():
+            srt = sorted(ents, key=kf)
+            rng = max(kf(srt[-1]) - kf(srt[0]), 1e-12)
+            crowd[id(srt[0])] = crowd[id(srt[-1])] = float("inf")
+            for i in range(1, len(srt) - 1):
+                crowd[id(srt[i])] += (kf(srt[i + 1]) - kf(srt[i - 1])) / rng
+        finite = [e for e in ents if crowd[id(e)] != float("inf")]
+        if not finite:
+            srt = sorted(ents, key=lambda e: (e["area"], e["power"]))
+            return srt[:self.cap]
+        victim = min(finite, key=lambda e: crowd[id(e)])
+        return [e for e in ents if e is not victim]
 
     def nearest_nonempty(self, b):
         """b 空则向外找最近非空箱（同距先取更紧/更低 mred 的一侧）。"""

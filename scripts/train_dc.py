@@ -91,6 +91,9 @@ def main():
     p.add_argument("--pareto_mred_hi", type=float, default=2e-1, help="v5 档案 mred 上限")
     p.add_argument("--pareto_bin_ratio", type=float, default=2.0, help="v5 分箱对数间距")
     p.add_argument("--pareto_bin_cap", type=int, default=6, help="v5 每箱容量（拥挤度淘汰）")
+    p.add_argument("--pareto_binless", action="store_true",
+                   help="无箱消融（07-16）：全局 3 目标支配档案 + 3D 拥挤度；"
+                        "bin_cap 语义变为总容量，伪预算=亲代 mred×ratio")
     p.add_argument("--pareto_eps_power", type=float, default=0.01,
                    help="v5 功耗支配分辨率（DC 复跑噪声地板，非偏好系数）")
     p.add_argument("--pareto_seed_ks", default="2-30",
@@ -333,6 +336,7 @@ def main():
             bin_cap=args.pareto_bin_cap,
             eps_power=args.pareto_eps_power,
             seed_ks=_parse_ks(args.pareto_seed_ks),
+            binless=args.pareto_binless,
         )
         if args.v5_warm_state:
             exp.v5_load_front_state(args.v5_warm_state)
