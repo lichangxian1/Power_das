@@ -1,0 +1,94 @@
+#!/bin/bash
+# 监控三阶段训练的持久化前沿；每出现一个新快照就重建四图 HTML。
+# 用法: bash scripts/watch_three_stage_visual.sh [RUN_NAME]
+set -euo pipefail
+cd /home/lichangxian/Power_das
+
+RUN=${1:-2026-07-19_arith_three_stage_quiet}
+INTERVAL=${VISUAL_WATCH_INTERVAL:-30}
+STALE_SECONDS=${VISUAL_WATCH_STALE_SECONDS:-7200}
+RUN_DIR="outputs/$RUN"
+HIST_DIR="$RUN_DIR/stage3/front_hist"
+CONFIG_PATH="$RUN_DIR/three_stage_config.json"
+PID_FILE="$RUN_DIR/stage3/visual_watch.pid"
+WATCH_LOCK="$RUN_DIR/stage3/visual_watch.lock"
+REBUILD_LOCK="/tmp/power_das_visual_rebuild.lock"
+
+[ -d "$HIST_DIR" ] || { echo "Stage 3 快照目录不存在: $HIST_DIR"; exit 1; }
+[ -f "$CONFIG_PATH" ] || { echo "三阶段配置不存在: $CONFIG_PATH"; exit 1; }
+
+exec 8>"$WATCH_LOCK"
+if ! flock -n 8; then
+  echo "已有 visual 监控在运行: $RUN"
+  exit 0
+fi
+printf '%s\n' "$$" > "$PID_FILE"
+
+cleanup() {
+  if [ -f "$PID_FILE" ] && [ "$(sed -n '1p' "$PID_FILE")" = "$$" ]; then
+    rm -f "$PID_FILE"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+TARGET=$(python3 - "$CONFIG_PATH" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    config = json.load(handle)
+print(int(config.get("stage3_elites", 24))
+      * int(config.get("stage3_episodes_per_elite", 5)))
+PY
+)
+TARGET_SNAPSHOT=$(printf '%s/front_gen%04d.json' "$HIST_DIR" "$TARGET")
+
+latest_signature() {
+  find "$HIST_DIR" -maxdepth 1 -type f -name 'front_gen*.json' \
+    -printf '%f:%s:%T@\n' | sort | tail -n 1
+}
+
+rebuild() {
+  echo "[$(date '+%F %T')] $1，重建 visual"
+  if flock -w 55 "$REBUILD_LOCK" env MAIN="$RUN" bash scripts/visual.sh; then
+    echo "[$(date '+%F %T')] visual 已更新"
+  else
+    echo "[$(date '+%F %T')] [warn] visual 重建失败，下一轮重试" >&2
+    return 1
+  fi
+}
+
+last_signature=""
+last_checkpoint_mtime=0
+last_progress=$(date +%s)
+rebuild "监控启动"
+
+while true; do
+  signature=$(latest_signature)
+  now=$(date +%s)
+  if [ "$signature" != "$last_signature" ]; then
+    [ -z "$last_signature" ] || rebuild "检测到新快照: ${signature%%:*}"
+    last_signature="$signature"
+    last_progress="$now"
+  fi
+
+  checkpoint="$RUN_DIR/stage3/checkpoint.pt"
+  if [ -f "$checkpoint" ]; then
+    checkpoint_mtime=$(stat -c %Y "$checkpoint")
+    if (( checkpoint_mtime > last_checkpoint_mtime )); then
+      last_checkpoint_mtime="$checkpoint_mtime"
+      last_progress="$now"
+    fi
+  fi
+
+  if [ -f "$TARGET_SNAPSHOT" ]; then
+    echo "[$(date '+%F %T')] 已到 Stage 3 目标 $TARGET，监控结束"
+    exit 0
+  fi
+
+  if (( now - last_progress > STALE_SECONDS )); then
+    echo "[$(date '+%F %T')] 超过 $STALE_SECONDS 秒无 checkpoint/快照更新，监控退出" >&2
+    exit 1
+  fi
+  sleep "$INTERVAL"
+done

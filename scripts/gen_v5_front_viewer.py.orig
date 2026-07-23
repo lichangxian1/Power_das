@@ -389,17 +389,6 @@ TEMPLATE = r"""<!doctype html>
               align-items: center; gap: 5px; cursor: pointer; }
   .legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 0 2px 10px;
             color: var(--text-2); font-size: 12.5px; }
-  .legend .line-toggle { display: inline-flex; align-items: center; border: 0;
-                         border-radius: 6px; padding: 3px 6px; margin: -3px -6px;
-                         color: inherit; background: transparent; font: inherit;
-                         cursor: pointer; transition: color .12s, background .12s,
-                         opacity .12s; }
-  .legend .line-toggle:hover { color: var(--text-1); background: var(--grid); }
-  .legend .line-toggle:focus-visible { outline: 2px solid #2a78d6;
-                                       outline-offset: 2px; }
-  .legend .line-toggle.active { color: var(--text-1); background: var(--grid);
-                                font-weight: inherit; }
-  .legend.has-focus .line-toggle:not(.active) { opacity: 0.5; }
   .legend .key { display: inline-block; width: 18px; height: 0;
                  border-top: 2.5px solid; vertical-align: middle; margin-right: 6px;
                  border-radius: 2px; }
@@ -434,7 +423,7 @@ TEMPLATE = r"""<!doctype html>
 <div class="sub">拖动进度条回放训练档案（ParetoArchive 快照）。每组一条前沿线
 （组内各 seg 并集非支配），档案点按子线着色；背景 = 纯截断基线（灰=Dadda 种子
 首次入档，紫=arith）。x 轴 = verilator 实测 MRED（log）；面积/功耗为环内 DC 口径，
-XA 终审另算。点击图例中的线名称可聚焦，再次点击恢复。</div>
+XA 终审另算。</div>
 
 <div class="ctrl">
   <button id="play">▶ 播放</button>
@@ -458,13 +447,6 @@ const DATA = __DATA__;
 const NS = "http://www.w3.org/2000/svg";
 const dark = matchMedia("(prefers-color-scheme: dark)");
 const col = r => dark.matches ? r.cd : r.cl;
-const groupLineId = g => "group:" + g.key;
-const baselineLineId = b => "baseline:" + b.kind + ":" + b.name;
-let focusedLine = null;
-const isFocused = id => focusedLine === id;
-const fadedByFocus = id => focusedLine !== null && !isFocused(id);
-const focusOrder = (items, idOf) => [...items].sort((a, b) =>
-  Number(isFocused(idOf(a))) - Number(isFocused(idOf(b))));
 
 document.getElementById("title").textContent = "v5 前沿回放 — " + DATA.title;
 document.title = "v5 front replay — " + DATA.title;
@@ -475,7 +457,6 @@ const epList = [...new Set(DATA.runs.filter(r => !r.static)
   .flatMap(r => r.snaps.map(s => s.ep)))].sort((a,b)=>a-b);
 const snapAt = (r, ep) => {
   if (r.static) return r.snaps[r.snaps.length - 1];
-  if (r.active_until != null && ep >= r.active_until) return null;
   let s = null; for (const x of r.snaps) { if (x.ep <= ep) s = x; else break; } return s;
 };
 const groupRuns = g => DATA.runs.filter(r => r.group === g.key);
@@ -484,14 +465,7 @@ const mergedPts = (g, ep) => groupRuns(g).flatMap(r => { const s = snapAt(r, ep)
 /* ---- 全局定轴（含基线点，回放期间坐标不动） ---- */
 const all = DATA.runs.flatMap(r => r.snaps.flatMap(s => s.pts))
   .concat(DATA.baselines.flatMap(b => b.pts));
-// Do not spread the full replay history into Math.min/Math.max. Long-running
-// campaigns can exceed the browser's function-argument limit and leave the
-// embedded viewer blank before the first SVG is drawn.
-let xmin = Infinity, xmax = -Infinity;
-for (const q of all) {
-  if (q[0] < xmin) xmin = q[0];
-  if (q[0] > xmax) xmax = q[0];
-}
+const xmin = Math.min(...all.map(p => p[0])), xmax = Math.max(...all.map(p => p[0]));
 const PANELS = [
   { svg: document.getElementById("svg0"), yi: 1, sc: 1,    unit: "µm²" },
   { svg: document.getElementById("svg1"), yi: 2, sc: 1000, unit: "mW"  },
@@ -499,13 +473,8 @@ const PANELS = [
 const M = { l: 62, r: 18, t: 10, b: 44 }, W = 640, H = 430;
 const lx = Math.log10, X = v => M.l + (lx(v) - lx(xmin)) / (lx(xmax) - lx(xmin)) * (W - M.l - M.r);
 for (const p of PANELS) {
-  let lo = Infinity, hi = -Infinity;
-  for (const q of all) {
-    const value = q[p.yi] * p.sc;
-    if (value < lo) lo = value;
-    if (value > hi) hi = value;
-  }
-  const pad = (hi - lo) * 0.06 || 1;
+  const ys = all.map(q => q[p.yi] * p.sc);
+  const lo = Math.min(...ys), hi = Math.max(...ys), pad = (hi - lo) * 0.06 || 1;
   p.y0 = Math.max(0, lo - pad); p.y1 = hi + pad;
   p.Y = v => H - M.b - (v * p.sc - p.y0) / (p.y1 - p.y0) * (H - M.t - M.b);
 }
@@ -563,23 +532,19 @@ function drawBaselines() {
   staticHits = [];
   for (const p of PANELS) {
     p.baseG.textContent = "";
-    for (const b of focusOrder(DATA.baselines, baselineLineId)) {
+    for (const b of DATA.baselines) {
       const c = col(b);
-      const id = baselineLineId(b), focus = isFocused(id), faded = fadedByFocus(id);
       el("polyline", { points: b.pts.map(q => X(q[0]) + "," + p.Y(q[p.yi])).join(" "),
-        fill: "none", stroke: c, "stroke-width": 1.8,
-        opacity: focus ? 1 : faded ? 0.14 : 0.55,
+        fill: "none", stroke: c, "stroke-width": 1.8, opacity: 0.55,
         "stroke-linejoin": "round", "stroke-linecap": "round" }, p.baseG);
       for (const q of b.pts) {
         const x = X(q[0]), y = p.Y(q[p.yi]);
         if (b.kind === "dadda")
           el("circle", { cx: x, cy: y, r: 3, fill: css("--panel"),
-            stroke: c, "stroke-width": 1.5,
-            opacity: focus ? 1 : faded ? 0.14 : 0.7 }, p.baseG);
+            stroke: c, "stroke-width": 1.5, opacity: 0.7 }, p.baseG);
         else
-          el("rect", { x: x - 2.8, y: y - 2.8,
-            width: 5.6, height: 5.6, rx: 1.5,
-            fill: c, opacity: focus ? 1 : faded ? 0.14 : 0.7 }, p.baseG);
+          el("rect", { x: x - 2.8, y: y - 2.8, width: 5.6, height: 5.6, rx: 1.5,
+            fill: c, opacity: 0.7 }, p.baseG);
         staticHits.push({ svg: p.svg, x, y, base: b, pt: q, panel: p });
       }
     }
@@ -592,14 +557,12 @@ function drawGhost() {
   for (const p of PANELS) {
     p.ghostG.textContent = "";
     if (!showGhost.checked) continue;
-    for (const g of focusOrder(DATA.groups, groupLineId)) {
+    for (const g of DATA.groups) {
       if (groupRuns(g).every(r => r.static)) continue;   // 静态组本体即最终前沿
       const env = envelope(mergedPts(g, last), p.yi);
       if (!env.length) continue;
-      const id = groupLineId(g), focus = isFocused(id), faded = fadedByFocus(id);
       el("polyline", { points: env.map(q => X(q[0]) + "," + p.Y(q[p.yi])).join(" "),
-        fill: "none", stroke: col(g), "stroke-width": 2.5,
-        opacity: focus ? 0.48 : faded ? 0.08 : 0.25,
+        fill: "none", stroke: col(g), "stroke-width": 2.5, opacity: 0.25,
         "stroke-linejoin": "round", "stroke-linecap": "round" }, p.ghostG);
     }
   }
@@ -616,24 +579,21 @@ function draw(idx) {
     for (const r of DATA.runs) {
       const s = snapAt(r, ep);
       if (!s) continue;
-      const id = "group:" + r.group;
-      const faded = fadedByFocus(id);
       for (const q of s.pts) {
         const x = X(q[0]), y = p.Y(q[p.yi]);
         el("circle", { cx: x, cy: y, r: r.static ? 2.6 : 2, fill: col(r),
           stroke: css("--ring"), "stroke-width": 0.8,
-          opacity: faded ? 0.16 : r.static ? 0.4 : 1 }, p.dataG); // 历史参照淡显
+          opacity: r.static ? 0.4 : 1 }, p.dataG);       // 历史参照淡显
         hitPts.push({ svg: p.svg, x, y, run: r, pt: q, panel: p });
       }
     }
-    for (const g of focusOrder(DATA.groups, groupLineId)) { // 聚焦线最后画，保持在最上层
+    for (const g of DATA.groups) {                 // 前沿线压在点上，不被圆点遮挡
       const env = envelope(mergedPts(g, ep), p.yi);
       if (!env.length) continue;
       const isStatic = groupRuns(g).every(r => r.static);
-      const id = groupLineId(g), focus = isFocused(id), faded = fadedByFocus(id);
       el("polyline", { points: env.map(q => X(q[0]) + "," + p.Y(q[p.yi])).join(" "),
         fill: "none", stroke: col(g), "stroke-width": isStatic ? 2 : 2.5,
-        opacity: focus ? 1 : faded ? 0.16 : isStatic ? 0.4 : 1,
+        opacity: isStatic ? 0.4 : 1,
         "stroke-linejoin": "round", "stroke-linecap": "round",
         "pointer-events": "none" }, p.dataG);
     }
@@ -660,24 +620,12 @@ function draw(idx) {
 function legend() {
   const lg = document.getElementById("legend"); lg.textContent = "";
   const item = (node, label) => { const s = document.createElement("span"); s.append(node, label); lg.appendChild(s); };
-  const lineItem = (node, label, id) => {
-    const button = document.createElement("button");
-    button.type = "button"; button.className = "line-toggle" + (isFocused(id) ? " active" : "");
-    button.title = isFocused(id) ? "再次点击取消聚焦" : "点击聚焦这条线";
-    button.setAttribute("aria-pressed", String(isFocused(id)));
-    button.append(node, label);
-    button.addEventListener("click", () => {
-      focusedLine = isFocused(id) ? null : id;
-      legend(); drawBaselines(); drawGhost(); draw(+slider.value);
-    });
-    lg.appendChild(button);
-  };
   const key = c => { const k = document.createElement("span"); k.className = "key"; k.style.borderTopColor = c; return k; };
   for (const g of DATA.groups) {
     const k = key(col(g));
     const gr = groupRuns(g);
     if (gr.length && gr.every(r => r.static)) k.style.opacity = 0.45;
-    lineItem(k, g.label, groupLineId(g));
+    item(k, g.label);
   }
   for (const r of DATA.runs) {
     if (DATA.groups.some(g => g.key === r.group && g.key !== "GA")) continue;  // 对照组点色=线色，不重复列
@@ -685,12 +633,11 @@ function legend() {
     item(d, r.name + " 档案点");
   }
   for (const b of DATA.baselines) {
-    if (b.kind === "dadda") lineItem(key(col(b)), b.name, baselineLineId(b));
-    else { const sq = document.createElement("span"); sq.className = "sq"; sq.style.background = col(b); lineItem(sq, b.name, baselineLineId(b)); }
+    if (b.kind === "dadda") item(key(col(b)), b.name);
+    else { const sq = document.createElement("span"); sq.className = "sq"; sq.style.background = col(b); item(sq, b.name); }
   }
   const gk = key(css("--text-2")); gk.style.opacity = 0.45;
   item(gk, "淡色 = 各组最终前沿参照");
-  lg.classList.toggle("has-focus", focusedLine !== null);
 }
 
 /* ---- 悬停：最近点命中（半径 26px；档案点 + 基线点） ---- */

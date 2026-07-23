@@ -30,10 +30,8 @@ class TrainingMixin:
     def get_rule_loss(
         self,
         Z_mat_dict: Dict[Tuple, torch.Tensor],
-        normalize: bool = False,
     ) -> torch.Tensor:
         l = 0.0
-        normalizer = 0.0
         time_start = time.time()
         for (s, c), Z_mat_slice in Z_mat_dict.items():
             keys = ["a", "b", "c", "d"][: self.comp_graph.port_num]
@@ -49,20 +47,15 @@ class TrainingMixin:
             row_sum = torch.sum(p, dim=1)
             row_sum_target = (torch.sum(mask.float(), dim=1) > 0).float()
             l += torch.sum(torch.pow(row_sum - row_sum_target, 2))
-            normalizer += float(row_sum_target.sum().item())
 
         time_end = time.time()
-        if normalize:
-            l = l / max(normalizer, 1.0)
         return l
 
     def get_discrete_loss(
         self,
         Z_mat_dict: Dict[Tuple, torch.Tensor],
-        normalize: bool = False,
     ) -> torch.Tensor:
         l = 0.0
-        normalizer = 0.0
         time_start = time.time()
         for (s, c), Z_mat_slice in Z_mat_dict.items():
             keys = ["a", "b", "c", "d"][: self.comp_graph.port_num]
@@ -76,10 +69,7 @@ class TrainingMixin:
             mask = Z > -1e6
             p = torch.softmax(Z, dim=0).masked_fill(~mask, 0.0)
             l += torch.sum(torch.pow((p * (1 - p)), 2))
-            normalizer += float(mask.sum().item())
         time_end = time.time()
-        if normalize:
-            l = l / max(normalizer, 1.0)
         return l
 
     def get_objective(self, simulated_result, cell_types=None, measured_error=None):

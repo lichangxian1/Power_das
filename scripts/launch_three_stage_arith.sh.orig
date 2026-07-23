@@ -1,0 +1,41 @@
+#!/bin/bash
+# Full structure -> Cell NSGA-II -> PPO routing campaign. The Python runner resumes
+# automatically from stage checkpoints when OUT points at an existing run.
+set -u
+
+source ~/OpenROAD-flow-scripts/env.sh >/dev/null 2>&1 || true
+export PATH=/home/lichangxian/anaconda3/envs/vtool/bin:$PATH
+export TZ=Asia/Shanghai
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
+
+REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+cd "$REPO"
+PY=${PY:-/home/lichangxian/anaconda3/envs/das/bin/python}
+STAMP=${STAMP:-$(TZ=Asia/Shanghai date +%F_%H%M)}
+OUT=${OUT:-outputs/${STAMP}_arith_three_stage}
+DEVICE=${DEVICE:-cuda:0}
+DC_PARALLEL=${DC_PARALLEL:-64}
+BASE_DIR_DC=${BASE_DIR_DC:-/home/lchangxian/sandbox/sandbox_base_dcpwr}
+
+mkdir -p "$OUT"
+{
+  echo "three-stage ARITH search"
+  echo "P=128 Q=128 DC_batch=64 DC_parallel=$DC_PARALLEL"
+  echo "Stage1=120 generations Stage2=120 generations Stage3=120 episodes (24x5), front snapshot every 5"
+  echo "device=$DEVICE base_dir_dc=$BASE_DIR_DC"
+} > "$OUT/_schedule.txt"
+
+setsid nohup "$PY" -u scripts/train_three_stage.py \
+  --out "$OUT" \
+  --device "$DEVICE" \
+  --dc_parallelism "$DC_PARALLEL" \
+  --base_dir_dc "$BASE_DIR_DC" \
+  --population 128 --offspring 128 --dc_batch 64 \
+  --stage1_generations 120 --stage2_generations 120 \
+  --stage3_episodes_per_elite 5 --stage3_routes_per_episode 64 \
+  --front_snapshot_every 5 \
+  --target_delay 1.5 --seed 42 \
+  > "$OUT/launcher.log" 2>&1 < /dev/null &
+
+echo $! > "$OUT/train.pid"
+echo "launched pid=$! out=$OUT"

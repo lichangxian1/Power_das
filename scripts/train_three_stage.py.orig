@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Launch the resumable structure -> cell NSGA-II -> routing PPO search."""
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import logging
+import os
+import random
+import sys
+
+import numpy as np
+from omegaconf import OmegaConf
+import torch
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from trainer.arith_das_v5 import CompressorRouting  # noqa: E402
+from trainer.arith_three_stage import Candidate, ThreeStageConfig, ThreeStageRunner  # noqa: E402
+
+
+class ConciseTrainingFilter(logging.Filter):
+    """Drop high-volume construction details while preserving run summaries."""
+
+    _DROP_PREFIXES = ("remain_pp", "[trunc]", "[trunc-mred]")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not str(record.getMessage()).startswith(self._DROP_PREFIXES)
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def build_engine(args):
+    cfg = OmegaConf.to_container(OmegaConf.load(args.config), resolve=True)
+    exp_kwargs = copy.deepcopy(cfg["experiment"]["kwargs"])
+    kwargs = copy.deepcopy(cfg["trainer"]["kwargs"])
+    kwargs.pop("area_budgets", None)
+    kwargs.update(exp_kwargs)
+    kwargs.update(
+        {
+            "synth": "dc",
+            "power_source": "eda",
+            "use_power_proxy": False,
+            "fixed_target_delay": float(args.target_delay),
+            "delay_weight": 0.0,
+            "delay_as_constraint": True,
+            "delay_target_ns": float(args.target_delay),
+            "area_budget": None,
+            "error_gate": "verilator",
+            "error_gate_vectors": int(args.error_vectors),
+            "log_dir": os.path.join(args.out, "policy_logs"),
+            "build_dir": os.path.join(args.out, "engine_build"),
+            "num_episodes": 1,
+            "num_samples": int(args.dc_batch),
+            "num_epochs": int(getattr(args, "stage3_num_epochs", 1)),
+            "save_freq": 1,
+            "front_dump_freq": 0,
+            "n_processing": int(args.dc_parallelism),
+            "n_full_target_delay_processing": int(args.dc_parallelism),
+            "device": args.device,
+            "seed": int(args.seed),
+            "trunc_cols": int(args.k_min),
+            "use_ct42": True,
+            "outer_cell_search": True,
+            "outer_bandit": False,
+            "outer_crossover": False,
+            "outer_multi_config": 1,
+            "outer_zero_ops": True,
+            "inject_exact_candidate": False,
+            "approx_max_col": 30,
+            "approx_col_window": int(args.approx_col_window),
+            "approx_lib_path": args.approx_lib_path,
+            "approx42_library_path": args.approx42_library_path,
+            "approx42_rtl_path": args.approx42_rtl_path,
+            "normalize_advantage": True,
+        }
+    )
+    stage3_elites = 1 if getattr(args, "stage3_single_elite_index", None) is not None else 24
+    kwargs.setdefault("scheduler_kwargs", {})["T_max"] = max(
+        1, int(args.stage3_episodes_per_elite) * stage3_elites
+    )
+    engine = CompressorRouting(**kwargs)
+    engine.error_metric = "mred"
+    engine.mred_budget = None
+    engine.mred_scale = 0.01
+    engine._trunc_profiles = {}
+    engine._trunc_bits = {}
+    engine._setup_truncation()
+    engine._trunc_profiles[int(args.k_min)] = engine._capture_trunc_profile()
+    return engine
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--config", default="configs/config_groups/mul_16_approx_error_obj.yaml")
+    p.add_argument("--out", required=True)
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--target_delay", type=float, default=1.5)
+    p.add_argument("--population", type=int, default=128)
+    p.add_argument("--offspring", type=int, default=128)
+    p.add_argument("--dc_batch", type=int, default=64)
+    p.add_argument("--dc_parallelism", type=int, default=64)
+    p.add_argument("--error_vectors", type=int, default=16_000_000)
+    p.add_argument("--k_min", type=int, default=2)
+    p.add_argument("--k_max", type=int, default=24)
+    p.add_argument("--mred_lo", type=float, default=1e-7)
+    p.add_argument("--mred_hi", type=float, default=2e-1)
+    p.add_argument("--stage1_generations", type=int, default=120)
+    p.add_argument("--stage2_generations", type=int, default=120)
+    p.add_argument("--stage3_episodes_per_elite", type=int, default=5)
+    p.add_argument("--stage3_routes_per_episode", type=int, default=64)
+    p.add_argument(
+        "--stage3_num_epochs",
+        type=int,
+        default=1,
+        help="PPO optimizer epochs over each fixed Stage-3 DC batch",
+    )
+    p.add_argument(
+        "--stage3_single_elite_source",
+        help="Stage-2 elites_24.json to use for an isolated Stage-3-only ablation",
+    )
+    p.add_argument(
+        "--stage3_single_elite_index",
+        type=int,
+        help="zero-based elite index in --stage3_single_elite_source",
+    )
+    p.add_argument("--front_snapshot_every", type=int, default=5)
+    p.add_argument(
+        "--stage1_archive_variants_per_objective", type=int, default=4,
+        help="maximum structurally diverse variants per exact Stage 1 objective tuple",
+    )
+    p.add_argument(
+        "--stage2_archive_variants_per_objective", type=int, default=2,
+        help="maximum structurally diverse variants per exact Stage 2 objective tuple",
+    )
+    p.add_argument(
+        "--stage3_archive_variants_per_objective", type=int, default=1,
+        help="maximum structurally diverse variants per exact Stage 3 objective tuple",
+    )
+    p.add_argument(
+        "--stage1_init_only",
+        action="store_true",
+        help=(
+            "evaluate and save the 128-candidate Stage 1 generation-0 "
+            "population, then stop before producing generation-1 offspring"
+        ),
+    )
+    p.add_argument(
+        "--stop_after_stage1",
+        action="store_true",
+        help="finish the requested Stage 1 generations, then stop before Stage 2",
+    )
+    p.add_argument(
+        "--stop_after_stage2",
+        action="store_true",
+        help="finish the requested Stage 2 generations, then stop before Stage 3",
+    )
+    p.add_argument("--approx_col_window", type=int, default=6)
+    p.add_argument(
+        "--approx_lib_path",
+        default="Appr_Comp/selected_compressors_all_substd.json",
+    )
+    p.add_argument(
+        "--approx42_library_path",
+        default="Appr_Comp/selected_compressors_all_substd.json",
+    )
+    p.add_argument(
+        "--approx42_rtl_path",
+        default="Appr_Comp/rtl/comp42s_standalone.v",
+    )
+    p.add_argument(
+        "--base_dir_dc",
+        default="/home/lchangxian/sandbox/sandbox_base_dcpwr",
+    )
+    args = p.parse_args()
+
+    args.out = os.path.abspath(args.out)
+    os.makedirs(args.out, exist_ok=True)
+    os.environ["EDA_BASE_DIR_DC"] = args.base_dir_dc
+    handlers = [
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(os.path.join(args.out, "train_three_stage.log")),
+    ]
+    concise_filter = ConciseTrainingFilter()
+    for handler in handlers:
+        handler.addFilter(concise_filter)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
+    )
+    if args.population != 128 or args.offspring != 128:
+        raise SystemExit("正式三阶段实现当前固定 P=128, Q=128")
+    if args.dc_batch != 64:
+        raise SystemExit("正式三阶段实现当前固定每批64个候选")
+    if args.stage3_num_epochs < 1:
+        raise SystemExit("--stage3_num_epochs 必须 >= 1")
+    single_elite_mode = (
+        args.stage3_single_elite_source is not None
+        or args.stage3_single_elite_index is not None
+    )
+    if single_elite_mode and (
+        args.stage3_single_elite_source is None
+        or args.stage3_single_elite_index is None
+    ):
+        raise SystemExit(
+            "单点 Stage 3 必须同时提供 --stage3_single_elite_source 和 "
+            "--stage3_single_elite_index"
+        )
+    selected_elite = None
+    source_path = None
+    if single_elite_mode:
+        source_path = os.path.abspath(args.stage3_single_elite_source)
+        with open(source_path) as f:
+            source_elites = json.load(f)
+        if len(source_elites) != 24:
+            raise SystemExit(f"单点消融要求原始24点交接文件，实际得到 {len(source_elites)} 点")
+        if not 0 <= args.stage3_single_elite_index < len(source_elites):
+            raise SystemExit(
+                f"elite index {args.stage3_single_elite_index} 越界；"
+                f"合法范围 0..{len(source_elites) - 1}"
+            )
+        selected_elite = Candidate.from_dict(
+            source_elites[args.stage3_single_elite_index]
+        )
+    logging.info("three-stage run directory: %s", args.out)
+    logging.info("EDA_BASE_DIR_DC=%s", os.environ["EDA_BASE_DIR_DC"])
+    set_seed(args.seed)
+    engine = build_engine(args)
+    search_cfg = ThreeStageConfig(
+        population_size=args.population,
+        offspring_size=args.offspring,
+        dc_batch_size=args.dc_batch,
+        dc_parallelism=args.dc_parallelism,
+        delay_limit=args.target_delay,
+        error_vectors=args.error_vectors,
+        seed=args.seed,
+        k_min=args.k_min,
+        k_max=args.k_max,
+        mred_lo=args.mred_lo,
+        mred_hi=args.mred_hi,
+        stage1_generations=args.stage1_generations,
+        stage2_generations=args.stage2_generations,
+        stage3_elites=1 if single_elite_mode else 24,
+        stage3_episodes_per_elite=args.stage3_episodes_per_elite,
+        stage3_routes_per_episode=args.stage3_routes_per_episode,
+        stage3_num_epochs=args.stage3_num_epochs,
+        front_snapshot_every=args.front_snapshot_every,
+        stage1_archive_variants_per_objective=args.stage1_archive_variants_per_objective,
+        stage2_archive_variants_per_objective=args.stage2_archive_variants_per_objective,
+        stage3_archive_variants_per_objective=args.stage3_archive_variants_per_objective,
+        stage3_single_elite_source=source_path,
+        stage3_single_elite_index=(
+            args.stage3_single_elite_index if single_elite_mode else None
+        ),
+        stage3_single_elite_id=(
+            selected_elite.candidate_id if selected_elite is not None else None
+        ),
+        stage1_init_only=args.stage1_init_only,
+        stop_after_stage1=args.stop_after_stage1,
+        stop_after_stage2=args.stop_after_stage2,
+    )
+    runner = ThreeStageRunner(engine, args.out, search_cfg)
+    if selected_elite is not None:
+        runner.run_stage3_only(selected_elite)
+    else:
+        runner.run()
+
+
+if __name__ == "__main__":
+    main()

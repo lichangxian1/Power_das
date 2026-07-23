@@ -1,0 +1,890 @@
+"""Resumable three-stage ARITH search runner."""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import copy
+import csv
+import json
+import logging
+import math
+import os
+import random
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+
+from utils import CompressorTree
+
+from .bandit import ContextualThompsonBandit
+from .candidate import Candidate
+from .cell_ops import CELL_ARMS, CellOperator
+from .evaluator import V5CandidateEvaluator
+from .pareto import (
+    ExternalArchive,
+    assign_crowding,
+    environmental_select,
+    fast_non_dominated_sort,
+    tournament,
+)
+from .selection import select_banded
+from .structure_actions import STRUCTURE_ARMS, StructureMutator
+
+
+@dataclass
+class ThreeStageConfig:
+    population_size: int = 128
+    offspring_size: int = 128
+    dc_batch_size: int = 64
+    dc_parallelism: int = 64
+    delay_limit: float = 1.5
+    error_vectors: int = 16_000_000
+    seed: int = 42
+    k_min: int = 2
+    k_max: int = 24
+    mred_lo: float = 1e-7
+    mred_hi: float = 2e-1
+    handoff_bins: int = 8
+    stage1_generations: int = 120
+    stage2_generations: int = 120
+    stage2_crossover_probability: float = 0.9
+    bandit_window: int = 128
+    bandit_explore: float = 0.03
+    stage3_elites: int = 24
+    stage3_episodes_per_elite: int = 5
+    stage3_routes_per_episode: int = 64
+    stage3_num_epochs: int = 1
+    stage3_ratio_mode: str = "trajectory"
+    stage3_learning_rate: float = 1e-4
+    stage3_policy_mode: str = "ppo"
+    stage3_rule_loss_weight: float = 0.0
+    stage3_discrete_loss_weight: float = 0.0
+    stage3_discrete_start_fraction: float = 0.5
+    checkpoint_every: int = 1
+    front_snapshot_every: int = 5
+    infrastructure_retries: int = 2
+    stage1_archive_variants_per_objective: int = 4
+    stage2_archive_variants_per_objective: int = 2
+    stage3_archive_variants_per_objective: int = 1
+    stage3_single_elite_source: Optional[str] = None
+    stage3_single_elite_index: Optional[int] = None
+    stage3_single_elite_id: Optional[str] = None
+    stage1_init_only: bool = False
+    stop_after_stage1: bool = False
+    stop_after_stage2: bool = False
+
+
+def _atomic_json(path: str, payload) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _atomic_torch(path: str, payload) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _load_candidates(path: str) -> List[Candidate]:
+    with open(path) as f:
+        return [Candidate.from_dict(x) for x in json.load(f)]
+
+
+class ThreeStageRunner:
+    def __init__(self, engine, run_dir: str, config: Optional[ThreeStageConfig] = None):
+        self.engine = engine
+        self.run_dir = os.path.abspath(run_dir)
+        self.cfg = config or ThreeStageConfig()
+        self.rng = random.Random(self.cfg.seed)
+        np.random.seed(self.cfg.seed)
+        torch.manual_seed(self.cfg.seed)
+        os.makedirs(self.run_dir, exist_ok=True)
+        for name in ("stage1", "stage2", "stage3", "final"):
+            os.makedirs(os.path.join(self.run_dir, name), exist_ok=True)
+        _atomic_json(os.path.join(self.run_dir, "three_stage_config.json"), asdict(self.cfg))
+
+        if not getattr(engine, "use_ct42", False):
+            raise ValueError("three-stage search requires use_ct42=True")
+        if not getattr(engine, "use_approx_types", False):
+            raise ValueError("three-stage search requires use_approx_types=True")
+        if not getattr(engine, "outer_cell_search", False):
+            raise ValueError("three-stage search requires outer_cell_search=True")
+
+        self.evaluator = V5CandidateEvaluator(
+            engine,
+            self.run_dir,
+            batch_size=self.cfg.dc_batch_size,
+            n_processing=self.cfg.dc_parallelism,
+            target_delay=self.cfg.delay_limit,
+            error_vectors=self.cfg.error_vectors,
+        )
+        self.structure_mutator = StructureMutator(
+            engine, k_min=self.cfg.k_min, k_max=self.cfg.k_max
+        )
+        self.cell_operator = CellOperator(engine)
+        self.structure_bandit = ContextualThompsonBandit(
+            STRUCTURE_ARMS, self.cfg.bandit_window, self.cfg.bandit_explore
+        )
+        self.cell_bandit = ContextualThompsonBandit(
+            CELL_ARMS, self.cfg.bandit_window, self.cfg.bandit_explore
+        )
+
+    def close(self):
+        self.evaluator.close()
+
+    def run(self) -> None:
+        try:
+            backbones = self._load_or_run_stage1()
+            if self.cfg.stage1_init_only:
+                logging.info(
+                    "Stage 1 initialization-only run complete; "
+                    "saved generation 0 and stopped before offspring generation 1"
+                )
+                return
+            if self.cfg.stop_after_stage1:
+                logging.info(
+                    "Stage 1-only run complete; stopped before Stage 2 initialization"
+                )
+                return
+            elites = self._load_or_run_stage2(backbones)
+            if self.cfg.stop_after_stage2:
+                logging.info(
+                    "Stage 2-only run complete; stopped before Stage 3 initialization"
+                )
+                return
+            self._load_or_run_stage3(elites)
+        finally:
+            self.close()
+
+    def run_stage3_only(self, elite: Candidate) -> None:
+        """Run a fresh Stage-3 policy on one fixed Stage-2 handoff elite."""
+        if self.cfg.stage3_elites != 1:
+            raise ValueError("single-elite Stage 3 requires stage3_elites=1")
+        if (
+            self.cfg.stage3_single_elite_id is not None
+            and elite.candidate_id != self.cfg.stage3_single_elite_id
+        ):
+            raise ValueError(
+                "single-elite candidate mismatch: "
+                f"config={self.cfg.stage3_single_elite_id} loaded={elite.candidate_id}"
+            )
+        _atomic_json(
+            os.path.join(self.run_dir, "stage2", "source_elite.json"),
+            [elite.to_dict()],
+        )
+        logging.info(
+            "single-elite Stage 3: source=%s index=%s id=%s role=%s "
+            "episodes=%d routes=%d ppo_epochs=%d ratio_mode=%s lr=%.3g "
+            "policy_mode=%s rule_weight=%.3g discrete_weight=%.3g "
+            "discrete_start=%.3f",
+            self.cfg.stage3_single_elite_source,
+            self.cfg.stage3_single_elite_index,
+            elite.candidate_id,
+            elite.metadata.get("selection_role"),
+            self.cfg.stage3_episodes_per_elite,
+            self.cfg.stage3_routes_per_episode,
+            self.cfg.stage3_num_epochs,
+            self.cfg.stage3_ratio_mode,
+            self.cfg.stage3_learning_rate,
+            self.cfg.stage3_policy_mode,
+            self.cfg.stage3_rule_loss_weight,
+            self.cfg.stage3_discrete_loss_weight,
+            self.cfg.stage3_discrete_start_fraction,
+        )
+        try:
+            self._load_or_run_stage3([elite])
+        finally:
+            self.close()
+
+    def _evaluate_with_retries(self, candidates: Sequence[Candidate]) -> List[Candidate]:
+        self.evaluator.evaluate(candidates)
+        for _ in range(self.cfg.infrastructure_retries):
+            retry = [
+                c for c in candidates
+                if not c.evaluated and c.failure_reason in ("dc_failed", "verilator_failed")
+            ]
+            if not retry:
+                break
+            for c in retry:
+                c.valid = True
+                c.failure_reason = None
+            logging.warning("retrying %d infrastructure-failed candidates", len(retry))
+            self.evaluator.evaluate(retry)
+        return list(candidates)
+
+    @staticmethod
+    def _prepare_population(population: Sequence[Candidate], delay_limit: float) -> None:
+        for front in fast_non_dominated_sort(population, delay_limit):
+            assign_crowding(front)
+
+    def _structure_context(self, c: Candidate) -> str:
+        m = math.log10(max(float(c.mred or self.cfg.mred_lo), 1e-15))
+        density = sum(c.ct42) / max(1, sum(c.ct22) + sum(c.ct32) + sum(c.ct42))
+        return f"m{math.floor(m)}|t{min(4, int(density * 10))}|k{c.k // 4}"
+
+    def _cell_context(self, c: Candidate) -> str:
+        m = math.log10(max(float(c.mred or self.cfg.mred_lo), 1e-15))
+        return f"m{math.floor(m)}"
+
+    def _mutation_steps(self) -> int:
+        x = self.rng.random()
+        if x < 0.80:
+            return 1
+        if x < 0.95:
+            return 2
+        return self.rng.randint(3, 4)
+
+    def _new_archive(self, stage: int) -> ExternalArchive:
+        limits = {
+            1: self.cfg.stage1_archive_variants_per_objective,
+            2: self.cfg.stage2_archive_variants_per_objective,
+            3: self.cfg.stage3_archive_variants_per_objective,
+        }
+        if stage not in limits:
+            raise ValueError(f"unsupported archive stage: {stage}")
+        return ExternalArchive(
+            self.cfg.delay_limit,
+            variants_per_objective=limits[stage],
+        )
+
+    @staticmethod
+    def _front_snapshot_payload(candidates: Sequence[Candidate]) -> List[dict]:
+        payload = []
+        for candidate in candidates:
+            if not candidate.evaluated:
+                continue
+            payload.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "stage": int(candidate.stage),
+                    "k": int(candidate.k),
+                    "area": float(candidate.area),
+                    "power": float(candidate.power),
+                    "delay": float(candidate.delay),
+                    "mred": float(candidate.mred),
+                    "valid": bool(candidate.valid),
+                    "n_cells": len(candidate.cells),
+                    "bin": candidate.metadata.get(
+                        "selection_bin",
+                        candidate.metadata.get("selection_role", candidate.stage),
+                    ),
+                }
+            )
+        return payload
+
+    def _save_front_snapshot(
+        self, stage: int, step: int, candidates: Sequence[Candidate]
+    ) -> None:
+        every = max(1, int(self.cfg.front_snapshot_every))
+        if int(step) % every != 0:
+            return
+        path = os.path.join(
+            self.run_dir,
+            f"stage{stage}",
+            "front_hist",
+            f"front_gen{int(step):04d}.json",
+        )
+        _atomic_json(path, self._front_snapshot_payload(candidates))
+
+
+    def _save_generation(
+        self,
+        stage: int,
+        generation: int,
+        population: Sequence[Candidate],
+        archive: ExternalArchive,
+        bandit: ContextualThompsonBandit,
+    ) -> None:
+        stage_dir = os.path.join(self.run_dir, f"stage{stage}")
+        _atomic_json(os.path.join(stage_dir, "population.json"), [c.to_dict() for c in population])
+        _atomic_json(os.path.join(stage_dir, "archive.json"), archive.to_list())
+        _atomic_json(os.path.join(stage_dir, "bandit.json"), bandit.state_dict())
+        self._save_front_snapshot(stage, generation, archive.items)
+        _atomic_torch(
+            os.path.join(stage_dir, "checkpoint.pt"),
+            {
+                "generation": int(generation),
+                "population": [c.to_dict() for c in population],
+                "archive": archive.to_list(),
+                "bandit": bandit.state_dict(),
+                "rng_state": self.rng.getstate(),
+                "numpy_state": np.random.get_state(),
+                "torch_state": torch.random.get_rng_state(),
+            },
+        )
+
+    def _restore_generation(self, stage: int):
+        path = os.path.join(self.run_dir, f"stage{stage}", "checkpoint.pt")
+        if not os.path.exists(path):
+            return None
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        self.rng.setstate(state["rng_state"])
+        np.random.set_state(state["numpy_state"])
+        torch.random.set_rng_state(state["torch_state"])
+        archive = self._new_archive(stage)
+        archive.items = [Candidate.from_dict(x) for x in state["archive"]]
+        archive.update(())
+        bandit = self.structure_bandit if stage == 1 else self.cell_bandit
+        bandit.load_state_dict(state["bandit"])
+        return (
+            int(state["generation"]),
+            [Candidate.from_dict(x) for x in state["population"]],
+            archive,
+        )
+
+    def _initial_structure_population(self) -> List[Candidate]:
+        ct = CompressorTree.dadda(np.asarray(self.engine.initial_pp, dtype=int))
+        base = [
+            Candidate(
+                k,
+                ct.ct22.astype(int).tolist(),
+                ct.ct32.astype(int).tolist(),
+                np.zeros_like(ct.ct32, dtype=int).tolist(),
+                stage=1,
+                operator="seed_dadda",
+            )
+            for k in range(self.cfg.k_min, self.cfg.k_max + 1)
+        ]
+        population = list(base)
+        seen = {c.cell_hash for c in population}
+        attempts = 0
+        while len(population) < self.cfg.population_size and attempts < 100_000:
+            attempts += 1
+            parent = self.rng.choice(population)
+            arms = self.structure_mutator.legal_arms(parent)
+            if not arms:
+                continue
+            child = self.structure_mutator.mutate(
+                parent, self.rng.choice(arms), self.rng, steps=self._mutation_steps()
+            )
+            if child is None or child.cell_hash in seen:
+                continue
+            seen.add(child.cell_hash)
+            population.append(child)
+        if len(population) != self.cfg.population_size:
+            raise RuntimeError(f"could only initialize {len(population)} unique structures")
+        return population
+
+    def _load_or_run_stage1(self) -> List[Candidate]:
+        done = os.path.join(self.run_dir, "stage1", "backbones_32.json")
+        if os.path.exists(done):
+            logging.info("Stage 1 already complete; loading %s", done)
+            return _load_candidates(done)
+        restored = self._restore_generation(1)
+        if restored is None:
+            population = self._initial_structure_population()
+            self._evaluate_with_retries(population)
+            if sum(c.evaluated for c in population) < self.cfg.population_size:
+                raise RuntimeError("Stage 1 initial population has unresolved evaluation failures")
+            population = environmental_select(
+                population, self.cfg.population_size, self.cfg.delay_limit
+            )
+            archive = self._new_archive(1)
+            archive.update(population)
+            start_generation = 0
+            self._save_generation(1, 0, population, archive, self.structure_bandit)
+            if self.cfg.stage1_init_only:
+                return []
+        else:
+            if self.cfg.stage1_init_only:
+                raise RuntimeError(
+                    "--stage1_init_only requires a fresh output directory without "
+                    "an existing Stage 1 checkpoint"
+                )
+            start_generation, population, archive = restored
+            logging.info("resuming Stage 1 after generation %d", start_generation)
+
+        for generation in range(start_generation, self.cfg.stage1_generations):
+            self._prepare_population(population, self.cfg.delay_limit)
+            offspring, seen = [], {c.cell_hash for c in population}
+            attempts = 0
+            while len(offspring) < self.cfg.offspring_size and attempts < 200_000:
+                attempts += 1
+                parent = tournament(population, self.rng)
+                legal = self.structure_mutator.legal_arms(parent)
+                if not legal:
+                    continue
+                context = self._structure_context(parent)
+                arm = self.structure_bandit.choose(context, legal, self.rng)
+                child = self.structure_mutator.mutate(
+                    parent, arm, self.rng, steps=self._mutation_steps()
+                )
+                if child is None or child.cell_hash in seen:
+                    continue
+                child.operator_context = context
+                child.metadata["generation"] = generation + 1
+                seen.add(child.cell_hash)
+                offspring.append(child)
+            if len(offspring) != self.cfg.offspring_size:
+                raise RuntimeError(f"Stage 1 generation {generation + 1}: only {len(offspring)} offspring")
+            self._evaluate_with_retries(offspring)
+            next_population = environmental_select(
+                list(population) + offspring, self.cfg.population_size, self.cfg.delay_limit
+            )
+            survivor_hashes = {c.cell_hash for c in next_population}
+            for child in offspring:
+                if child.evaluated and child.operator and child.operator_context:
+                    self.structure_bandit.update(
+                        child.operator_context, child.operator, child.cell_hash in survivor_hashes
+                    )
+            archive.update(offspring)
+            population = next_population
+            logging.info(
+                "Stage 1 generation %d/%d complete: archive=%d",
+                generation + 1,
+                self.cfg.stage1_generations,
+                len(archive.items),
+            )
+            if (generation + 1) % self.cfg.checkpoint_every == 0:
+                self._save_generation(
+                    1, generation + 1, population, archive, self.structure_bandit
+                )
+
+        backbones = select_banded(
+            list(archive.items) + list(population),
+            n_bins=self.cfg.handoff_bins,
+            roles=("area", "power", "knee", "novel"),
+            mred_lo=self.cfg.mred_lo,
+            mred_hi=self.cfg.mred_hi,
+            delay_limit=self.cfg.delay_limit,
+        )
+        _atomic_json(done, [c.to_dict() for c in backbones])
+        logging.info("Stage 1 complete: selected %d backbones", len(backbones))
+        return backbones
+
+    def _load_or_run_stage2(self, backbones: Sequence[Candidate]) -> List[Candidate]:
+        done = os.path.join(self.run_dir, "stage2", "elites_24.json")
+        if os.path.exists(done):
+            logging.info("Stage 2 already complete; loading %s", done)
+            return _load_candidates(done)
+        restored = self._restore_generation(2)
+        if restored is None:
+            population = []
+            for backbone in backbones:
+                population.extend(self.cell_operator.make_seed_variants(backbone, self.rng))
+            if len(population) != self.cfg.population_size:
+                raise RuntimeError(f"Stage 2 expected 128 seeds, got {len(population)}")
+            self._evaluate_with_retries(population)
+            if sum(c.evaluated for c in population) < self.cfg.population_size:
+                raise RuntimeError("Stage 2 initial population has unresolved evaluation failures")
+            population = environmental_select(
+                population, self.cfg.population_size, self.cfg.delay_limit
+            )
+            archive = self._new_archive(2)
+            archive.update(population)
+            start_generation = 0
+            self._save_generation(2, 0, population, archive, self.cell_bandit)
+        else:
+            start_generation, population, archive = restored
+            logging.info("resuming Stage 2 after generation %d", start_generation)
+
+        for generation in range(start_generation, self.cfg.stage2_generations):
+            self._prepare_population(population, self.cfg.delay_limit)
+            offspring, seen = [], {c.cell_hash for c in population}
+            attempts = 0
+            while len(offspring) < self.cfg.offspring_size and attempts < 300_000:
+                attempts += 1
+                a, b = tournament(population, self.rng), tournament(population, self.rng)
+                if self.rng.random() < self.cfg.stage2_crossover_probability:
+                    base = self.cell_operator.crossover_a(a, b, self.rng)
+                else:
+                    base = a.clone(stage=2)
+                legal = self.cell_operator.legal_arms(base)
+                if not legal:
+                    continue
+                context = self._cell_context(a)
+                arm = self.cell_bandit.choose(context, legal, self.rng)
+                child = self.cell_operator.mutate(base, arm, self.rng)
+                if child is None or child.cell_hash in seen:
+                    continue
+                child.operator_context = context
+                child.metadata["generation"] = generation + 1
+                seen.add(child.cell_hash)
+                offspring.append(child)
+            if len(offspring) != self.cfg.offspring_size:
+                raise RuntimeError(f"Stage 2 generation {generation + 1}: only {len(offspring)} offspring")
+            self._evaluate_with_retries(offspring)
+            next_population = environmental_select(
+                list(population) + offspring, self.cfg.population_size, self.cfg.delay_limit
+            )
+            survivor_hashes = {c.cell_hash for c in next_population}
+            for child in offspring:
+                if child.evaluated and child.operator and child.operator_context:
+                    self.cell_bandit.update(
+                        child.operator_context, child.operator, child.cell_hash in survivor_hashes
+                    )
+            archive.update(offspring)
+            population = next_population
+            logging.info(
+                "Stage 2 generation %d/%d complete: archive=%d",
+                generation + 1,
+                self.cfg.stage2_generations,
+                len(archive.items),
+            )
+            if (generation + 1) % self.cfg.checkpoint_every == 0:
+                self._save_generation(2, generation + 1, population, archive, self.cell_bandit)
+
+        elites = select_banded(
+            list(archive.items) + list(population),
+            n_bins=self.cfg.handoff_bins,
+            roles=("area", "power", "knee"),
+            mred_lo=self.cfg.mred_lo,
+            mred_hi=self.cfg.mred_hi,
+            delay_limit=self.cfg.delay_limit,
+        )
+        _atomic_json(done, [c.to_dict() for c in elites])
+        logging.info("Stage 2 complete: selected %d elites", len(elites))
+        return elites
+
+    @staticmethod
+    def _policy_weights(role: str) -> Tuple[float, float, float]:
+        return {
+            "area": (0.60, 0.20, 0.20),
+            "power": (0.20, 0.60, 0.20),
+            "knee": (0.35, 0.35, 0.30),
+        }[role]
+
+    def _routing_objective(self, route: Candidate, baseline: Candidate) -> float:
+        role = str(baseline.metadata.get("selection_role", "knee"))
+        wa, wp, wm = self._policy_weights(role)
+        da = (float(baseline.area) - float(route.area)) / float(baseline.area)
+        dp = (float(baseline.power) - float(route.power)) / float(baseline.power)
+        dm = math.log(max(float(baseline.mred), 1e-15) / max(float(route.mred), 1e-15))
+        timing_penalty = 5.0 * max(0.0, float(route.delay) / self.cfg.delay_limit - 1.0)
+        hi = float((baseline.metadata.get("mred_band_edges") or [0, self.cfg.mred_hi])[1])
+        mred_penalty = max(0.0, math.log(max(float(route.mred), 1e-15) / max(hi, 1e-15)))
+        reward = wa * da + wp * dp + wm * dm - timing_penalty - mred_penalty
+        return -reward
+
+    @staticmethod
+    def _loss_grad_norm(loss: torch.Tensor, parameters) -> float:
+        if not loss.requires_grad:
+            return 0.0
+        grads = torch.autograd.grad(
+            loss, tuple(parameters), retain_graph=True, allow_unused=True
+        )
+        return math.sqrt(
+            sum(float(torch.sum(g.detach() ** 2).item()) for g in grads if g is not None)
+        )
+
+    def _load_or_run_stage3(self, elites: Sequence[Candidate]) -> None:
+        if len(elites) != self.cfg.stage3_elites:
+            raise ValueError(
+                f"Stage 3 expected {self.cfg.stage3_elites} elites, got {len(elites)}"
+            )
+        if self.cfg.stage3_num_epochs < 1:
+            raise ValueError("Stage 3 requires stage3_num_epochs >= 1")
+        if self.cfg.stage3_ratio_mode not in ("trajectory", "action"):
+            raise ValueError(
+                "Stage 3 ratio mode must be 'trajectory' or 'action', got "
+                f"{self.cfg.stage3_ratio_mode!r}"
+            )
+        if self.cfg.stage3_policy_mode not in ("ppo", "frozen", "random"):
+            raise ValueError(
+                "Stage 3 policy mode must be 'ppo', 'frozen', or 'random', got "
+                f"{self.cfg.stage3_policy_mode!r}"
+            )
+        if self.cfg.stage3_rule_loss_weight < 0:
+            raise ValueError("Stage 3 rule-loss weight must be >= 0")
+        if self.cfg.stage3_discrete_loss_weight < 0:
+            raise ValueError("Stage 3 discrete-loss weight must be >= 0")
+        if not 0.0 <= self.cfg.stage3_discrete_start_fraction <= 1.0:
+            raise ValueError("Stage 3 discrete-loss start fraction must be in [0, 1]")
+        if self.cfg.stage3_policy_mode != "ppo" and (
+            self.cfg.stage3_rule_loss_weight > 0
+            or self.cfg.stage3_discrete_loss_weight > 0
+        ):
+            raise ValueError("frozen/random controls cannot enable auxiliary losses")
+        done = os.path.join(self.run_dir, "final", "pareto.json")
+        checkpoint = os.path.join(self.run_dir, "stage3", "checkpoint.pt")
+        if os.path.exists(done) and not os.path.exists(checkpoint):
+            logging.info(
+                "Stage 3 final exists but no checkpoint is available for extension: %s",
+                done,
+            )
+            return
+        roles = ("area", "power", "knee")
+        model_states = {r: copy.deepcopy(self.engine.gcn.state_dict()) for r in roles}
+        optimizers = {
+            r: torch.optim.Adam(self.engine.gcn.parameters(), lr=self.cfg.stage3_learning_rate)
+            for r in roles
+        }
+        final_archive = self._new_archive(3)
+        for stage in (1, 2):
+            path = os.path.join(self.run_dir, f"stage{stage}", "archive.json")
+            if os.path.exists(path):
+                final_archive.update(_load_candidates(path))
+        final_archive.update(elites)
+        schedule = [
+            (episode, elite_idx)
+            for episode in range(self.cfg.stage3_episodes_per_elite)
+            for elite_idx in range(len(elites))
+        ]
+        start = 0
+        if os.path.exists(checkpoint):
+            state = torch.load(checkpoint, map_location=self.engine.device, weights_only=False)
+            checkpoint_epochs = state.get("stage3_num_epochs")
+            if checkpoint_epochs is not None and checkpoint_epochs != self.cfg.stage3_num_epochs:
+                raise ValueError(
+                    "Stage 3 checkpoint epoch mismatch: "
+                    f"checkpoint={checkpoint_epochs} "
+                    f"requested={self.cfg.stage3_num_epochs}"
+                )
+            checkpoint_ratio_mode = state.get("stage3_ratio_mode")
+            if (
+                checkpoint_ratio_mode is not None
+                and checkpoint_ratio_mode != self.cfg.stage3_ratio_mode
+            ):
+                raise ValueError(
+                    "Stage 3 checkpoint ratio-mode mismatch: "
+                    f"checkpoint={checkpoint_ratio_mode} "
+                    f"requested={self.cfg.stage3_ratio_mode}"
+                )
+            checkpoint_lr = state.get("stage3_learning_rate")
+            if (
+                checkpoint_lr is not None
+                and checkpoint_lr != self.cfg.stage3_learning_rate
+            ):
+                raise ValueError(
+                    "Stage 3 checkpoint learning-rate mismatch: "
+                    f"checkpoint={checkpoint_lr} "
+                    f"requested={self.cfg.stage3_learning_rate}"
+                )
+            checkpoint_policy_mode = state.get("stage3_policy_mode", "ppo")
+            if checkpoint_policy_mode != self.cfg.stage3_policy_mode:
+                raise ValueError(
+                    "Stage 3 checkpoint policy-mode mismatch: "
+                    f"checkpoint={checkpoint_policy_mode} "
+                    f"requested={self.cfg.stage3_policy_mode}"
+                )
+            for key, requested in (
+                ("stage3_rule_loss_weight", self.cfg.stage3_rule_loss_weight),
+                ("stage3_discrete_loss_weight", self.cfg.stage3_discrete_loss_weight),
+                ("stage3_discrete_start_fraction", self.cfg.stage3_discrete_start_fraction),
+            ):
+                default = 0.0 if "weight" in key else 0.5
+                checkpoint_value = float(state.get(key, default))
+                if not math.isclose(checkpoint_value, requested, rel_tol=0.0, abs_tol=1e-15):
+                    raise ValueError(
+                        f"Stage 3 checkpoint {key} mismatch: "
+                        f"checkpoint={checkpoint_value} requested={requested}"
+                    )
+            expected_ids = [c.candidate_id for c in elites]
+            checkpoint_ids = state.get("elite_ids")
+            if checkpoint_ids is not None and checkpoint_ids != expected_ids:
+                raise ValueError(
+                    "Stage 3 checkpoint elite mismatch: "
+                    f"checkpoint={checkpoint_ids} requested={expected_ids}"
+                )
+            start = int(state["schedule_index"])
+            model_states = state["model_states"]
+            for role in roles:
+                optimizers[role].load_state_dict(state["optimizer_states"][role])
+            final_archive.items = [Candidate.from_dict(x) for x in state["archive"]]
+            final_archive.update(())
+            self.rng.setstate(state["rng_state"])
+            logging.info("resuming Stage 3 at schedule item %d/%d", start, len(schedule))
+        if start >= len(schedule):
+            if not os.path.exists(done):
+                self._export_final(final_archive.items)
+            else:
+                logging.info(
+                    "Stage 3 already satisfies requested schedule: %d/%d; final=%s",
+                    start,
+                    len(schedule),
+                    done,
+                )
+            return
+        if os.path.exists(done):
+            logging.info(
+                "extending completed Stage 3 from %d to %d schedule items",
+                start, len(schedule),
+            )
+
+        self.engine.normalize_advantage = True
+        self._save_front_snapshot(3, start, final_archive.items)
+        for schedule_index in range(start, len(schedule)):
+            episode, elite_idx = schedule[schedule_index]
+            baseline = elites[elite_idx]
+            role = str(baseline.metadata.get("selection_role", "knee"))
+            self.engine.gcn.load_state_dict(model_states[role])
+            self.evaluator._prepare(baseline)
+            with torch.no_grad():
+                logits = self.engine.get_Z_mat()
+                if self.cfg.stage3_policy_mode == "random":
+                    logits = {
+                        key: {
+                            port: torch.zeros_like(value)
+                            for port, value in value_dict.items()
+                        }
+                        for key, value_dict in logits.items()
+                    }
+                sampled = [
+                    self.engine.sample_from_logits(logits)
+                    for _ in range(self.cfg.stage3_routes_per_episode)
+                ]
+            route_candidates = []
+            for connection, old_log_prob in sampled:
+                c = baseline.clone(stage=3)
+                c.routing = connection
+                c.operator = f"{self.cfg.stage3_policy_mode}_{role}"
+                c.metadata.update({
+                    "baseline_id": baseline.candidate_id,
+                    "selection_role": role,
+                    "mred_band_edges": baseline.metadata.get("mred_band_edges"),
+                    "old_log_prob": float(old_log_prob),
+                    "policy_scope": "single_elite" if len(elites) == 1 else "role_shared",
+                    "stage3_policy_mode": self.cfg.stage3_policy_mode,
+                    "stage3_episode": episode + 1,
+                    "stage3_schedule_index": schedule_index + 1,
+                })
+                c.refresh_id()
+                route_candidates.append(c)
+            self._evaluate_with_retries(route_candidates)
+            usable = [c for c in route_candidates if c.evaluated]
+            if len(usable) >= 2 and self.cfg.stage3_policy_mode == "ppo":
+                sample_info = [
+                    {
+                        "connection": c.routing,
+                        "overall_log_prob": c.metadata["old_log_prob"],
+                        "objective": self._routing_objective(c, baseline),
+                        "cell_types": {},
+                        "cell_type_info": {"mode": "outer"},
+                        "config_group": baseline.candidate_id,
+                        "ppo_ratio_mode": self.cfg.stage3_ratio_mode,
+                    }
+                    for c in usable
+                ]
+                if self.cfg.stage3_discrete_start_fraction >= 1.0:
+                    discrete_scale = 0.0
+                else:
+                    progress = episode / max(1, self.cfg.stage3_episodes_per_elite - 1)
+                    discrete_scale = max(
+                        0.0,
+                        (progress - self.cfg.stage3_discrete_start_fraction)
+                        / (1.0 - self.cfg.stage3_discrete_start_fraction),
+                    )
+                effective_discrete_weight = (
+                    self.cfg.stage3_discrete_loss_weight * discrete_scale
+                )
+                loss_values = []
+                for ppo_epoch in range(self.cfg.stage3_num_epochs):
+                    self.evaluator._prepare(baseline)
+                    z_new = self.engine.get_Z_mat()
+                    l_ppo = self.engine.get_ppo_loss(z_new, sample_info)
+                    l_rule = (
+                        self.engine.get_rule_loss(z_new, normalize=True)
+                        if self.cfg.stage3_rule_loss_weight > 0
+                        else l_ppo.new_zeros(())
+                    )
+                    l_discrete = (
+                        self.engine.get_discrete_loss(z_new, normalize=True)
+                        if effective_discrete_weight > 0
+                        else l_ppo.new_zeros(())
+                    )
+                    loss = (
+                        l_ppo
+                        + self.cfg.stage3_rule_loss_weight * l_rule
+                        + effective_discrete_weight * l_discrete
+                    )
+                    if ppo_epoch == 0 and (
+                        self.cfg.stage3_rule_loss_weight > 0
+                        or effective_discrete_weight > 0
+                    ):
+                        parameters = [
+                            p for p in self.engine.gcn.parameters() if p.requires_grad
+                        ]
+                        ppo_grad = self._loss_grad_norm(l_ppo, parameters)
+                        rule_grad = self._loss_grad_norm(
+                            self.cfg.stage3_rule_loss_weight * l_rule, parameters
+                        )
+                        discrete_grad = self._loss_grad_norm(
+                            effective_discrete_weight * l_discrete, parameters
+                        )
+                        logging.info(
+                            "Stage 3 weighted component gradients "
+                            "ppo=%.4g rule=%.4g discrete=%.4g aux/ppo=%.4g",
+                            ppo_grad, rule_grad, discrete_grad,
+                            (rule_grad + discrete_grad) / max(ppo_grad, 1e-12),
+                        )
+                    optimizers[role].zero_grad()
+                    loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.engine.gcn.parameters(), 0.5
+                    )
+                    optimizers[role].step()
+                    stats = getattr(self.engine, "_last_ppo_stats", {})
+                    loss_values.append(float(loss.item()))
+                    logging.info(
+                        "Stage 3 PPO epoch=%d/%d ratio=%.4g[%.4g,%.4g] "
+                        "clip=%.3f approx_kl=%.4g grad=%.4g "
+                        "losses(total=%.6g ppo=%.6g rule=%.6g*%.3g "
+                        "discrete=%.6g*%.3g)",
+                        ppo_epoch + 1, self.cfg.stage3_num_epochs,
+                        stats.get("ratio_mean", float("nan")),
+                        stats.get("ratio_min", float("nan")),
+                        stats.get("ratio_max", float("nan")),
+                        stats.get("clip_fraction", float("nan")),
+                        stats.get("approx_kl", float("nan")), float(grad_norm),
+                        float(loss.item()), float(l_ppo.item()),
+                        float(l_rule.item()), self.cfg.stage3_rule_loss_weight,
+                        float(l_discrete.item()), effective_discrete_weight,
+                    )
+                model_states[role] = copy.deepcopy(self.engine.gcn.state_dict())
+                logging.info(
+                    "Stage 3 %d/%d elite=%d ep=%d role=%s usable=%d losses=%s",
+                    schedule_index + 1, len(schedule), elite_idx, episode + 1,
+                    role, len(usable), ",".join(f"{x:.6g}" for x in loss_values),
+                )
+            elif len(usable) < 2:
+                logging.warning("Stage 3 elite=%d has only %d usable routes", elite_idx, len(usable))
+            else:
+                logging.info(
+                    "Stage 3 %d/%d elite=%d ep=%d role=%s mode=%s usable=%d "
+                    "(policy update disabled)",
+                    schedule_index + 1, len(schedule), elite_idx, episode + 1,
+                    role, self.cfg.stage3_policy_mode, len(usable),
+                )
+            final_archive.update(usable)
+            self._save_front_snapshot(3, schedule_index + 1, final_archive.items)
+            _atomic_torch(
+                checkpoint,
+                {
+                    "schedule_index": schedule_index + 1,
+                    "stage3_num_epochs": self.cfg.stage3_num_epochs,
+                    "stage3_ratio_mode": self.cfg.stage3_ratio_mode,
+                    "stage3_learning_rate": self.cfg.stage3_learning_rate,
+                    "stage3_policy_mode": self.cfg.stage3_policy_mode,
+                    "stage3_rule_loss_weight": self.cfg.stage3_rule_loss_weight,
+                    "stage3_discrete_loss_weight": self.cfg.stage3_discrete_loss_weight,
+                    "stage3_discrete_start_fraction": self.cfg.stage3_discrete_start_fraction,
+                    "elite_ids": [c.candidate_id for c in elites],
+                    "model_states": model_states,
+                    "optimizer_states": {r: optimizers[r].state_dict() for r in roles},
+                    "archive": final_archive.to_list(),
+                    "rng_state": self.rng.getstate(),
+                },
+            )
+
+        self._export_final(final_archive.items)
+
+    def _export_final(self, candidates: Iterable[Candidate]) -> None:
+        items = list(candidates)
+        final_dir = os.path.join(self.run_dir, "final")
+        _atomic_json(os.path.join(final_dir, "pareto.json"), [c.to_dict() for c in items])
+        with open(os.path.join(final_dir, "pareto.csv"), "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "candidate_id", "stage", "k", "area", "power_W", "delay_ns", "mred",
+                "operator", "selection_role",
+            ])
+            for c in items:
+                writer.writerow([
+                    c.candidate_id, c.stage, c.k, c.area, c.power, c.delay, c.mred,
+                    c.operator, c.metadata.get("selection_role"),
+                ])
+        logging.info("three-stage search complete: final Pareto=%d", len(items))

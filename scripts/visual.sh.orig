@@ -1,0 +1,331 @@
+#!/bin/bash
+# 一键刷新四图训练回放：
+#   main vs FINAL_A：面积 + 功耗
+#   CMP_A vs FINAL_A：面积 + 功耗
+# 最终仍输出一个 front_viewer.html，并通过 HTTP 服务查看。
+# MAIN=auto 自动探测：优先取正在跑的训练进程（cwd 反推 run 目录）；没有在跑的
+# 就在两个输出根里取最新的真实 run 目录（以 _schedule.txt 为标志，同步副本没有它）。
+# 查看：VSCode 终端里 Ctrl+点击打印的 URL（端口自动转发到你笔记本浏览器）。
+# 用法: visual；要锁定某个历史战役时把 MAIN 改成目录名即可。
+set -euo pipefail
+cd /home/lichangxian/Power_das
+
+# MAIN=auto
+MAIN=${MAIN:-2026-07-19_arith_three_stage_quiet}
+CMP_A="v61cold=outputs/2026-07-16_01_v61cold_np2"    # A/B 对照（--compare=全程时间轴）
+FINAL_A="v5r2=outputs/2026-07-13_v5r2_np2"           # 历史参照（只画最终前沿，淡色）
+PORT=8735
+ROOTS=(/home/lichangxian/Power_das/outputs
+       /home/lichangxian/Arith-DAS-CUSTOM/outputs)
+
+if [ "$MAIN" = auto ]; then
+  MAIN=$(for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' '); do
+           readlink "/proc/$p/cwd" 2>/dev/null || true
+         done | grep -oP '/outputs/\K[^/]+' | sort -u | head -1)
+  if [ -z "$MAIN" ]; then
+    MAIN=$(ls -dt "${ROOTS[@]/%/\/*\/}" 2>/dev/null | while read -r d; do
+             [ -f "$d/_schedule.txt" ] && basename "$d" && break
+           done)
+  fi
+  [ -n "$MAIN" ] || { echo "未找到任何战役目录（无在跑进程，也无带 _schedule.txt 的 run）"; exit 1; }
+fi
+
+SRC=""
+for r in "${ROOTS[@]}"; do          # 优先带 _schedule.txt 的真实 run 目录
+  [ -f "$r/$MAIN/_schedule.txt" ] && { SRC="$r/$MAIN"; break; }
+done
+if [ -z "$SRC" ]; then
+  for r in "${ROOTS[@]}"; do
+    [ -d "$r/$MAIN" ] && { SRC="$r/$MAIN"; break; }
+  done
+fi
+[ -n "$SRC" ] || { echo "战役目录不存在: $MAIN"; exit 1; }
+echo "主战役: $MAIN  (源: $SRC)"
+
+# run 就在本仓 outputs 下时无需同步，直接原地读
+if [ "$SRC" != "/home/lichangxian/Power_das/outputs/$MAIN" ]; then
+  bash scripts/sync_v5_fronts.sh "$SRC"
+fi
+
+# 解析 LABEL=PATH。两组页面都把 FINAL_A 作为静态最终参照：第一组回放 main，
+# 第二组回放 CMP_A；每组各含面积/功耗两张图，入口页合计四张。
+CMP_A_LABEL=${CMP_A%%=*}
+CMP_A_DIR=${CMP_A#*=}
+FINAL_A_LABEL=${FINAL_A%%=*}
+FINAL_A_DIR=${FINAL_A#*=}
+[ -d "$CMP_A_DIR" ] || { echo "CMP_A 目录不存在: $CMP_A_DIR"; exit 1; }
+[ -d "$FINAL_A_DIR" ] || { echo "FINAL_A 目录不存在: $FINAL_A_DIR"; exit 1; }
+
+MAIN_VIEW="outputs/$MAIN/main_vs_FINAL_A.html"
+CMP_VIEW="outputs/$MAIN/CMP_A_vs_FINAL_A.html"
+BUILD_VERSION=$(date +%s%N)
+
+python3 scripts/gen_v5_front_viewer.py "outputs/$MAIN" "$MAIN_VIEW" \
+    --compare_final "$FINAL_A"
+python3 scripts/gen_v5_front_viewer.py "$CMP_A_DIR" "$CMP_VIEW" \
+    --compare_final "$FINAL_A"
+
+# 汇总入口：按指标排成 2x2（第一行面积、第二行功耗），并用 main 的 ep
+# 时间轴统一驱动四幅图。子页面仍完整嵌入 srcdoc，下载单个 HTML 可离线查看。
+python3 - "outputs/$MAIN/front_viewer.html" "$MAIN" \
+    "$CMP_A_LABEL" "$FINAL_A_LABEL" "$BUILD_VERSION" <<'PY'
+import html
+import json
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+main_label = html.escape(sys.argv[2])
+cmp_label = html.escape(sys.argv[3])
+final_label = html.escape(sys.argv[4])
+build_version = sys.argv[5]
+main_page = (out.parent / "main_vs_FINAL_A.html").read_text(encoding="utf-8")
+cmp_page = (out.parent / "CMP_A_vs_FINAL_A.html").read_text(encoding="utf-8")
+
+
+def embedded_data(page):
+    start = "const DATA = "
+    end = ";\nconst NS = "
+    try:
+        payload = page.split(start, 1)[1].split(end, 1)[0]
+    except IndexError as exc:
+        raise SystemExit("无法从子页面提取 DATA，gen_v5_front_viewer.py 模板可能已变化") from exc
+    return json.loads(payload)
+
+
+main_data = embedded_data(main_page)
+main_eps = sorted({snap["ep"] for run in main_data["runs"] if not run["static"]
+                   for snap in run["snaps"]})
+if not main_eps:
+    raise SystemExit("main 页面没有可回放的 episode")
+
+
+def panel_srcdoc(page, metric, viewer_id):
+    """保留一个指标卡片，隐藏子页面控件，并接收父页面发来的实际 ep。"""
+    hidden_card = 2 if metric == "area" else 1
+    panel_css = f"""
+<style>
+  body {{ padding:0 4px 8px !important; background:transparent !important; }}
+  body > h1, body > .sub, body > .ctrl, body > details {{ display:none !important; }}
+  body > .legend {{ margin:0 4px 8px !important; padding-top:2px; }}
+  .wrap {{ display:block !important; }}
+  .card {{ min-width:0 !important; width:100% !important; border:0 !important;
+           border-radius:0 !important; padding:0 !important; background:transparent !important; }}
+  .card:nth-child({hidden_card}) {{ display:none !important; }}
+  .card h2, .card .yl {{ display:none !important; }}
+</style>
+"""
+    bridge = f"""
+<script>
+(() => {{
+  function showEpisode(value) {{
+    const target = Number(value);
+    if (!Number.isFinite(target) || !epList.length) return;
+    let idx = 0;
+    for (let i = 0; i < epList.length; i++) {{
+      if (epList[i] <= target) idx = i; else break;
+    }}
+    stop();
+    slider.value = idx;
+    draw(idx);
+  }}
+  addEventListener("message", event => {{
+    if (event.data && event.data.type === "front-episode") showEpisode(event.data.ep);
+  }});
+  parent.postMessage({{type:"front-ready", viewer:{json.dumps(viewer_id)}}}, "*");
+}})();
+</script>
+"""
+    page = page.replace("</head>", panel_css + "</head>", 1)
+    page = page.replace("</body>", bridge + "</body>", 1)
+    return html.escape(page, quote=True)
+
+
+srcdocs = {
+    "main_area": panel_srcdoc(main_page, "area", "main-area"),
+    "cmp_area": panel_srcdoc(cmp_page, "area", "cmp-area"),
+    "main_power": panel_srcdoc(main_page, "power", "main-power"),
+    "cmp_power": panel_srcdoc(cmp_page, "power", "cmp-power"),
+}
+
+template = """<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>四图 Pareto 前沿回放</title>
+<style>
+  :root { --bg:#f6f6f4; --panel:#fff; --text:#111; --muted:#666; --line:#ddd; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#181817; --panel:#222221; --text:#fff; --muted:#bbb; --line:#3a3a38; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:22px 24px 40px; background:var(--bg); color:var(--text);
+         font:14px/1.5 system-ui,"PingFang SC","Microsoft YaHei",sans-serif; }
+  h1 { margin:0 0 4px; font-size:20px; }
+  .sub { color:var(--muted); margin-bottom:14px; }
+  .ctrl { display:flex; align-items:center; flex-wrap:wrap; gap:12px; padding:10px 14px;
+          margin-bottom:16px; background:var(--panel); border:1px solid var(--line);
+          border-radius:10px; }
+  .ctrl button { font:inherit; color:var(--text); background:none; border:1px solid var(--line);
+                 border-radius:8px; padding:4px 14px; cursor:pointer; }
+  #slider { flex:1; min-width:220px; accent-color:#2a78d6; }
+  #eplab { min-width:150px; font-weight:650; font-variant-numeric:tabular-nums; }
+  .cmp-toggle { display:flex; align-items:center; gap:5px; color:var(--muted);
+                white-space:nowrap; cursor:pointer; user-select:none; }
+  .cmp-toggle input { margin:0; accent-color:#2a78d6; }
+  .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+  section { min-width:0; padding:12px; background:var(--panel);
+            border:1px solid var(--line); border-radius:12px; }
+  h2 { margin:0 4px 8px; font-size:15px; }
+  .metric { color:var(--muted); font-weight:500; margin-right:7px; }
+  iframe { display:block; width:100%; height:500px; border:0; background:var(--panel); }
+  @media (max-width:900px) { .grid { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+  <h1>四图 Pareto 前沿回放</h1>
+  <div class="sub">第一行面积、第二行功耗；四图共用 main 的 episode 时间轴，FINAL_A (__FINAL_LABEL__) 为静态最终参照。</div>
+  <div class="ctrl">
+    <button id="play" type="button">▶ 播放</button>
+    <input id="slider" type="range" min="0" max="__EP_INDEX_MAX__" value="__EP_INDEX_MAX__" step="1">
+    <span id="eplab"></span>
+    <label class="cmp-toggle"><input id="showcmp" type="checkbox" checked>显示 CMP_A</label>
+  </div>
+  <main class="grid">
+    <section>
+      <h2><span class="metric">面积</span>main (__MAIN_LABEL__) vs FINAL_A (__FINAL_LABEL__)</h2>
+      <iframe srcdoc="__MAIN_AREA__" title="main vs FINAL_A 面积"></iframe>
+    </section>
+    <section class="cmp-panel">
+      <h2><span class="metric">面积</span>CMP_A (__CMP_LABEL__) vs FINAL_A (__FINAL_LABEL__)</h2>
+      <iframe srcdoc="__CMP_AREA__" title="CMP_A vs FINAL_A 面积"></iframe>
+    </section>
+    <section>
+      <h2><span class="metric">功耗</span>main (__MAIN_LABEL__) vs FINAL_A (__FINAL_LABEL__)</h2>
+      <iframe srcdoc="__MAIN_POWER__" title="main vs FINAL_A 功耗"></iframe>
+    </section>
+    <section class="cmp-panel">
+      <h2><span class="metric">功耗</span>CMP_A (__CMP_LABEL__) vs FINAL_A (__FINAL_LABEL__)</h2>
+      <iframe srcdoc="__CMP_POWER__" title="CMP_A vs FINAL_A 功耗"></iframe>
+    </section>
+  </main>
+<script>
+const MAIN_EPS = __MAIN_EPS__;
+const BUILD_VERSION = __BUILD_VERSION__;
+const slider = document.getElementById("slider");
+const playBtn = document.getElementById("play");
+const eplab = document.getElementById("eplab");
+const cmpToggle = document.getElementById("showcmp");
+const cmpPanels = [...document.querySelectorAll(".cmp-panel")];
+const frames = [...document.querySelectorAll("iframe")];
+const CMP_STORAGE_KEY = "front-show-cmp-a";
+let timer = null;
+
+async function checkForUpdate() {
+  try {
+    const response = await fetch("latest_front_viewer.version?t=" + Date.now(),
+                                 {cache:"no-store"});
+    if (!response.ok) return;
+    const version = (await response.text()).trim();
+    if (version && version !== BUILD_VERSION) location.reload();
+  } catch (_) {}
+}
+
+setInterval(checkForUpdate, 20000);
+addEventListener("focus", checkForUpdate);
+checkForUpdate();
+
+function setCmpVisibility(show) {
+  cmpToggle.checked = Boolean(show);
+  for (const panel of cmpPanels) panel.hidden = !show;
+}
+
+try {
+  const savedCmp = localStorage.getItem(CMP_STORAGE_KEY);
+  if (savedCmp !== null) cmpToggle.checked = savedCmp !== "0";
+} catch (_) {}
+
+cmpToggle.addEventListener("change", () => {
+  setCmpVisibility(cmpToggle.checked);
+  try { localStorage.setItem(CMP_STORAGE_KEY, cmpToggle.checked ? "1" : "0"); }
+  catch (_) {}
+});
+
+function selectedEpisode() {
+  const index = Math.max(0, Math.min(MAIN_EPS.length - 1, Number(slider.value)));
+  return MAIN_EPS[index];
+}
+
+function sync() {
+  const ep = selectedEpisode();
+  eplab.textContent = "ep " + ep + " / " + MAIN_EPS[MAIN_EPS.length - 1] + " (main)";
+  for (const frame of frames)
+    if (frame.contentWindow) frame.contentWindow.postMessage({type:"front-episode", ep}, "*");
+}
+function stop() {
+  if (!timer) return;
+  clearInterval(timer); timer = null; playBtn.textContent = "▶ 播放";
+}
+function nextSnapshot() {
+  const nextIndex = Number(slider.value) + 1;
+  if (nextIndex >= MAIN_EPS.length) { stop(); return false; }
+  slider.value = nextIndex; sync(); return true;
+}
+
+slider.addEventListener("input", () => { stop(); sync(); });
+playBtn.addEventListener("click", () => {
+  if (timer) { stop(); return; }
+  if (Number(slider.value) >= MAIN_EPS.length - 1) slider.value = 0;
+  sync(); playBtn.textContent = "⏸ 暂停";
+  timer = setInterval(nextSnapshot, 500);
+});
+addEventListener("message", event => {
+  if (event.data && event.data.type === "front-ready") sync();
+});
+addEventListener("keydown", event => {
+  if (event.key === "ArrowRight") { stop(); nextSnapshot(); }
+  if (event.key === "ArrowLeft") {
+    stop();
+    const previousIndex = Number(slider.value) - 1;
+    if (previousIndex >= 0) { slider.value = previousIndex; sync(); }
+  }
+  if (event.key === " ") { event.preventDefault(); playBtn.click(); }
+});
+for (const frame of frames) frame.addEventListener("load", sync);
+setCmpVisibility(cmpToggle.checked);
+sync();
+</script>
+</body>
+</html>
+"""
+
+replacements = {
+    "__MAIN_LABEL__": main_label,
+    "__CMP_LABEL__": cmp_label,
+    "__FINAL_LABEL__": final_label,
+    "__BUILD_VERSION__": json.dumps(build_version),
+    "__EP_INDEX_MAX__": str(len(main_eps) - 1),
+    "__MAIN_EPS__": json.dumps(main_eps, separators=(",", ":")),
+    "__MAIN_AREA__": srcdocs["main_area"],
+    "__CMP_AREA__": srcdocs["cmp_area"],
+    "__MAIN_POWER__": srcdocs["main_power"],
+    "__CMP_POWER__": srcdocs["cmp_power"],
+}
+for key, value in replacements.items():
+    template = template.replace(key, value)
+out.write_text(template, encoding="utf-8")
+print("saved ->", out)
+PY
+
+cp "outputs/$MAIN/front_viewer.html" outputs/latest_front_viewer.html
+printf '%s\n' "$BUILD_VERSION" > outputs/latest_front_viewer.version
+
+# 常驻 HTTP 服务（幂等）：VSCode 会自动转发端口，浏览器里刷新即最新
+if ! pgrep -f "http.server $PORT" >/dev/null 2>&1; then
+  nohup python3 -m http.server "$PORT" \
+      --directory /home/lichangxian/Power_das/outputs \
+      >/tmp/front_viewer_http.log 2>&1 &
+  sleep 0.5
+fi
+echo "浏览器打开/刷新: http://localhost:$PORT/latest_front_viewer.html"
