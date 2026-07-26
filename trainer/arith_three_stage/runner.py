@@ -19,6 +19,7 @@ from utils import CompressorTree
 from .bandit import ContextualThompsonBandit
 from .candidate import Candidate
 from .cell_ops import CELL_ARMS, CellOperator
+from .cem import RoutingCEM
 from .evaluator import V5CandidateEvaluator
 from .pareto import (
     ExternalArchive,
@@ -56,10 +57,21 @@ class ThreeStageConfig:
     stage3_num_epochs: int = 1
     stage3_ratio_mode: str = "trajectory"
     stage3_learning_rate: float = 1e-4
+    stage3_normalize_advantage: bool = True
     stage3_policy_mode: str = "ppo"
     stage3_rule_loss_weight: float = 0.0
     stage3_discrete_loss_weight: float = 0.0
     stage3_discrete_start_fraction: float = 0.5
+    stage3_cem_elite_fraction: float = 0.20
+    stage3_cem_smoothing: float = 0.25
+    stage3_cem_exploration: float = 0.05
+    stage3_cem_temperature: float = 1.0
+    stage3_cem_init: str = "policy"
+    stage3_cem_reheat_patience: int = 30
+    stage3_cem_reheat_entropy_threshold: float = 0.25
+    stage3_cem_reheat_temperature: float = 2.0
+    stage3_cem_reheat_episodes: int = 10
+    stage3_cem_restart_fraction: float = 0.30
     checkpoint_every: int = 1
     front_snapshot_every: int = 5
     infrastructure_retries: int = 2
@@ -92,6 +104,25 @@ def _atomic_torch(path: str, payload) -> None:
 def _load_candidates(path: str) -> List[Candidate]:
     with open(path) as f:
         return [Candidate.from_dict(x) for x in json.load(f)]
+
+
+def _partial_restart_logits(current, initial, fraction: float, rng: random.Random):
+    """Reset a reproducible subset of complete (stage, column) CEM blocks."""
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("CEM restart fraction must be in (0, 1]")
+    current_keys = sorted(current)
+    if current_keys != sorted(initial):
+        raise ValueError("current and initial CEM logits have different blocks")
+    count = max(1, int(math.ceil(fraction * len(current_keys))))
+    selected = set(rng.sample(current_keys, count))
+    restarted = RoutingCEM._clone_logits(current)
+    for key in selected:
+        if set(current[key]) != set(initial[key]):
+            raise ValueError(f"CEM restart block fields differ at {key}")
+        restarted[key] = {
+            name: value.detach().clone() for name, value in initial[key].items()
+        }
+    return restarted, sorted(selected)
 
 
 class ThreeStageRunner:
@@ -179,8 +210,9 @@ class ThreeStageRunner:
         logging.info(
             "single-elite Stage 3: source=%s index=%s id=%s role=%s "
             "episodes=%d routes=%d ppo_epochs=%d ratio_mode=%s lr=%.3g "
-            "policy_mode=%s rule_weight=%.3g discrete_weight=%.3g "
-            "discrete_start=%.3f",
+            "normalize_advantage=%s policy_mode=%s rule_weight=%.3g discrete_weight=%.3g "
+            "discrete_start=%.3f cem=(elite=%.3f smooth=%.3f explore=%.3f "
+            "temp=%.3f init=%s)",
             self.cfg.stage3_single_elite_source,
             self.cfg.stage3_single_elite_index,
             elite.candidate_id,
@@ -190,10 +222,16 @@ class ThreeStageRunner:
             self.cfg.stage3_num_epochs,
             self.cfg.stage3_ratio_mode,
             self.cfg.stage3_learning_rate,
+            self.cfg.stage3_normalize_advantage,
             self.cfg.stage3_policy_mode,
             self.cfg.stage3_rule_loss_weight,
             self.cfg.stage3_discrete_loss_weight,
             self.cfg.stage3_discrete_start_fraction,
+            self.cfg.stage3_cem_elite_fraction,
+            self.cfg.stage3_cem_smoothing,
+            self.cfg.stage3_cem_exploration,
+            self.cfg.stage3_cem_temperature,
+            self.cfg.stage3_cem_init,
         )
         try:
             self._load_or_run_stage3([elite])
@@ -583,9 +621,12 @@ class ThreeStageRunner:
                 "Stage 3 ratio mode must be 'trajectory' or 'action', got "
                 f"{self.cfg.stage3_ratio_mode!r}"
             )
-        if self.cfg.stage3_policy_mode not in ("ppo", "frozen", "random"):
+        if self.cfg.stage3_policy_mode not in (
+            "ppo", "frozen", "random", "cem", "cem_reheat"
+        ):
             raise ValueError(
-                "Stage 3 policy mode must be 'ppo', 'frozen', or 'random', got "
+                "Stage 3 policy mode must be 'ppo', 'frozen', 'random', "
+                "'cem', or 'cem_reheat', got "
                 f"{self.cfg.stage3_policy_mode!r}"
             )
         if self.cfg.stage3_rule_loss_weight < 0:
@@ -598,7 +639,27 @@ class ThreeStageRunner:
             self.cfg.stage3_rule_loss_weight > 0
             or self.cfg.stage3_discrete_loss_weight > 0
         ):
-            raise ValueError("frozen/random controls cannot enable auxiliary losses")
+            raise ValueError("non-PPO Stage 3 modes cannot enable auxiliary losses")
+        if not 0.0 < self.cfg.stage3_cem_elite_fraction <= 1.0:
+            raise ValueError("Stage 3 CEM elite fraction must be in (0, 1]")
+        if not 0.0 < self.cfg.stage3_cem_smoothing <= 1.0:
+            raise ValueError("Stage 3 CEM smoothing must be in (0, 1]")
+        if not 0.0 <= self.cfg.stage3_cem_exploration < 1.0:
+            raise ValueError("Stage 3 CEM exploration must be in [0, 1)")
+        if self.cfg.stage3_cem_temperature <= 0.0:
+            raise ValueError("Stage 3 CEM temperature must be > 0")
+        if self.cfg.stage3_cem_init not in ("policy", "uniform"):
+            raise ValueError("Stage 3 CEM init must be 'policy' or 'uniform'")
+        if self.cfg.stage3_cem_reheat_patience < 1:
+            raise ValueError("Stage 3 CEM reheat patience must be positive")
+        if not 0.0 <= self.cfg.stage3_cem_reheat_entropy_threshold <= 1.0:
+            raise ValueError("Stage 3 CEM reheat entropy threshold must be in [0, 1]")
+        if self.cfg.stage3_cem_reheat_temperature <= 0.0:
+            raise ValueError("Stage 3 CEM reheat temperature must be positive")
+        if self.cfg.stage3_cem_reheat_episodes < 1:
+            raise ValueError("Stage 3 CEM reheat episodes must be positive")
+        if not 0.0 < self.cfg.stage3_cem_restart_fraction <= 1.0:
+            raise ValueError("Stage 3 CEM restart fraction must be in (0, 1]")
         done = os.path.join(self.run_dir, "final", "pareto.json")
         checkpoint = os.path.join(self.run_dir, "stage3", "checkpoint.pt")
         if os.path.exists(done) and not os.path.exists(checkpoint):
@@ -613,6 +674,16 @@ class ThreeStageRunner:
             r: torch.optim.Adam(self.engine.gcn.parameters(), lr=self.cfg.stage3_learning_rate)
             for r in roles
         }
+        cem = RoutingCEM(
+            self.engine,
+            smoothing=self.cfg.stage3_cem_smoothing,
+            exploration=self.cfg.stage3_cem_exploration,
+            temperature=self.cfg.stage3_cem_temperature,
+            init_mode=self.cfg.stage3_cem_init,
+        )
+        cem_logits = {}
+        cem_initial_logits = {}
+        cem_reheat_states = {}
         final_archive = self._new_archive(3)
         for stage in (1, 2):
             path = os.path.join(self.run_dir, f"stage{stage}", "archive.json")
@@ -654,6 +725,15 @@ class ThreeStageRunner:
                     f"checkpoint={checkpoint_lr} "
                     f"requested={self.cfg.stage3_learning_rate}"
                 )
+            checkpoint_normalize_advantage = state.get(
+                "stage3_normalize_advantage", True
+            )
+            if checkpoint_normalize_advantage != self.cfg.stage3_normalize_advantage:
+                raise ValueError(
+                    "Stage 3 checkpoint advantage-normalization mismatch: "
+                    f"checkpoint={checkpoint_normalize_advantage} "
+                    f"requested={self.cfg.stage3_normalize_advantage}"
+                )
             checkpoint_policy_mode = state.get("stage3_policy_mode", "ppo")
             if checkpoint_policy_mode != self.cfg.stage3_policy_mode:
                 raise ValueError(
@@ -665,10 +745,46 @@ class ThreeStageRunner:
                 ("stage3_rule_loss_weight", self.cfg.stage3_rule_loss_weight),
                 ("stage3_discrete_loss_weight", self.cfg.stage3_discrete_loss_weight),
                 ("stage3_discrete_start_fraction", self.cfg.stage3_discrete_start_fraction),
+                ("stage3_cem_elite_fraction", self.cfg.stage3_cem_elite_fraction),
+                ("stage3_cem_smoothing", self.cfg.stage3_cem_smoothing),
+                ("stage3_cem_exploration", self.cfg.stage3_cem_exploration),
+                ("stage3_cem_temperature", self.cfg.stage3_cem_temperature),
+                ("stage3_cem_reheat_entropy_threshold", self.cfg.stage3_cem_reheat_entropy_threshold),
+                ("stage3_cem_reheat_temperature", self.cfg.stage3_cem_reheat_temperature),
+                ("stage3_cem_restart_fraction", self.cfg.stage3_cem_restart_fraction),
             ):
-                default = 0.0 if "weight" in key else 0.5
+                defaults = {
+                    "stage3_rule_loss_weight": 0.0,
+                    "stage3_discrete_loss_weight": 0.0,
+                    "stage3_discrete_start_fraction": 0.5,
+                    "stage3_cem_elite_fraction": 0.20,
+                    "stage3_cem_smoothing": 0.25,
+                    "stage3_cem_exploration": 0.05,
+                    "stage3_cem_temperature": 1.0,
+                    "stage3_cem_reheat_entropy_threshold": 0.25,
+                    "stage3_cem_reheat_temperature": 2.0,
+                    "stage3_cem_restart_fraction": 0.30,
+                }
+                default = defaults[key]
                 checkpoint_value = float(state.get(key, default))
                 if not math.isclose(checkpoint_value, requested, rel_tol=0.0, abs_tol=1e-15):
+                    raise ValueError(
+                        f"Stage 3 checkpoint {key} mismatch: "
+                        f"checkpoint={checkpoint_value} requested={requested}"
+                    )
+            checkpoint_cem_init = state.get("stage3_cem_init", "policy")
+            if checkpoint_cem_init != self.cfg.stage3_cem_init:
+                raise ValueError(
+                    "Stage 3 checkpoint CEM-init mismatch: "
+                    f"checkpoint={checkpoint_cem_init} "
+                    f"requested={self.cfg.stage3_cem_init}"
+                )
+            for key, requested, default in (
+                ("stage3_cem_reheat_patience", self.cfg.stage3_cem_reheat_patience, 30),
+                ("stage3_cem_reheat_episodes", self.cfg.stage3_cem_reheat_episodes, 10),
+            ):
+                checkpoint_value = int(state.get(key, default))
+                if checkpoint_value != requested:
                     raise ValueError(
                         f"Stage 3 checkpoint {key} mismatch: "
                         f"checkpoint={checkpoint_value} requested={requested}"
@@ -687,6 +803,20 @@ class ThreeStageRunner:
             final_archive.items = [Candidate.from_dict(x) for x in state["archive"]]
             final_archive.update(())
             self.rng.setstate(state["rng_state"])
+            cem_logits = state.get("cem_logits", {})
+            cem_initial_logits = state.get("cem_initial_logits", {})
+            cem_reheat_states = state.get("cem_reheat_states", {})
+            torch_rng_state = state.get("torch_rng_state")
+            if torch_rng_state is not None:
+                # The checkpoint is loaded with map_location=self.engine.device,
+                # which also moves RNG byte tensors to CUDA.  PyTorch's RNG
+                # restoration APIs require their serialized state on CPU.
+                torch.set_rng_state(torch_rng_state.detach().cpu())
+            device_rng_state = state.get("device_rng_state")
+            if device_rng_state is not None and str(self.engine.device).startswith("cuda"):
+                torch.cuda.set_rng_state(
+                    device_rng_state.detach().cpu(), device=self.engine.device
+                )
             logging.info("resuming Stage 3 at schedule item %d/%d", start, len(schedule))
         if start >= len(schedule):
             if not os.path.exists(done):
@@ -705,7 +835,7 @@ class ThreeStageRunner:
                 start, len(schedule),
             )
 
-        self.engine.normalize_advantage = True
+        self.engine.normalize_advantage = self.cfg.stage3_normalize_advantage
         self._save_front_snapshot(3, start, final_archive.items)
         for schedule_index in range(start, len(schedule)):
             episode, elite_idx = schedule[schedule_index]
@@ -713,8 +843,47 @@ class ThreeStageRunner:
             role = str(baseline.metadata.get("selection_role", "knee"))
             self.engine.gcn.load_state_dict(model_states[role])
             self.evaluator._prepare(baseline)
+            cem_mode = self.cfg.stage3_policy_mode in ("cem", "cem_reheat")
+            reheat_active = False
+            sampling_temperature = self.cfg.stage3_cem_temperature
             with torch.no_grad():
-                logits = self.engine.get_Z_mat()
+                if cem_mode:
+                    if baseline.candidate_id not in cem_logits:
+                        policy_logits = self.engine.get_Z_mat()
+                        initial = cem.initialize(policy_logits)
+                        cem_initial_logits[baseline.candidate_id] = (
+                            RoutingCEM._clone_logits(initial)
+                        )
+                        cem_logits[baseline.candidate_id] = (
+                            RoutingCEM._clone_logits(initial)
+                        )
+                    if baseline.candidate_id not in cem_initial_logits:
+                        policy_logits = self.engine.get_Z_mat()
+                        cem_initial_logits[baseline.candidate_id] = cem.initialize(
+                            policy_logits
+                        )
+                    if self.cfg.stage3_policy_mode == "cem_reheat":
+                        reheat_state = cem_reheat_states.setdefault(
+                            baseline.candidate_id,
+                            {
+                                "best_reward": float("-inf"),
+                                "stagnation": 0,
+                                "restart_count": 0,
+                                "reheat_remaining": 0,
+                            },
+                        )
+                        reheat_active = int(reheat_state["reheat_remaining"]) > 0
+                        if reheat_active:
+                            sampling_temperature = (
+                                self.cfg.stage3_cem_reheat_temperature
+                            )
+                    cem.temperature = sampling_temperature
+                    logits = cem_logits[baseline.candidate_id]
+                    sampled = cem.sample_many(
+                        logits, self.cfg.stage3_routes_per_episode
+                    )
+                else:
+                    logits = self.engine.get_Z_mat()
                 if self.cfg.stage3_policy_mode == "random":
                     logits = {
                         key: {
@@ -723,25 +892,38 @@ class ThreeStageRunner:
                         }
                         for key, value_dict in logits.items()
                     }
-                sampled = [
-                    self.engine.sample_from_logits(logits)
-                    for _ in range(self.cfg.stage3_routes_per_episode)
-                ]
+                if not cem_mode:
+                    sampled = [
+                        self.engine.sample_from_logits(logits)
+                        for _ in range(self.cfg.stage3_routes_per_episode)
+                    ]
             route_candidates = []
             for connection, old_log_prob in sampled:
                 c = baseline.clone(stage=3)
                 c.routing = connection
                 c.operator = f"{self.cfg.stage3_policy_mode}_{role}"
-                c.metadata.update({
+                route_metadata = {
                     "baseline_id": baseline.candidate_id,
                     "selection_role": role,
                     "mred_band_edges": baseline.metadata.get("mred_band_edges"),
-                    "old_log_prob": float(old_log_prob),
-                    "policy_scope": "single_elite" if len(elites) == 1 else "role_shared",
+                    "policy_scope": (
+                        "single_elite"
+                        if len(elites) == 1
+                        else (
+                            "elite_specific"
+                            if cem_mode
+                            else "role_shared"
+                        )
+                    ),
                     "stage3_policy_mode": self.cfg.stage3_policy_mode,
                     "stage3_episode": episode + 1,
                     "stage3_schedule_index": schedule_index + 1,
-                })
+                }
+                if cem_mode:
+                    route_metadata["cem_matching_score"] = float(old_log_prob)
+                else:
+                    route_metadata["old_log_prob"] = float(old_log_prob)
+                c.metadata.update(route_metadata)
                 c.refresh_id()
                 route_candidates.append(c)
             self._evaluate_with_retries(route_candidates)
@@ -840,6 +1022,113 @@ class ThreeStageRunner:
                     schedule_index + 1, len(schedule), elite_idx, episode + 1,
                     role, len(usable), ",".join(f"{x:.6g}" for x in loss_values),
                 )
+            elif len(usable) >= 2 and cem_mode:
+                ranked = sorted(
+                    usable,
+                    key=lambda candidate: self._routing_objective(candidate, baseline),
+                )
+                elite_count = max(
+                    2,
+                    min(
+                        len(ranked),
+                        int(math.ceil(
+                            self.cfg.stage3_cem_elite_fraction * len(ranked)
+                        )),
+                    ),
+                )
+                chosen = ranked[:elite_count]
+                cem_logits[baseline.candidate_id], cem_stats = cem.update(
+                    cem_logits[baseline.candidate_id],
+                    [candidate.routing for candidate in chosen],
+                )
+                rewards = [
+                    -self._routing_objective(candidate, baseline)
+                    for candidate in usable
+                ]
+                if self.cfg.stage3_policy_mode == "cem_reheat":
+                    reheat_state = cem_reheat_states[baseline.candidate_id]
+                    episode_best = float(max(rewards))
+                    if episode_best > float(reheat_state["best_reward"]) + 1.0e-12:
+                        reheat_state["best_reward"] = episode_best
+                        reheat_state["stagnation"] = 0
+                    else:
+                        reheat_state["stagnation"] = int(
+                            reheat_state["stagnation"]
+                        ) + 1
+                    if reheat_active:
+                        reheat_state["reheat_remaining"] = max(
+                            0, int(reheat_state["reheat_remaining"]) - 1
+                        )
+                    restart_blocks = []
+                    restart_triggered = (
+                        not reheat_active
+                        and int(reheat_state["reheat_remaining"]) == 0
+                        and int(reheat_state["stagnation"])
+                        >= self.cfg.stage3_cem_reheat_patience
+                        and float(cem_stats["normalized_entropy"])
+                        < self.cfg.stage3_cem_reheat_entropy_threshold
+                    )
+                    if restart_triggered:
+                        (
+                            cem_logits[baseline.candidate_id],
+                            restart_blocks,
+                        ) = _partial_restart_logits(
+                            cem_logits[baseline.candidate_id],
+                            cem_initial_logits[baseline.candidate_id],
+                            self.cfg.stage3_cem_restart_fraction,
+                            self.rng,
+                        )
+                        reheat_state["restart_count"] = int(
+                            reheat_state["restart_count"]
+                        ) + 1
+                        reheat_state["reheat_remaining"] = (
+                            self.cfg.stage3_cem_reheat_episodes
+                        )
+                        reheat_state["stagnation"] = 0
+                        cem_stats = cem.stats(cem_logits[baseline.candidate_id])
+                    logging.info(
+                        "Stage 3 CEM-REHEAT %d/%d elite=%d ep=%d role=%s "
+                        "usable=%d selected=%d reward(mean=%.6g best=%.6g "
+                        "cutoff=%.6g) entropy=%.4f mean_max_p=%.4f "
+                        "temp=%.3f stagnation=%d reheat_left=%d restarts=%d "
+                        "restart_triggered=%s restart_blocks=%d",
+                        schedule_index + 1,
+                        len(schedule),
+                        elite_idx,
+                        episode + 1,
+                        role,
+                        len(usable),
+                        elite_count,
+                        float(np.mean(rewards)),
+                        episode_best,
+                        float(-self._routing_objective(chosen[-1], baseline)),
+                        cem_stats["normalized_entropy"],
+                        cem_stats["mean_max_probability"],
+                        sampling_temperature,
+                        int(reheat_state["stagnation"]),
+                        int(reheat_state["reheat_remaining"]),
+                        int(reheat_state["restart_count"]),
+                        restart_triggered,
+                        len(restart_blocks),
+                    )
+                else:
+                    logging.info(
+                        "Stage 3 CEM %d/%d elite=%d ep=%d role=%s usable=%d "
+                        "selected=%d reward(mean=%.6g best=%.6g cutoff=%.6g) "
+                        "entropy=%.4f mean_max_p=%.4f",
+                        schedule_index + 1,
+                        len(schedule),
+                        elite_idx,
+                        episode + 1,
+                        role,
+                        len(usable),
+                        elite_count,
+                        float(np.mean(rewards)),
+                        float(max(rewards)),
+                        float(-self._routing_objective(chosen[-1], baseline)),
+                        cem_stats["normalized_entropy"],
+                        cem_stats["mean_max_probability"],
+                    )
             elif len(usable) < 2:
                 logging.warning("Stage 3 elite=%d has only %d usable routes", elite_idx, len(usable))
             else:
@@ -858,15 +1147,35 @@ class ThreeStageRunner:
                     "stage3_num_epochs": self.cfg.stage3_num_epochs,
                     "stage3_ratio_mode": self.cfg.stage3_ratio_mode,
                     "stage3_learning_rate": self.cfg.stage3_learning_rate,
+                    "stage3_normalize_advantage": self.cfg.stage3_normalize_advantage,
                     "stage3_policy_mode": self.cfg.stage3_policy_mode,
                     "stage3_rule_loss_weight": self.cfg.stage3_rule_loss_weight,
                     "stage3_discrete_loss_weight": self.cfg.stage3_discrete_loss_weight,
                     "stage3_discrete_start_fraction": self.cfg.stage3_discrete_start_fraction,
+                    "stage3_cem_elite_fraction": self.cfg.stage3_cem_elite_fraction,
+                    "stage3_cem_smoothing": self.cfg.stage3_cem_smoothing,
+                    "stage3_cem_exploration": self.cfg.stage3_cem_exploration,
+                    "stage3_cem_temperature": self.cfg.stage3_cem_temperature,
+                    "stage3_cem_init": self.cfg.stage3_cem_init,
+                    "stage3_cem_reheat_patience": self.cfg.stage3_cem_reheat_patience,
+                    "stage3_cem_reheat_entropy_threshold": self.cfg.stage3_cem_reheat_entropy_threshold,
+                    "stage3_cem_reheat_temperature": self.cfg.stage3_cem_reheat_temperature,
+                    "stage3_cem_reheat_episodes": self.cfg.stage3_cem_reheat_episodes,
+                    "stage3_cem_restart_fraction": self.cfg.stage3_cem_restart_fraction,
                     "elite_ids": [c.candidate_id for c in elites],
                     "model_states": model_states,
                     "optimizer_states": {r: optimizers[r].state_dict() for r in roles},
+                    "cem_logits": cem_logits,
+                    "cem_initial_logits": cem_initial_logits,
+                    "cem_reheat_states": cem_reheat_states,
                     "archive": final_archive.to_list(),
                     "rng_state": self.rng.getstate(),
+                    "torch_rng_state": torch.get_rng_state(),
+                    "device_rng_state": (
+                        torch.cuda.get_rng_state(device=self.engine.device)
+                        if str(self.engine.device).startswith("cuda")
+                        else None
+                    ),
                 },
             )
 

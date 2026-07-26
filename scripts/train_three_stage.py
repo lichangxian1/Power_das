@@ -1,5 +1,5 @@
  #!/usr/bin/env python3
-"""Launch the resumable structure -> cell NSGA-II -> routing PPO search."""
+"""Launch the resumable structure -> cell NSGA-II -> routing search."""
 from __future__ import annotations
 
 import argparse
@@ -81,7 +81,7 @@ def build_engine(args):
             "approx_lib_path": args.approx_lib_path,
             "approx42_library_path": args.approx42_library_path,
             "approx42_rtl_path": args.approx42_rtl_path,
-            "normalize_advantage": True,
+            "normalize_advantage": bool(args.stage3_normalize_advantage),
         }
     )
     stage3_elites = 1 if getattr(args, "stage3_single_elite_index", None) is not None else 24
@@ -138,12 +138,20 @@ def main() -> None:
         help="Adam learning rate for Stage-3 PPO updates",
     )
     p.add_argument(
+        "--stage3_normalize_advantage",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="normalize Stage-3 PPO advantages within each real-evaluated batch",
+    )
+    p.add_argument(
         "--stage3_policy_mode",
-        choices=("ppo", "frozen", "random"),
+        choices=("ppo", "frozen", "random", "cem", "cem_reheat"),
         default="ppo",
         help=(
             "ppo updates the sampled policy; frozen samples the identical initial "
-            "policy without updates; random samples uniformly over legal actions"
+            "policy without updates; random samples uniformly over legal actions; "
+            "cem updates direct routing logits from DC/Verilator-selected matchings; "
+            "cem_reheat adds stagnation-triggered partial restart and temporary reheating"
         ),
     )
     p.add_argument(
@@ -164,6 +172,43 @@ def main() -> None:
         default=0.5,
         help="episode fraction at which discrete-loss weight starts linear ramp-up",
     )
+    p.add_argument(
+        "--stage3_cem_elite_fraction",
+        type=float,
+        default=0.20,
+        help="fraction of each real-evaluated Stage-3 batch used for CEM updates",
+    )
+    p.add_argument(
+        "--stage3_cem_smoothing",
+        type=float,
+        default=0.25,
+        help="CEM interpolation weight from old probabilities to elite frequencies",
+    )
+    p.add_argument(
+        "--stage3_cem_exploration",
+        type=float,
+        default=0.05,
+        help="uniform probability mixed into every CEM update",
+    )
+    p.add_argument(
+        "--stage3_cem_temperature",
+        type=float,
+        default=1.0,
+        help="logit temperature for Gumbel-Hungarian CEM sampling",
+    )
+    p.add_argument(
+        "--stage3_cem_init",
+        choices=("policy", "uniform"),
+        default="policy",
+        help="initialize direct CEM logits from the initial policy or uniformly",
+    )
+    p.add_argument("--stage3_cem_reheat_patience", type=int, default=30)
+    p.add_argument(
+        "--stage3_cem_reheat_entropy_threshold", type=float, default=0.25
+    )
+    p.add_argument("--stage3_cem_reheat_temperature", type=float, default=2.0)
+    p.add_argument("--stage3_cem_reheat_episodes", type=int, default=10)
+    p.add_argument("--stage3_cem_restart_fraction", type=float, default=0.30)
     p.add_argument(
         "--stage3_single_elite_source",
         help="Stage-2 elites_24.json to use for an isolated Stage-3-only ablation",
@@ -240,8 +285,14 @@ def main() -> None:
     )
     if args.population != 128 or args.offspring != 128:
         raise SystemExit("正式三阶段实现当前固定 P=128, Q=128")
-    if args.dc_batch != 64:
-        raise SystemExit("正式三阶段实现当前固定每批64个候选")
+    isolated_stage3 = (
+        args.stage3_single_elite_source is not None
+        and args.stage3_single_elite_index is not None
+    )
+    if args.dc_batch != 64 and not (isolated_stage3 and args.dc_batch == 32):
+        raise SystemExit(
+            "完整三阶段固定每批64个候选；单点Stage3对照允许每批32或64个候选"
+        )
     if args.stage3_num_epochs < 1:
         raise SystemExit("--stage3_num_epochs 必须 >= 1")
     if args.stage3_learning_rate <= 0:
@@ -252,11 +303,29 @@ def main() -> None:
         raise SystemExit("--stage3_discrete_loss_weight 必须 >= 0")
     if not 0 <= args.stage3_discrete_start_fraction <= 1:
         raise SystemExit("--stage3_discrete_start_fraction 必须在 [0, 1] 内")
+    if not 0 < args.stage3_cem_elite_fraction <= 1:
+        raise SystemExit("--stage3_cem_elite_fraction 必须在 (0, 1] 内")
+    if not 0 < args.stage3_cem_smoothing <= 1:
+        raise SystemExit("--stage3_cem_smoothing 必须在 (0, 1] 内")
+    if not 0 <= args.stage3_cem_exploration < 1:
+        raise SystemExit("--stage3_cem_exploration 必须在 [0, 1) 内")
+    if args.stage3_cem_temperature <= 0:
+        raise SystemExit("--stage3_cem_temperature 必须 > 0")
+    if args.stage3_cem_reheat_patience < 1:
+        raise SystemExit("--stage3_cem_reheat_patience 必须为正数")
+    if not 0 <= args.stage3_cem_reheat_entropy_threshold <= 1:
+        raise SystemExit("--stage3_cem_reheat_entropy_threshold 必须在 [0, 1] 内")
+    if args.stage3_cem_reheat_temperature <= 0:
+        raise SystemExit("--stage3_cem_reheat_temperature 必须 > 0")
+    if args.stage3_cem_reheat_episodes < 1:
+        raise SystemExit("--stage3_cem_reheat_episodes 必须为正数")
+    if not 0 < args.stage3_cem_restart_fraction <= 1:
+        raise SystemExit("--stage3_cem_restart_fraction 必须在 (0, 1] 内")
     if args.stage3_policy_mode != "ppo" and (
         args.stage3_rule_loss_weight > 0
         or args.stage3_discrete_loss_weight > 0
     ):
-        raise SystemExit("frozen/random 对照不能启用 rule/discrete 辅助损失")
+        raise SystemExit("非 PPO Stage 3 模式不能启用 rule/discrete 辅助损失")
     single_elite_mode = (
         args.stage3_single_elite_source is not None
         or args.stage3_single_elite_index is not None
@@ -309,10 +378,21 @@ def main() -> None:
         stage3_num_epochs=args.stage3_num_epochs,
         stage3_ratio_mode=args.stage3_ratio_mode,
         stage3_learning_rate=args.stage3_learning_rate,
+        stage3_normalize_advantage=args.stage3_normalize_advantage,
         stage3_policy_mode=args.stage3_policy_mode,
         stage3_rule_loss_weight=args.stage3_rule_loss_weight,
         stage3_discrete_loss_weight=args.stage3_discrete_loss_weight,
         stage3_discrete_start_fraction=args.stage3_discrete_start_fraction,
+        stage3_cem_elite_fraction=args.stage3_cem_elite_fraction,
+        stage3_cem_smoothing=args.stage3_cem_smoothing,
+        stage3_cem_exploration=args.stage3_cem_exploration,
+        stage3_cem_temperature=args.stage3_cem_temperature,
+        stage3_cem_init=args.stage3_cem_init,
+        stage3_cem_reheat_patience=args.stage3_cem_reheat_patience,
+        stage3_cem_reheat_entropy_threshold=args.stage3_cem_reheat_entropy_threshold,
+        stage3_cem_reheat_temperature=args.stage3_cem_reheat_temperature,
+        stage3_cem_reheat_episodes=args.stage3_cem_reheat_episodes,
+        stage3_cem_restart_fraction=args.stage3_cem_restart_fraction,
         front_snapshot_every=args.front_snapshot_every,
         stage1_archive_variants_per_objective=args.stage1_archive_variants_per_objective,
         stage2_archive_variants_per_objective=args.stage2_archive_variants_per_objective,

@@ -1,0 +1,498 @@
+
+===== PAGE 1 =====
+IEICE Electronics Express, Vol.21, No.14, 1–5
+LETTER
+Two energy eﬃcient unsigned approximate multipliers with N-4 compres-
+sors
+Xiaohui Zhang1, 2, Yi Zhan1, a), Zenghui Yu1, Yinglei Dong1, 2, and Yadong Wang1, 2
+Abstract
+Approximate computing stands as a highly promising approach
+in curbing power consumption and enhancing energy eﬃciency in error-
+tolerant applications, such as image processing and neural networks. This
+brief introduces two unsigned approximate multiplier designs: MUL1, tai-
+lored for high-precision applications, and MUL2, optimized for low-power
+usage. Furthermore, we propose Approximate N-4 compressors, which
+are devised based on input reordering circuits, along with a novel approx-
+imate 4-2 compressor that align positive and negative approximations for
+input patterns sharing the same probability. These proposed approximate
+multipliers have been synthesized using 40nm technology, demonstrating
+remarkable improvements. In comparison to the exact multiplier, the ﬁrst
+proposed multiplier boasts an 84.98% enhancement in the power-delay-
+area product (PDAP), while the second multiplier achieves an even more
+signiﬁcant improvement of 97.22% in this parameter.
+Keywords: approximate computing, multiplier, N-4 compressors, high pre-
+cision design, low-power design, image processing
+Classiﬁcation:
+Integrated circuits
+1.
+Introduction
+Constrained by human perception, a discrepancy exists be-
+tween the precision demanded by humans and the accuracy
+delivered by exact computing systems. Tailoring the calcu-
+lation accuracy to align with human requirements can signif-
+icantly enhance energy eﬃciency, and approximate comput-
+ing serves as an eﬃcient method to modulate this accuracy
+[1, 2].
+Approximate computing holds promise in various error-
+tolerant applications, including image processing [3, 6, 18,
+29] and neural networks [2, 4, 19]. Multipliers, as fundamen-
+tal subsystems in digital signal processors, ﬁnd applications
+across a broad spectrum, from ﬁltering to neural networks.
+Nevertheless, multipliers possess intricate designs and of-
+ten contribute signiﬁcantly to power consumption and delay
+time in system designs. Consequently, approximate multi-
+pliers have garnered signiﬁcant attention in recent years, as
+they oﬀer a potential solution to these challenges.
+Approximate unsigned multipliers are widely utilized in
+numerous approximation applications. The computational
+process of an unsigned multiplier typically encompasses
+three stages: partial product generation, partial product com-
+1 Institute of Microelectronics of Chinese Academy of Sciences,
+Chaoyang, Beijing 100029, China
+2 University of Chinese Academy of Sciences, Shijingshan, Sci-
+ences, Chaoyang, Beijing 100029, China
+a) yizhan@ime.ac.cn
+DOI: 10.1587/elex.21.20240189
+Received March 22, 2024
+Accepted June 4, 2024
+Publicized June 14, 2024
+Copyedited July 25, 2024
+pression, and ultimately accumulation. Each of these steps
+oﬀers potential for approximation, providing ﬂexibility in
+balancing accuracy and computational eﬃciency.
+Esposito et al. [3] initially introduced an algorithm that
+redistributed the probabilities of 0 and 1 in a partial product,
+validating its eﬀectiveness across various operand lengths.
+Ahmadinejad et al. [4] presented novel 5-2 and 4-1 compres-
+sors, along with three approximate multipliers leveraging
+these compressors. They employed NAND gates for gen-
+erating partial products and a highly eﬃcient compressor
+to enhance the PDAP. Yi et al. [5] proposed a 4-2 com-
+pressor with a complementary error strategy, optimizing the
+circuit size at the transistor level to operate eﬀectively at
+low supply voltages. In [6], one majority gate was used to
+an ultra-eﬃcient imprecise 4:2 compressor which the sum
+output is equal to ‘1’. Signiﬁcantly simpliﬁes the structure
+and number of transistors compared to precise 4-2 compres-
+sors. In literature [7], three approximate 4-2 compressors
+were introduced and subsequently combined to create two
+low-cost multipliers. This approach took into account the
+dependency between neighboring columns, utilizing distinct
+compressors for adjacent partial products. Duan et al. [8]
+introduced an N:2 compressor with uniform output weight,
+oﬀering improved resource utilization and reduced latency.
+Shankar et al. [9] developed a truncation-based approximate
+multiplier that leverages diverse compressors, including 4-2,
+5-2, and 6-3 conﬁgurations. Without compromising the crit-
+ical path, carry circuit was applied to compensate and reduce
+the error. Sabetzadeh et al. [10] truncated half of product to a
+constant, the other half was calculated precisely and eﬀective
+error compensation module (ECM) was applied to improve
+the accuracy. Static segmentation has been investigated in
+approximate multipliers [11, 28], where the continuous m
+bits were extracted from the two n-bit operands and trans-
+ferred to the m-bit multiplier (m < n), and the ﬁnal output
+was obtained after correction and suitable shift. Compared
+to most of the diﬀerent weight compressions (carry, sum),
+Joshi et al. [12] applied the carry prediction and truncation
+techniques to the approximate multiplier, which resulted in
+a signiﬁcant reduction in power delay and area, while hav-
+ing no signiﬁcant eﬀect on the normalized error distance.
+Priya et al. [13] presented a low-power, low-area approxi-
+mate multiplier featuring an error compensation function.
+The proposed multiplier considers the least signiﬁcant bit in
+the product as a ﬁxed compensation term, and the remain-
+ing diﬀerences are calculated through the approximation and
+the exact part, so as to realize the trade-oﬀbetween accu-
+racy and eﬃciency. Approximate logarithmic multipliers
+This work is licensed under a Creative Commons Attribution NonCommercial, No Derivatives 4.0 License.
+Copyright © 2024 The Institute of Electronics, Information and Communication Engineers
+1
+
+===== PAGE 2 =====
+IEICE Electronics Express, Vol.21, No.14, 1–5
+[14–16] sum the high signiﬁcant bits of the operand and
+perform logarithmic transformation as approximate result.
+In general, the approximate multiplier is vertically seg-
+mented into three key regions: the precision region, the
+approximation region, and the truncation region [17]. The
+proposed multiplier adheres to this three-part categoriza-
+tion. The principle contributions of this brief are outlined
+as follows:
+1) During the partial product generation stage, we opt for
+the NAND-gate instead of the conventional AND-gate. The
+resulting output is then fed directly into the compressor. No-
+tably, the NAND-gate exhibits superior performance com-
+pared to the AND-gate [10].
+2) In the partial product compression stage, a novel 4-2 com-
+pressor with align positive and negative approximations is
+applied to reduce error accumulation and enhance electrical
+performance.
+3) In the truncation part, we adopt a constant approxima-
+tion method, utilizing a speciﬁc constant to further reﬁne
+accuracy.
+This brief is structured as follows: Section 2 introduces
+the compressors relevant to the proposed designs and their
+features. Section 3 shows the proposed architecture of mul-
+tiplier. In Sect. 4, we present the simulation results and the
+comparison with previous approximate multipliers. Finally,
+Sect. 5 concludes this brief.
+2.
+Compressor
+2.1
+Exact compressor
+Compressors are most commonly used for implementing the
+partial products reduction stage. Full-adder is most basic
+exact 3-2 compressor and an exact 4-2 compressor is im-
+plemented with two full-adders. Exact 4-2 compressor has
+ﬁve inputs and three outputs so it should more be called 5-3
+compressor. Higher order exact 5-2 compressors is achieved
+by three full adders which should be called 7-4 compressor.
+The schematics of compressor are illustrated in Fig. 1. For
+special structural designs, exact compressors do not have
+long carry chains, however, the large number of transistors
+brings a non-negligible power consumption.
+2.2
+Previous approximate compressors
+As the importance of the energy consumption rising in in-
+tegrated circuits, the power consumption from exact com-
+pressor circuits has been paid more attention. Approximate
+compressors [20–25, 30] are getting more attention.
+Zhang et al. [17] proposed a novel tiny area 4 gate 4-2 com-
+Fig. 1
+Exact 3-2 compressor (a); exact 4-2 compressor (b); exact 5-2
+compressor (c).
+pressor, which combined with Esposito’s compressors [3] to
+form a hybrid multiplier. The hybrid multiplier outperforms
+in terms of PDAP and accuracy tradeoﬀ. Ahmadinejad et
+al. [21] proposed eﬃcient imprecise 4:2 and 5:2 compres-
+sors and optimized transistor level circuit structure. Five
+high-accuracy approximate 4-2 compressors designed by de-
+composition and recombination methods were proposed in
+[22]. Kumar et al. [23] use constant compensation term to
+improve hardware savings and using 4-2 compressor com-
+bined with error correction module to unsigned approximate
+multiplier architecture. Gowda et al. [26] proposed that two
+diﬀerent compressors produce positive and negative errors
+respectively, which can be applied to the partial product
+compression stage to reduce cumulative errors. D. P et al.
+[27] designed an 8-bit Dadda multiplier using A 4:2 com-
+pressor. Five diﬀerent full adder circuit conﬁgurations were
+created, and these full adder circuit conﬁgurations were then
+used to obtain 16 possible 4:2 compressor combinations.
+2.3
+Proposed approximate compressors
+Since the probability of being 1 is 1/4 and the probability of
+being 0 is 3/4 for the initial partial product, we use low error
+rated compressors to the ﬁrst compress of partial product.
+The 5-4, 6-4, 7-4, 8-4 series compressors are proposed to
+compress the columns with more than 4 initial partial prod-
+ucts to 4 partial products. The circuits of approximate 5-4
+compressor and approximate 6-4 compressor are shown in
+Fig. 2 and the circuits of approximate 7-4 compressor and
+approximate 8-4 compressor are shown in Fig. 3. All ap-
+proximate N-4 compressors have same output weight and
+Fig. 2
+Proposed approximate 5-4 compressor (a) and approximate 6-4
+compressor (b).
+Fig. 3
+Proposed approximate 7-4 compressor (a) and approximate 8-4
+compressor (b).
+2
+
+===== PAGE 3 =====
+IEICE Electronics Express, Vol.21, No.14, 1–5
+Table I
+Probability table of compressors output 0.
+Fig. 4
+Architecture of the proposed approximate 4-2 compressor.
+the inputs (np0, np1, np2, np3, np4, np5, np6, np7) are from
+inverse code of the initial partial products. For approximate
+5-4 compressor, minus-one error occurs when only 5 input
+values are all 1. The probability of each input is calculated
+on the premise that the original input follows an average dis-
+tribution of 0/1 and the total probability of error is 1/1024 ≈
+0.976%, which is rather small. For approximately 6-4, 7-4
+compressors, the probability of negative errors is 23/2048
+≈1.123% and 859/16384 ≈5.24%, respectively. In particu-
+lar, the approximate 8-4 compressor is composed of two 4-2
+compressors, and the error probability of a single approxi-
+mate 4-2 compressor is 13/256 ≈5.08%, so the error prob-
+ability of the approximate 8-4 compressor is 6487/65536 ≈
+9.89%.
+Since the probability of the compressors’ input signal is
+set, the probability of the output signal is calculated as shown
+in Table I. It can be seen that in the 7-4, 8-4 approximate
+compressor output results, the output signals have similar
+probabilities for 0/1.
+We proposed a novel 4-2 approximate compressor as pre-
+sented in Fig. 4. The truth table of proposed approximate
+4-2 compressor is shown in Table II. The output signal c has
+higher weight than the input signal and the output signal s
+have same weight than the input signal. For the proposed
+compressor is used in the second time of partial product
+compression stage and the input signals (w1, w2, w3, w4)
+are the compression results of the ﬁrst stage of partial prod-
+uct, so all input patterns has similar probability after the ﬁrst
+time of partial product compression stage so even though it
+has 12 errors out of 16 input patterns, the design is error bal-
+anced when the 16 input patterns have approximately equal
+probability.
+3.
+Proposed unsigned approximate multiplier
+This paper proposes two designs of unsigned approximate
+8-bit multiplier, which are aim at high precision and low
+power consumption respectively.
+Table II
+Truth table of proposed approximate 4-2 compressor.
+Fig. 5
+Construction of the proposed unsigned approximate multiplier
+design MUL1.
+Fig. 6
+Construction of the proposed unsigned approximate multiplier
+design MUL2.
+The structure of the proposed unsigned approximate 8-bit
+multiplier design MUL1 is illustrated in Fig. 5 which more
+focus on high accuracy between the hardware and accuracy
+characteristics. For trade-oﬀaccuracy and power, the partial
+product is divided into three regions in columns, exact, ap-
+proximate and truncation. The four least signiﬁcant columns
+of the partial products are truncated with constants ‘1000’.
+Columns four to ten are regarded as the approximate region,
+where the approximate N-4 compressors are used in stage
+one. The input data of approximate compressors is obtained
+through the NAND gate, which is more advantageous in area
+and power compared to the AND gate. The four most sig-
+niﬁcant columns and partial products compression in stage
+2 are calculated precisely. For the ﬁnal addition, a 10-bit
+ripple carry adder (RCA) is employed.
+In order to further reduce power consumption and achieve
+ultra-low power consumption calculation, proposed design
+3
+
+===== PAGE 4 =====
+IEICE Electronics Express, Vol.21, No.14, 1–5
+MUL2 as shown in Fig. 6. The least signiﬁcant half of the
+products is truncated, and an 8-bit constant appears in this
+part. Iterate over 256 8-bit compensation constants to select
+the best values for normalized mean error distance and mean
+relative error distance, and then “00111000” is selected as
+compensation constant. In columns eight and nine, approx-
+imate 7-4 compressor and approximate 6-4 compressor are
+applied at stage one and proposed 4-2 compressor is used at
+stage two. Compute exactly the bits with higher weights and
+the ﬁnal addition uses a 7-bit ripple carry adder.
+4.
+Experimental results
+4.1
+Accuracy analysis
+The accuracy factors of the proposed multipliers are inves-
+tigated in this section based on the results obtained by the
+MODELSIM simulations. For evaluating the output quality
+of the proposed unsigned approximate multipliers, error rate
+(ER), normalized mean error distance (NMED) and mean
+relative error distance (MRED) is considered.
+ER represents the proportion of the number of error re-
+sults in the total output. MRED describes the mean value
+of the relative error distance. In order to facilitate the com-
+parison of approximate multipliers with diﬀerent bit widths,
+NMED normalizes the average error distance to measure the
+deviation of the calculated result from the exact value.
+To obtain reliable error metrics, we go through all 65536
+input combinations.
+The accuracy metrics results of the
+multipliers are presented in Table III. The results indicate
+high error rate for our designs due to the truncation of the
+least signiﬁcant columns.
+NMED and MRED of MUL1
+achieve highest levels than the other counterparts due to its
+structure and the eﬃcient compressor module. Meanwhile,
+MUL2 has the worst parameters due to the larger truncation.
+4.2
+Hardware analysis
+All mentioned approximate multipliers are modeled using
+Verilog HDL, and synthesized by Synopsys Design Com-
+piler using a commercial SMIC 40 nm library under supply
+voltage of 1.1 V. Perform functional simulation for 65536
+input combinations and generate saif ﬁle of signal ﬂip prob-
+ability. Since the designed approximate multipliers are all
+pure combinatory logic, a virtual clock with a frequency of
+100 Mhz is set in the constraint ﬁle. Set INV cell of library as
+input drive cell and 40 times the input capacity of AND2/A
+pin as output load. The power-delay-area product (PDAP) is
+regard as the normalize metrics of trade-oﬀ. The evaluation
+results are shown in Table IV.
+The results indicate that the proposed multipliers have su-
+perior delay, power, power-delay-area product (PDAP) and
+area compared to the existing multipliers.
+The proposed
+approximate multiplier MUL2 has unquestionably the best
+PDAP reduction. Compared with the exact multiplier, the
+delay, area, power consumption and PDAP are reduced by
+45.49%, 77.17%, 77.62% and 97.22% respectively but suf-
+fers from the largest NMED and MRED. MUL1 has worse
+latency, area, and power consumption compared to compa-
+rable designs, but has the highest NMED and MRED, PDAP
+down by 84.98% compared to the exact multiplier.
+Table III
+Accuracy metrics of the approximate multipliers.
+Table IV
+Accuracy metrics of the approximate multipliers.
+Table V
+Image multiplication results.
+4.3
+Image multiplication
+Image multiplication is the multiplication of two gray-scale
+images with corresponding pixels, which only contains mul-
+tiplication, so it can directly reﬂect the eﬀectiveness of
+the approximate multiplier.
+The peak signal-to-noise ra-
+tio (PSNR) value and structural similarity (SSIM) value of
+the approximate image are obtained by using MATLAB tool
+to evaluate the quality of the approximate image, and the
+average value of all photos is used as the ﬁnal index, so as to
+verify the eﬀectiveness of the approximate multiplier in the
+application of image multiplication.
+The PSNR and SSIM values of diﬀerent approximate im-
+ages are listed in Table V, which are used to quantify the
+quality of approximate images. The higher the accuracy of
+the approximate multiplier, the higher the PSNR and SSIM
+values of the output image. When the value of PSNR is
+greater than 30 dB, it indicates that the image quality is ex-
+cellent. MUL1 oﬀers the average PSNR and SSIM values
+of more than 58 dB and 0.9993, respectively, which are best
+image quality. MUL2 oﬀers the average PSNR and SSIM
+values of more than 43 dB and 0.9781, respectively, which
+are more than enough for image processing applications.
+Figure 7 shows three resulting graphs from exact multipli-
+cation, MUL1, and MUL2. From the subjective view of the
+naked eye, it is diﬃcult to ﬁnd the diﬀerence between the
+output images of diﬀerent approximate multipliers.
+5.
+Conclusion
+In this brief, we propose the N-4 compressors and a novel
+4-2 compressor, which combined to two unsigned approxi-
+4
+
+===== PAGE 5 =====
+IEICE Electronics Express, Vol.21, No.14, 1–5
+Fig. 7
+Cameraman x Blonde results of exact (left upper), MUL1 (right
+upper) and MUL2 (bottom).
+mate multipliers. The high precision multiplier MUL1 has
+the highest MRED and NMED, and hardware parameter
+PDAP is reduced by 84.98% compared with the exact mul-
+tiplier. The ultra-low power multiplier MUL2 achieves a
+maximum PDAP reduction of 97.22%. Achieved PSNR of
+58 dB and 43 dB respectively in image multiplication appli-
+cations, meeting the performance requirements. Basically,
+the proposed multipliers oﬀer a signiﬁcantly more attractive
+trade-oﬀof electrical performance and accuracy.
+References
+[1] W. Liu, et al.: “Approximate computing: from circuits to applica-
+tions,” Proc. IEEE 108 (2020) 2103 (DOI: 10.1109/JPROC.2020.
+3033361).
+[2] B. Liu, et al.: “An energy-eﬃcient reconﬁgurable architecture for
+RNNs using dynamically adaptive approximate computing,” IE-
+ICE Electron. Express 14 (2017) 20170637 (DOI: 10.1587/elex.14.
+20170637).
+[3] D. Esposito, et al.: “Approximate multipliers based on new approx-
+imate compressors,” IEEE Trans. Circuits Syst. I, Reg. Papers 65
+(2018) 4169 (DOI: 10.1109/TCSI.2018.2839266).
+[4] M. Ahmadinejad and M.H. Moaiyeri: “Energy- and quality-eﬃcient
+approximate multipliers for neural network and image processing
+applications,” IEEE Trans. Emerg. Topics 10 (2022) 1105 (DOI:
+10.1109/TETC.2021.3072666).
+[5] X. Yi, et al.: “Design of an energy-eﬃcient approximate compressor
+for error-resilient multiplications,” ISCAS (2019) 1 (DOI: 10.1109/
+ISCAS.2019.8702199).
+[6] F. Sabetzadeh, et al.: “A majority-based imprecise multiplier for
+ultra-eﬃcient approximate image multiplication,” IEEE Trans. Cir-
+cuits Syst. I, Reg. Papers 66 (2019) 4200 (DOI: 10.1109/TCSI.2019.
+2918241).
+[7] L. Sayadi, et al.: “Two eﬃcient approximate unsigned multipliers
+by developing new conﬁguration for approximate 4:2 compressors,”
+IEEE Trans. Circuits Syst. I, Reg. Papers 70 (2023) 1649 (DOI:
+10.1109/TCSI.2023.3242558).
+[8] R. Duan, et al.: “A hardware-eﬃcient approximate multiplier com-
+bining inexact same-weight N:2 compressors and remapping logic
+with error recovery,” SOCC (2023) 1 (DOI: 10.1109/SOCC58585.
+2023.10257018).
+[9] R.G. Shankar and Ananthi D.R.: “Approximate booth multipliers
+using compressors and counter,” ICICT (2023) 1658 (DOI: 10.1109/
+ICICT57646.2023.10134198).
+[10] F. Sabetzadeh, et al.: “An ultra-eﬃcient approximate multiplier with
+error compensation for error-resilient applications,” IEEE Trans. Cir-
+cuits Syst. II, Exp. Briefs 70 (2023) 776 (DOI: 10.1109/TCSII.
+2022.3215065).
+[11] A.G.M. Strollo, et al.: “Approximate multipliers using static segmen-
+tation: error analysis and improvements,” IEEE Trans. Circuits Syst.
+I, Reg. Papers 69 (2022) 2449 (DOI: 10.1109/TCSI.2022.3152921).
+[12] P.U. Joshi, et al.: “Power-area eﬃcient computing technique for ap-
+proximate multiplier with carry prediction,” ICETET–SIP (2023) 1
+(DOI: 10.1109/ICETET-SIP58143.2023.10151588).
+[13] N.K. Priya, et al.: “Low power low area approximate multiplier
+with modiﬁed error compensation,” GCAT (2023) 1 (DOI: 10.1109/
+GCAT59970.2023.10353488).
+[14] W. Liu, et al.: “Design and evaluation of approximate logarithmic
+multipliers for low power error-tolerant applications,” IEEE Trans.
+Circuits Syst. I, Reg. Papers 65 (2018) 2856 (DOI: 10.1109/TCSI.
+2018.2792902).
+[15] P. Yin, et al.: “Design and analysis of energy-eﬃcient dynamic
+range approximate logarithmic multipliers for machine learning,”
+IEEE Trans. Sustain. Comput. 6 (2021) 612 (DOI: 10.1109/TSUSC.
+2020.3004980).
+[16] X. Wu, et al.:
+“Design of energy eﬃcient logarithmic approxi-
+mate multiplier,” ICCS (2023) 129 (DOI: 10.1109/ICCS59502.2023.
+10367339).
+[17] M. Zhang, et al.: “Area eﬃcient approximate 4–2 compressor and
+probability-based error adjustment for approximate multiplier,” IEEE
+Trans. Circuits Syst. II, Exp. Briefs 70 (2023) 1714 (DOI: 10.1109/
+TCSII.2023.3257852).
+[18] S. Nambi, et al.: “DeBAM: decoder-based approximate multiplier for
+low power applications,” IEEE Embedded Syst. Lett. 13 (2021) 174
+(DOI: 10.1109/LES.2020.3045165).
+[19] S. Zheng, et al.: “HEAM: high-eﬃciency approximate multiplier
+optimization for deep neural networks,” ISCAS (2022) 3359 (DOI:
+10.1109/ISCAS48785.2022.9937321).
+[20] A.G.M. Strollo, et al.:
+“Comparison and extension of approxi-
+mate 4-2 compressors for low-power approximate multipliers,” IEEE
+Trans. Circuits Syst. I, Reg. Papers 67 (2020) 3021 (DOI: 10.1109/
+TCSI.2020.2988353).
+[21] M. Ahmadinejad, et al.: “Energy and area eﬃcient imprecise com-
+pressors for approximate multiplication at nanoscale,” AEU - Interna-
+tional Journal of Electronics and Communications 110 (2019) 152859
+(DOI: 10.1016/j.aeue.2019.152859).
+[22] T. Kong and S. Li: “Design and analysis of approximate 4–2 compres-
+sors for high-accuracy multipliers,” IEEE Trans. Very Large Scale
+Integr. (VLSI) Syst. 29 (2021) 1771 (DOI: 10.1109/TVLSI.2021.
+3104145).
+[23] U.A. Kumar, et al.: “Low-power compressor-based approximate mul-
+tipliers with error correcting module,” IEEE Embedded Syst. Lett. 14
+(2022) 59 (DOI: 10.1109/LES.2021.3113005).
+[24] L.H. Krishna, et al.: “Energy eﬃcient approximate multiplier de-
+sign with lesser error rate using the probability-based approximate
+4:2 compressor,” IEEE Embedded Syst. Lett. 16 (2023) 134 (DOI:
+10.1109/LES.2023.3280199).
+[25] R. Duan, et al.: “A hardware-eﬃcient approximate multiplier combin-
+ing inexact same-weight N:2 compressors and remapping logic with
+error recovery,” SOCC (2023) 1 (DOI: 10.1109/SOCC58585.2023.
+10257018).
+[26] B.G. Gowda, et al.: “Error diluted approximate multipliers using
+positive and negative compressors,” ISQED (2023) 1 (DOI: 10.1109/
+ISQED57927.2023.10129376).
+[27] Dinesha P., et al.: “Leveraging approximate 4:2 compressors for
+improved performance in an 8-bit dadda multiplier design,” CCPIS
+(2023) 1 (DOI: 10.1109/CCPIS59145.2023.10292058).
+[28] K. Sivanandam, et al.: “Low power design of edge detector using
+static segmented approximate multipliers,” ICCMC (2023) 739 (DOI:
+10.1109/ICCMC56507.2023.10083930).
+[29] Y. Zhang, et al.: “Design and analysis of approximate multiplier
+of majority-based imprecise 4–2 compressor for image processing,”
+NANO (2023) 1 (DOI: 10.1109/NANO58406.2023.10231167).
+[30] J. Kokkiligadda, et al.: “Analysis and implementation of approxi-
+mate 4-2 compressors for approximate multipliers,” PCEMS (2023)
+1 (DOI: 10.1109/PCEMS58491.2023.10136060).
+5

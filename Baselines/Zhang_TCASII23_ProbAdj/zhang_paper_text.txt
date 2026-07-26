@@ -1,0 +1,377 @@
+
+===== PAGE 1 =====
+1714 IEEE TRANSACTIONS ON CIRCUITS AND SYSTEMS—II: EXPRESS BRIEFS, VOL. 70, NO. 5, MAY 2023
+Area Efﬁcient Approximate 4-2 Compressor
+and Probability-Based Error Adjustment
+for Approximate Multiplier
+Mingtao Zhang , Graduate Student Member, IEEE , Shinichi Nishizawa , Member, IEEE,
+and Shinji Kimura , Member, IEEE
+Abstract—Many multipliers based on approximate compres-
+sors have been developed for error-tolerant applications such as
+image processing to reduce power, but the combination of them
+has not been fully studied. This brief proposes a novel 4 gate
+4-2 approximate compressor which is complementary with other
+compressors from earlier work and constructs a hybrid multiplier
+based on the compressors, a constant approximation, and error
+correction AND gate. According to the simulation results, the
+proposed hybrid approximate multiplier has excellent accuracy
+and electrical performance tradeoff and reduces the power-delay-
+area product (PDAP) by 66% with an MRED of 2.5% when
+compared to the exact multiplier.
+Index Terms—Approximate computing, 4-2 compressor, digital
+multiplier, compressor combination, error compensation.
+I. I NTRODUCTION
+M
+EDIA processing applications, such as image process-
+ing and machine learning, have developed rapidly over
+the past two decades. For these applications which involve
+human perception, approximate computing is an effective way
+to improve power efﬁciency [ 1].
+Approximate multipliers are the most popularly used arith-
+metic units and are easily modiﬁable. The three parts of a
+multiplier that approximation methods could be applied to
+are partial product creation, partial product accumulation and
+reduction, and ﬁnal addition. The second part reducing partial
+products by accumulation consumes the most resources during
+the multiplication process [ 2].
+Approximate compressors such as 4-2 compressors are usu-
+ally used to accelerate the accumulation. Kong and Li [ 3]
+broadly classify compressors into high-accuracy and low-
+accuracy categories based on the number of output errors.
+Low-accuracy approximate compressors mainly focus on
+reducing power dissipation. Momeni et al. [ 4] proposed a
+symmetrical approximate 4-2 compressor, but it produces a
+plus-one error when all four inputs are 0, which is the most
+Manuscript received 6 February 2023; accepted 13 March 2023. Date of
+publication 16 March 2023; date of current version 12 May 2023. This work
+was supported by NEC, Japan. This brief was recommended by Associate
+Editor M. Martina. (Corresponding author: Mingtao Zhang.)
+The authors are with the Graduate School of Information, Production and
+System, Waseda University, Kitakyushu 808-0135, Fukuoka, Japan (e-mail:
+mutouz@akane.waseda.jp; shinji_kimura@waseda.jp).
+Color versions of one or more ﬁgures in this article are available at
+https://doi.org/10.1109/TCSII.2023.3257852.
+Digital Object Identiﬁer 10.1109/TCSII.2023.3257852
+common case for all input patterns. Sabetzadeh et al. [ 5]
+proposed a simple compressor only consists of a majority gate
+and assumes S output is a constant 1.
+This brief studies approximate compressors and shows the
+following contributions:
+• A new tiny area approximate 4-2 compressor with only
+four logic gates is proposed. The compressor’s output
+errors occur regularly with speciﬁc input patterns.
+• Esposito’s compressors are combined in a novel way
+to adjust the error probability that different input pat-
+terns will occur. The combination reduces error and
+signiﬁcantly enhances electrical performance.
+• An approximate multiplier with low resource cost is
+developed based on the proposed compressor. The simu-
+lation results demonstrate that the proposed approximate
+multiplier outperforms the present multipliers in terms of
+PDAP and accuracy tradeoff.
+This brief is organized as follows. Section II introduces the
+compressor-based approximate multipliers most relevant to our
+design and their features. Section III shows the proposed archi-
+tecture of the compressor with its error characteristics and a
+proposed multiplier. The simulation results of accuracy and
+electrical performance, and comparison on an application with
+previous compressor-based approximate multipliers are shown
+in Section IV. Finally, Section V concludes this brief.
+II. R
+ELATED WORK
+A. Compressors With Same Output Weight
+Pei et al. [ 6] and Esposito et al. [ 7] designed a series of
+new approximate compressors generating the same weight out-
+puts. These compressors contain fewer gates and no XOR or
+XNOR gates so they are indubitably competitive in electrical
+performance. Because initial partial products are three times
+more likely to be 1 than 0, the error should not be signiﬁcant
+even if these compressors always generate the output to less
+than the exact output when the majority of the inputs are 1.
+However, the compressor design proposed by Esposito et al.
+in [7] is based on the initial partial products. The 8-bit approx-
+imate multiplier is built with two layers of compressors, and
+the compressors at the second layer receive inputs with a larger
+probability of becoming 1. Using Esposito’s approximate com-
+pressors on the second layer results in a high error rate, while
+using exact compressors results in high power usage. In this
+1549-7747 c⃝ 2023 IEEE. Personal use is permitted, but republication/redistribution requires IEEE permission.
+See https://www.ieee.org/publications/rights/index.html for more information.
+Authorized licensed use limited to: Shanghai Jiaotong University. Downloaded on June 28,2026 at 12:12:05 UTC from IEEE Xplore.  Restrictions apply. 
+===== PAGE 2 =====
+ZHANG et al.: AREA EFFICIENT APPROXIMATE 4-2 COMPRESSOR AND PROBABILITY 1715
+TABLE I
+TRUTH TABLE OF APPROXIMATE 4-2 C OMPRESSOR
+case, the accuracy and electrical performance tradeoff of their
+approximate multipliers are insufﬁcient.
+B. Constant Approximation and Error Correction Module
+Kumar et al. [ 8] designed a 4-2 compressor that output
+becomes a minus-one error when the last two bits of the input
+are 1. An AND gate connected to the last two bits of the com-
+pressor’s input is used to compensate for the error, which is
+similar to [10]. Besides, the last four bits of the multiplier are
+truncated using an unusual method that substitutes an average
+number 0110 for the traditional 0000. By doing this, the error
+can be reduced without making an extra effort.
+The approximate multiplier in [ 8] has the one of highest
+accuracy among the multipliers using the compressor with four
+error cases in the truth table. However, to receive the output
+of error correction AND gate in the ﬁrst level, the multiplier
+modiﬁes a half adder to a full adder and a full adder to an exact
+compressor. Furthermore, the error correction modules extend
+the propagation path to some extent, which would enlarge the
+delay of the multiplier.
+III. P
+ROPOSED UNSIGNED APPROXIMATE MULTIPLIER
+A. Proposed 4-2 Approximate Compressor
+If we compel the erroneous output to occur at speciﬁc input
+characteristics, as shown in [ 8], we can remedy compressor
+errors with a simple logic gate. The method can be extended
+to scenarios with more than four faults of the total sixteen input
+patterns. A new area efﬁcient 4-2 compressor is designed in
+an effort to make the sum of S (sum) and C (carry) as close
+to the exact result as possible and to improve the regularity of
+the Karnaugh map. Table I shows the proposed compressor’s
+outputs S and C.
+The C derived from Table I is OR as shown in equation ( 1).
+According to De Morgan’s laws, the proposed expression of
+S is shown in equation ( 2) under the assumption of using the
+fewest number of logic gates possible. It is worth noting that
+Fig. 1. Architecture of the proposed compressor.
+NAND and NOR gates have better performance than AND
+and OR gates [ 3].
+C = P1 + P2( 1 )
+S = (P1 · P2 + P1 · P2)(P3 + P4)
+= (P1 ⊕ P2) + (P3 + P4) (2)
+The architecture of the proposed 4-2 compressor is
+presented in Fig. 1. This compressor only has two NOR gates
+and one XOR gate and one OR gate, which makes the com-
+pressor consume very few transistors. So even though it has six
+errors out of sixteen input patterns, the design is still attractive
+and competitive.
+B. Error Adjustment With Probability
+Table I shows the probability of each input and the total
+probability of error is 70 /256 ≈ 0.273, which is rather large.
+The error rates of the plus-one error is 54 /256 ≈ 0.211 and
+the minus-one error is 16 /256 ≈ 0.063. Since the probability
+of being 1 is 1/4 and the probability of being 0 is 3/4 for the
+initial partial products, the corresponding plus-one error for
+0100 and 1000 is very likely to happen.
+To solve this unfavorable situation, it is essential to avoid
+using the proposed compressors at the ﬁrst level, where the
+inputs of the compressors are directly connected to the initial
+partial products. The error probability in the ﬁrst level is modi-
+ﬁed by using Esposito’s approximate compressors in [7]a tt h e
+ﬁrst level and the error produced by the proposed compressors
+in the second level is compensated.
+The behavior of Esposito’s 4-2 compressor is shown in
+Table I. The output of Esposito’s 3-2 or 4-2 compressor will
+be 11 if two or more inputs are 1. We ﬁnd that the error proba-
+bility can be somewhat compensated by combining Esposito’s
+compressors for the initial partial products and the proposed
+compressor at the second layer.
+The structure of the proposed 8-bit hybrid approximate
+multiplier is illustrated in Fig. 2, which combines two dis-
+tinct approximate compressors and makes use of the error
+correction module (i.e., AND gate) and constant approxima-
+tion from [8]. For the ﬁnal addition, a ripple carry adder (RCA)
+is employed.
+As Fig. 2 shows, two types of Esposito’s compressors, 3-2
+and 4-2, are used in the ﬁrst level. For Esposito’s 4-2 com-
+pressor, the probability of outputs w
+1 and w2 being 0 are
+both 135 /256 ≈ 0.527 as shown in Table I. For Esposito’s
+3-2 compressor, the probability of an output w1 being 0
+is 36 /64 ≈ 0.563, and the other output w2 being 0 is
+45/64 ≈ 0.703. The four inexact columns with unique input
+patterns are named C4 to C1 respectively. The probability of
+Authorized licensed use limited to: Shanghai Jiaotong University. Downloaded on June 28,2026 at 12:12:05 UTC from IEEE Xplore.  Restrictions apply. 
+===== PAGE 3 =====
+1716 IEEE TRANSACTIONS ON CIRCUITS AND SYSTEMS—II: EXPRESS BRIEFS, VOL. 70, NO. 5, MAY 2023
+Fig. 2. Proposed hybrid approximate multiplier structure (ProposedH).
+TABLE II
+PROBABILITY TABLE OF THE PROPOSED COMPRESSOR
+plus-one error and minus-one error at each column are reported
+in Table II.
+In Table II, origin means the probability of the correspond-
+ing input patterns of compressors at the ﬁrst level in which
+initial partial products are directly connected (the same as
+“Prob.” in Table I). With the usage of Esposito’s compres-
+sors at the ﬁrst level, although the total error possibility (i.e.,
+P
+Total) of every single approximate compressor at the second
+level has been increased, the higher minus-one error possi-
+bility and lower plus-one error possibility make the proposed
+hybrid approximate multiplier more reasonable to use the error
+correcting AND gate.
+The proposed hybrid concept is applied to a 16-bit approx-
+imate multiplier, where Esposito’s compressors are used at
+the ﬁrst and third levels. Two error correcting AND gates are
+carried out in the second level to reduce the error distance
+without sacriﬁcing too many resources. Besides, the truncation
+TABLE III
+EVA L UAT I O NRESULTS OF 8-B IT UNSIGNED MULTIPLIERS
+is adjusted to 6 bits, and the compensation constant is set to
+the average value of 011110.
+IV . EXPERIMENTAL RESULTS
+This section compares the 8-bit and 16-bit unsigned approx-
+imate multipliers. For the 8-bit approximate multiplier, various
+compressors proposed in [ 4], [ 5], [ 6], [ 7], [ 8], [ 9] and one
+in this brief (Proposed) are applied to the uniﬁed Dadda
+structure illustrated in paper [3] with the same truncation tech-
+nique. Note that Proposed only uses the proposed compressors.
+The hybrid structure illustrated in Fig. 2 (Proposed
+H) is also
+designed and compared. 16-bit approximate multipliers are
+implemented with ten columns of approximate compressors
+and six columns of constant approximation. In particular, the
+additional error correction modules in [ 6] and [ 8] are applied
+to their multipliers in respect of the authors’ intentions. As for
+the multiplier with compressors in [ 7], their compressors are
+used only at the ﬁrst layer because of the large error when
+using the second layer.
+A. Error Analysis
+The normalized mean error distance (NMED) and mean
+relative error distance (MRED) [ 2] are commonly used error
+metrics when judging the accuracy of approximate computing.
+To obtain reliable error metrics results, we carry out exhaustive
+65536 cases for 8-bit multipliers and take the average result
+of ten times independent 1 million random cases for 16-bit
+multipliers. The results are respectively shown in Table III and
+Table IV.
+In Table III, Esposito’s design and Kumar’s design have
+the best MRED and NMED because of the lower usage of
+approximate compressors or error-correction modules. The
+error performance of the multiplier based on the proposed
+compressor (Proposed) is not notably impressive, but the
+proposed hybrid approximate multiplier (Proposed
+H) has the
+best NMED and MRED among the low-accuracy category and
+a 60.65% reduction of error over Proposed multiplier. TableIV
+demonstrates that the proposed hybrid 16-bit approximate
+multiplier is competitive even in the high-accuracy category.
+Authorized licensed use limited to: Shanghai Jiaotong University. Downloaded on June 28,2026 at 12:12:05 UTC from IEEE Xplore.  Restrictions apply. 
+===== PAGE 4 =====
+ZHANG et al.: AREA EFFICIENT APPROXIMATE 4-2 COMPRESSOR AND PROBABILITY 1717
+TABLE IV
+EVA L UAT I O NRESULTS OF 16-B IT UNSIGNED MULTIPLIERS
+Fig. 3. Hardware and accuracy tradeoff on various multipliers. (a) 8-bit PDAP
+and MRED comparison. (b) 8-bit PDAP and NMED comparison. (c)16-bit
+PDAP and MRED comparison. (d)16-bit PDAP and NMED comparison.
+Pei’s design’s high accuracy is due to an extra column of exact
+compressors and only one layer of approximate compressors.
+B. ASIC Synthesis
+All the stated approximate multipliers are modeled using
+Verilog and synthesized as combinational circuits by Synopsys
+Design Compiler using a commercial 65 nm process with
+a nominal supply voltage of 0.7 V , toggle rate of 20% and
+maximum delay constraint of 6 ns for 8-bit multipliers and
+12 ns for 16-bit multipliers. The power-delay-area product
+(PDAP) is a decisive metric that we utilize to fully describe
+the electrical performance, which includes area, total power
+consumption, and maximum delay. The evaluation results are
+shown in Table III and Table IV.
+The synthesis results demonstrate that Sabetzadeh’s design
+has unquestionably the best PDAP reduction but suffers
+from the largest NMED and MRED. The two proposed
+approximative multipliers are ranked second and third in terms
+Fig. 4. Image sharpening results computed by 8-bit multipliers. (a) Original
+image. (b)-(f) Sharpened images.
+TABLE V
+PSNR R ESULTS FOR IMAGE SHARPENING APPLICATION
+of PDAP reduction, respectively. And the proposed hybrid
+approximate multiplier in particular has a remarkably low
+delay. Proposed multiplier’s PDAP reduction is 59.13% (8-bit)
+and 59.06% (16-bit) less than the exact multiplier. When
+it comes to Proposed
+H multiplier, the reduction becomes to
+66.61% (8-bit) and 66.08% (16-bit).
+The NMED versus PDAP graph and the MRED versus
+PDAP graph of 8-bit multipliers and 16-bit multipliers are
+plotted in Fig. 3 to depict the tradeoffs between electrical
+performance and accuracy. The proposed hybrid approximate
+multiplier is shown to be closest to the axis origin in both plots,
+particularly in Fig. 3 (a) and Fig. 3 (c), which almost indi-
+cates that our design has the best tradeoff among the existing
+relevant designs.
+C. Image Processing
+Image processing is one of the most common error-resilient
+applications. Three photos, titled “Barbara,” “Baboon,” and
+“Lena” that were downloaded from the same website are sub-
+jected to image sharpening. The pixel depth of all these photos
+is 8 bits, so we use 8-bit approximate multipliers to take care
+of the exact multiplication function during image sharpen-
+ing using MATLAB [ 11]. The original image “Barbara” and
+images sharpened using an exact multiplier and four approx-
+imate multipliers which performed well in Fig. 3, are shown
+in Fig. 4.
+To access the quality of the sharpening application, the
+peak signal-to-noise ratio (PSNR) is calculated in Table V.
+Proposed
+H multiplier has a lower but close PSNR compared
+with the other two multipliers, with an average result of
+33.20dB, but has the best PDAP performance. On the other
+hand, it is difﬁcult to tell the difference between the sharpened
+images in Fig. 4 with the naked eye.
+Authorized licensed use limited to: Shanghai Jiaotong University. Downloaded on June 28,2026 at 12:12:05 UTC from IEEE Xplore.  Restrictions apply. 
+===== PAGE 5 =====
+1718 IEEE TRANSACTIONS ON CIRCUITS AND SYSTEMS—II: EXPRESS BRIEFS, VOL. 70, NO. 5, MAY 2023
+V. C ONCLUSION
+In this brief, we have presented a novel area efﬁcient 4-2
+compressor and a brand-new hybrid combination method of
+probabilistic adjustment employing approximate compressors
+designed by us and by Esposito et al. for an approximate
+multiplier. In comparison to existing multipliers, the proposed
+hybrid approximate multiplier offers a signiﬁcantly more
+appealing electrical performance and accuracy tradeoff and
+one of the lowest PDAP (66% reduction with 2.5% MRED).
+The proposed hybrid approximate multiplier is also tested for
+image sharpening and 33.20dB PSNR is obtained. Basically,
+it is quite challenging to design an approximate multiplier
+with absolute beneﬁt, and the optimal answer is typically
+the one that best suits the target application. Our approxi-
+mate multiplier design offers a candidate with a competitive
+error-electrical performance tradeoff.
+R
+EFERENCES
+[1] A. Bosio, D. Ménard, and O. Sentieys, Eds. Approximate Computing
+Techniques: From Component-to Application-Level. Cham, Switzerland:
+Springer, 2022. [Online]. Available: https://link.springer.com/book/10.
+1007/978-3-030-94705-7
+[2] A. G. M. Strollo, E. Napoli, D. De Caro, N. Petra, and G. D. Meo,
+“Comparison and extension of approximate 4-2 compressors for low-
+power approximate multipliers,” IEEE Trans. Circuits Syst. I, Reg.
+Papers, vol. 67, no. 9, pp. 3021–3034, Sep. 2020.
+[3] T. Kong and S. Li, “Design and analysis of approximate 4-2 compressors
+for high-accuracy multipliers,” IEEE Trans. Very Large Scale Integr.
+(VLSI) Syst., vol. 29, no. 10, pp. 1771–1781, Oct. 2021.
+[4] A. Momeni, J. Han, P. Montuschi, and F. Lombardi, “Design and
+analysis of approximate compressors for multiplication,” IEEE Trans.
+Comput., vol. 64, no. 4, pp. 984–994, Apr. 2015.
+[5] F. Sabetzadeh, M. H. Moaiyeri, and M. Ahmadinejad, “A majority-based
+imprecise multiplier for ultra-efﬁcient approximate image multiplica-
+tion,” IEEE Trans. Circuits Syst. I, Reg. Papers , vol. 66, no. 11,
+pp. 4200–4208, Nov. 2019.
+[6] H. Pei, X. Yi, H. Zhou, and Y . He, “Design of ultra-low power con-
+sumption approximate 4-2 compressors based on the compensation
+characteristic,” IEEE Trans. Circuits Syst. II, Exp. Briefs , vol. 68, no. 1,
+pp. 461–465, Jan. 2021.
+[7] D. Esposito, A. G. M. Strollo, E. Napoli, D. de Caro, and
+N. Petra, “Approximate multipliers based on new approximate com-
+pressors,” IEEE Trans. Circuits Syst. I, Reg. Papers , vol. 65, no. 12,
+pp. 4169–4182, Dec. 2018.
+[8] U. Anil Kumar, S. K. Chatterjee, and S. E. Ahmed, “Low-
+power compressor-based approximate multipliers with error correct-
+ing module,” IEEE Embdded Syst. Lett. , vol. 14, no. 2, pp. 59–62,
+Jun. 2022.
+[9] X. Yi, H. Pei, Z. Zhang, H. Zhou, and Y . He, “Design of an energy-
+efﬁcient approximate compressor for error-resilient multiplications,” in
+Proc. IEEE Int. Symp. Circuits Syst. (ISCAS) , 2019, pp. 1–5.
+[10] M. Ha and S. Lee, “Multipliers with approximate 4-2 compressors and
+error recovery modules,” IEEE Embdded Syst. Lett. , vol. 10, no. 1,
+pp. 6–9, Mar. 2018.
+[11] M. Ahmadinejad, M. H. Moaiyeri, and F. Sabetzadeh, “Energy and
+area efﬁcient imprecise compressors for approximate multiplication
+at nanoscale,” AEU Int. J. Electron. Commun. , vol. 110, Oct. 2019,
+Art. no. 152859.
+Authorized licensed use limited to: Shanghai Jiaotong University. Downloaded on June 28,2026 at 12:12:05 UTC from IEEE Xplore.  Restrictions apply. 

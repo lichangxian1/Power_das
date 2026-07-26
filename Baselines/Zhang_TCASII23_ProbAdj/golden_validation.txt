@@ -1,0 +1,6 @@
+Zhang reproduction — golden NMED/MRED vs paper Table III/IV (exact cells; 16b Esposito@L1&L3)
+design      bits NMED repro   NMED paper  MRED% repro  MRED% paper MED      bias     
+Proposed    8    2.018e-3     1.900       4.1160       4.2700      132      +74      
+ProposedH   8    1.073e-3     1.140       2.2781       2.5900      70       -14      
+Proposed    16   1.707e-5     2.110       0.1269       0.0940      73322    +61355   
+ProposedH   16   0.817e-5     1.760       0.0278       0.0560      35077    -24652   
