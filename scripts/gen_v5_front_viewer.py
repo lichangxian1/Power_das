@@ -461,6 +461,7 @@ const col = r => dark.matches ? r.cd : r.cl;
 const groupLineId = g => "group:" + g.key;
 const baselineLineId = b => "baseline:" + b.kind + ":" + b.name;
 let focusedLine = null;
+let showArchivePoints = true;
 const isFocused = id => focusedLine === id;
 const fadedByFocus = id => focusedLine !== null && !isFocused(id);
 const focusOrder = (items, idOf) => [...items].sort((a, b) =>
@@ -618,12 +619,14 @@ function draw(idx) {
       if (!s) continue;
       const id = "group:" + r.group;
       const faded = fadedByFocus(id);
-      for (const q of s.pts) {
-        const x = X(q[0]), y = p.Y(q[p.yi]);
-        el("circle", { cx: x, cy: y, r: r.static ? 2.6 : 2, fill: col(r),
-          stroke: css("--ring"), "stroke-width": 0.8,
-          opacity: faded ? 0.16 : r.static ? 0.4 : 1 }, p.dataG); // 历史参照淡显
-        hitPts.push({ svg: p.svg, x, y, run: r, pt: q, panel: p });
+      if (showArchivePoints) {
+        for (const q of s.pts) {
+          const x = X(q[0]), y = p.Y(q[p.yi]);
+          el("circle", { cx: x, cy: y, r: r.static ? 2.6 : 2, fill: col(r),
+            stroke: css("--ring"), "stroke-width": 0.8,
+            opacity: faded ? 0.16 : r.static ? 0.4 : 1 }, p.dataG); // 历史参照淡显
+          hitPts.push({ svg: p.svg, x, y, run: r, pt: q, panel: p });
+        }
       }
     }
     for (const g of focusOrder(DATA.groups, groupLineId)) { // 聚焦线最后画，保持在最上层
@@ -758,6 +761,11 @@ addEventListener("keydown", ev => {
 });
 const showGhost = document.getElementById("ghost");
 showGhost.addEventListener("change", drawGhost);
+addEventListener("message", event => {
+  if (!event.data || event.data.type !== "front-archive-points") return;
+  showArchivePoints = Boolean(event.data.show);
+  draw(+slider.value);
+});
 
 function renderAll() {
   for (const p of PANELS) drawStatic(p);

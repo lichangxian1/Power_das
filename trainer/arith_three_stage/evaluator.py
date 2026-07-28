@@ -61,7 +61,7 @@ class V5CandidateEvaluator:
         engine,
         run_dir: str,
         batch_size: int = 64,
-        n_processing: int = 64,
+        n_processing: int = 32,
         target_delay: float = 1.5,
         error_vectors: int = 16_000_000,
     ):
@@ -71,6 +71,8 @@ class V5CandidateEvaluator:
         os.makedirs(self.build_dir, exist_ok=True)
         self.batch_size = int(batch_size)
         self.n_processing = int(n_processing)
+        if not 1 <= self.n_processing <= 64:
+            raise ValueError("V5CandidateEvaluator n_processing must be in [1, 64]")
         self.target_delay = float(target_delay)
         self.error_vectors = int(error_vectors)
         self.router = CanonicalRouter()

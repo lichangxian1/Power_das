@@ -51,7 +51,9 @@ def stats(exprs):
     wae = bias = er = 0.0
     maxe = 0
     for p in range(16):
-        a, b, c, d = (p >> 0) & 1, (p >> 1) & 1, (p >> 2) & 1, (p >> 3) & 1
+        # LUT index follows product("01", repeat=4): a is the MSB and d the LSB.
+        # This is the convention used by the emitted module ports and TreeSim.
+        a, b, c, d = (p >> 3) & 1, (p >> 2) & 1, (p >> 1) & 1, p & 1
         s, c1, c2 = (evl(e, a, b, c, d) for e in exprs)
         v = s + 2 * (c1 + c2)
         e_ = v - (a + b + c + d)
@@ -133,6 +135,7 @@ def main():
         bias = st["bias"]
         out[name] = {
             "type": "42", "pattern_bits": 4, "family": "sayadi_substd",
+            "lut_order": "msb_first",
             "group": "Z" if abs(bias) < 0.01 else ("P" if bias > 0 else "N"),
             "is_exact": False,
             "v_lut": st["v_lut"], "sum_lut": st["sum_lut"],

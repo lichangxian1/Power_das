@@ -11,10 +11,22 @@ set -euo pipefail
 cd /home/lichangxian/Power_das
 
 # MAIN=auto
-MAIN=${MAIN:-2026-07-19_arith_three_stage_quiet}
-CMP_A="v61cold=outputs/2026-07-16_01_v61cold_np2"    # A/B 对照（--compare=全程时间轴）
-FINAL_A="v5r2=outputs/2026-07-13_v5r2_np2"           # 历史参照（只画最终前沿，淡色）
+MAIN=${MAIN:-2026-07-28_01_stage2_diffam_proxy360_vs_ga}
+CMP_A="baseline=outputs/2026-07-28_23_stage2_actionppo360_vs_ga"    # A/B 对照（--compare=全程时间轴）
+FINAL_A="stage2_GA=outputs/2026-07-21_1147_arith_stage2_extend240_compare_baseline"           # 历史参照（只画最终前沿，淡色）
 PORT=8735
+ROUTING_ROOT="outputs/2026-07-25_0232_vanilla_arith_routing_only_ppo_vs_cem_360ep_32dc"
+ROUTING_ROOT_SEED43="outputs/2026-07-25_1144_vanilla_arith_routing_threeway_seed43_360ep_32dc"
+STAGE3_E12_METRICS="outputs/2026-07-26_0332_stage3_e12_ppo_vs_cem_60ep_64dc/stage3_pair_metrics.json"
+ROUTING_SPECS=(
+  "[s42] 原版 PPO=$ROUTING_ROOT/2026-07-25_0232_ppo_360ep_32dc/routing_metrics.jsonl"
+  "[s42] CEM=$ROUTING_ROOT/2026-07-25_0232_cem_360ep_32dc/routing_metrics.jsonl"
+  "[s42] Active-block PPO=$ROUTING_ROOT/2026-07-25_0333_active_ppo_b32_360ep_32dc/routing_metrics.jsonl"
+  "[s43] 原版 PPO=$ROUTING_ROOT_SEED43/2026-07-25_1144_ppo_seed43_360ep_32dc/routing_metrics.jsonl"
+  "[s43] CEM=$ROUTING_ROOT_SEED43/2026-07-25_1144_cem_seed43_360ep_32dc/routing_metrics.jsonl"
+  "[s43] Active-block PPO=$ROUTING_ROOT_SEED43/2026-07-25_1144_active_ppo_b32_seed43_360ep_32dc/routing_metrics.jsonl"
+  "[s43] CEM-escape=outputs/2026-07-26_0253_cem_escape_seed43_360ep_32dc/routing_metrics.jsonl"
+)
 ROOTS=(/home/lichangxian/Power_das/outputs
        /home/lichangxian/Arith-DAS-CUSTOM/outputs)
 
@@ -65,10 +77,11 @@ python3 scripts/gen_v5_front_viewer.py "outputs/$MAIN" "$MAIN_VIEW" \
 python3 scripts/gen_v5_front_viewer.py "$CMP_A_DIR" "$CMP_VIEW" \
     --compare_final "$FINAL_A"
 
-# 汇总入口：按指标排成 2x2（第一行面积、第二行功耗），并用 main 的 ep
-# 时间轴统一驱动四幅图。子页面仍完整嵌入 srcdoc，下载单个 HTML 可离线查看。
+# 汇总入口：四图置顶，按指标排成 2x2（第一行面积、第二行功耗），并用 main 的
+# ep 时间轴统一驱动四幅图。子页面仍完整嵌入 srcdoc，下载单个 HTML 可离线查看。
 python3 - "outputs/$MAIN/front_viewer.html" "$MAIN" \
-    "$CMP_A_LABEL" "$FINAL_A_LABEL" "$BUILD_VERSION" <<'PY'
+    "$CMP_A_LABEL" "$FINAL_A_LABEL" "$BUILD_VERSION" \
+    "$STAGE3_E12_METRICS" "${ROUTING_SPECS[@]}" <<'PY'
 import html
 import json
 import sys
@@ -79,6 +92,37 @@ main_label = html.escape(sys.argv[2])
 cmp_label = html.escape(sys.argv[3])
 final_label = html.escape(sys.argv[4])
 build_version = sys.argv[5]
+stage3_path = Path(sys.argv[6])
+if not stage3_path.is_file():
+    print(f"  [wait] Stage3 e12 指标尚未生成: {stage3_path}")
+try:
+    stage3_url = "/" + stage3_path.relative_to("outputs").as_posix()
+except ValueError as exc:
+    raise SystemExit(f"Stage3 e12 指标必须位于 outputs 下: {stage3_path}") from exc
+routing_sources = []
+for index, spec in enumerate(sys.argv[7:]):
+    label, separator, source = spec.partition("=")
+    if not separator:
+        raise SystemExit(f"routing 曲线需要 LABEL=PATH，收到: {spec}")
+    path = Path(source)
+    if not path.is_file():
+        print(f"  [wait] routing 指标尚未生成: {path}")
+    try:
+        url = "/" + path.relative_to("outputs").as_posix()
+    except ValueError as exc:
+        raise SystemExit(f"routing 指标必须位于 outputs 下: {path}") from exc
+    routing_sources.append({
+        "name": label,
+        "url": url,
+        "index": index,
+        "colorIndex": (
+            3 if "CEM-escape" in label else
+            2 if "Active-block" in label else
+            1 if "CEM" in label else
+            0
+        ),
+        "dashed": "seed43" in path.as_posix(),
+    })
 main_page = (out.parent / "main_vs_FINAL_A.html").read_text(encoding="utf-8")
 cmp_page = (out.parent / "CMP_A_vs_FINAL_A.html").read_text(encoding="utf-8")
 
@@ -174,13 +218,45 @@ template = """<!doctype html>
   .cmp-toggle { display:flex; align-items:center; gap:5px; color:var(--muted);
                 white-space:nowrap; cursor:pointer; user-select:none; }
   .cmp-toggle input { margin:0; accent-color:#2a78d6; }
-  .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+  .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px;
+          margin-bottom:16px; }
   section { min-width:0; padding:12px; background:var(--panel);
             border:1px solid var(--line); border-radius:12px; }
   h2 { margin:0 4px 8px; font-size:15px; }
   .metric { color:var(--muted); font-weight:500; margin-right:7px; }
   iframe { display:block; width:100%; height:500px; border:0; background:var(--panel); }
+  .routing-panel { margin-bottom:16px; padding:14px; background:var(--panel);
+                   border:1px solid var(--line); border-radius:12px; }
+  .routing-head { display:flex; align-items:flex-start; justify-content:space-between;
+                  flex-wrap:wrap; gap:10px; margin-bottom:8px; }
+  .routing-head h2 { margin:0; font-size:16px; }
+  .routing-meta { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .routing-stats { display:flex; flex-wrap:wrap; gap:8px 18px; margin:6px 0 8px;
+                   font-variant-numeric:tabular-nums; }
+  .routing-stat { white-space:nowrap; }
+  .routing-stat b { font-weight:650; }
+  #routing-chart { display:block; width:100%; height:auto; min-height:260px; }
+  .routing-grid { stroke:var(--line); stroke-width:1; }
+  .routing-axis { stroke:var(--muted); stroke-width:1; }
+  .routing-tick { fill:var(--muted); font-size:11px; }
+  .routing-label { fill:var(--text); font-size:12px; }
+  .routing-path { fill:none; stroke-width:2.4; stroke-linecap:round;
+                  stroke-linejoin:round; }
+  .stage3-panel { margin-bottom:16px; padding:14px; background:var(--panel);
+                  border:1px solid var(--line); border-radius:12px; }
+  .stage3-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; }
+  .stage3-chart-wrap { min-width:0; }
+  .stage3-chart-wrap h3 { margin:2px 0 4px; font-size:14px; font-weight:650; }
+  .stage3-chart { display:block; width:100%; height:auto; min-height:230px; }
+  .stage3-path { fill:none; stroke-width:2.5; stroke-linecap:round;
+                 stroke-linejoin:round; }
   @media (max-width:900px) { .grid { grid-template-columns:1fr; } }
+  @media (max-width:900px) { .stage3-grid { grid-template-columns:1fr; } }
+
+  # .routing-panel,
+  # .stage3-panel {
+  #   display: none !important;
+  # }
 </style>
 </head>
 <body>
@@ -190,6 +266,7 @@ template = """<!doctype html>
     <button id="play" type="button">▶ 播放</button>
     <input id="slider" type="range" min="0" max="__EP_INDEX_MAX__" value="__EP_INDEX_MAX__" step="1">
     <span id="eplab"></span>
+    <label class="cmp-toggle"><input id="showarchive" type="checkbox" checked>显示档案点</label>
     <label class="cmp-toggle"><input id="showcmp" type="checkbox" checked>显示 CMP_A</label>
   </div>
   <main class="grid">
@@ -210,17 +287,251 @@ template = """<!doctype html>
       <iframe srcdoc="__CMP_POWER__" title="CMP_A vs FINAL_A 功耗"></iframe>
     </section>
   </main>
+  <section class="routing-panel" aria-labelledby="routing-title">
+    <div class="routing-head">
+      <div>
+        <h2 id="routing-title">布线优化器实时对比</h2>
+        <div class="routing-meta">各实验按自身 episode 对齐；历史最优 objective，越低越好</div>
+      </div>
+      <div id="routing-updated" class="routing-meta">等待首轮读取…</div>
+    </div>
+    <div id="routing-stats" class="routing-stats" aria-live="polite"></div>
+    <svg id="routing-chart" viewBox="0 0 1080 340" role="img" aria-labelledby="routing-svg-title routing-svg-desc">
+      <title id="routing-svg-title">原版PPO、CEM、Active-block PPO与CEM-escape的实时历史最优目标值</title>
+      <desc id="routing-svg-desc">横轴是episode，纵轴是截至该episode的最优objective，各条线每十秒从实验日志刷新。</desc>
+    </svg>
+  </section>
+  <section class="stage3-panel" aria-labelledby="stage3-title">
+    <div class="routing-head">
+      <div>
+        <h2 id="stage3-title">Stage3 e12：PPO、CEM、CEM-reheat、Vanilla PPO、NSGA-II</h2>
+        <div class="routing-meta">同一 Stage2 结构、真实 DC+Verilator；PPO/CEM/CEM-reheat/NSGA-II 每轮 64 路，Vanilla 每轮 32 路；objective = -reward，越低越好</div>
+      </div>
+      <div id="stage3-updated" class="routing-meta">等待首轮读取…</div>
+    </div>
+    <div id="stage3-stats" class="routing-stats" aria-live="polite"></div>
+    <div class="stage3-grid">
+      <div class="stage3-chart-wrap">
+        <h3>每轮平均 objective</h3>
+        <svg id="stage3-mean-chart" class="stage3-chart" viewBox="0 0 540 300" role="img" aria-labelledby="stage3-mean-title stage3-mean-desc">
+          <title id="stage3-mean-title">e12 PPO、CEM、CEM-reheat、Vanilla PPO 与 NSGA-II 每轮平均目标值</title>
+          <desc id="stage3-mean-desc">横轴是 episode，纵轴是该轮候选的平均 objective，越低越好。</desc>
+        </svg>
+      </div>
+      <div class="stage3-chart-wrap">
+        <h3>累计最佳 objective</h3>
+        <svg id="stage3-best-chart" class="stage3-chart" viewBox="0 0 540 300" role="img" aria-labelledby="stage3-best-title stage3-best-desc">
+          <title id="stage3-best-title">e12 PPO、CEM、CEM-reheat、Vanilla PPO 与 NSGA-II 累计最佳目标值</title>
+          <desc id="stage3-best-desc">横轴是 episode，纵轴是截至该轮发现的最低 objective。</desc>
+        </svg>
+      </div>
+    </div>
+  </section>
 <script>
 const MAIN_EPS = __MAIN_EPS__;
 const BUILD_VERSION = __BUILD_VERSION__;
+const ROUTING_SOURCES = __ROUTING_SOURCES__;
+const STAGE3_PAIR_SOURCE = __STAGE3_PAIR_SOURCE__;
 const slider = document.getElementById("slider");
 const playBtn = document.getElementById("play");
 const eplab = document.getElementById("eplab");
+const archiveToggle = document.getElementById("showarchive");
 const cmpToggle = document.getElementById("showcmp");
 const cmpPanels = [...document.querySelectorAll(".cmp-panel")];
 const frames = [...document.querySelectorAll("iframe")];
+const ARCHIVE_STORAGE_KEY = "front-show-archive-points";
 const CMP_STORAGE_KEY = "front-show-cmp-a";
 let timer = null;
+
+const ROUTING_COLORS = ["#2a78d6", "#eda100", "#1baf7a", "#b45ad6"];
+const routingSvg = document.getElementById("routing-chart");
+const routingStats = document.getElementById("routing-stats");
+const routingUpdated = document.getElementById("routing-updated");
+let routingRefreshRunning = false;
+const STAGE3_COLORS = ["#2a78d6", "#eda100", "#b45ad6", "#1baf7a", "#d95f02"];
+const stage3MeanChart = document.getElementById("stage3-mean-chart");
+const stage3BestChart = document.getElementById("stage3-best-chart");
+const stage3Stats = document.getElementById("stage3-stats");
+const stage3Updated = document.getElementById("stage3-updated");
+let stage3RefreshRunning = false;
+
+function svgNode(tag, attrs, text) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [key, value] of Object.entries(attrs || {}))
+    node.setAttribute(key, String(value));
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+async function readRoutingSeries(source) {
+  const response = await fetch(source.url + "?t=" + Date.now(), {cache:"no-store"});
+  if (!response.ok) throw new Error(source.name + " HTTP " + response.status);
+  const records = [];
+  for (const line of (await response.text()).split(/\\r?\\n/)) {
+    if (!line.trim()) continue;
+    try { records.push(JSON.parse(line)); } catch (_) {}
+  }
+  let best = Infinity;
+  const points = [];
+  for (const record of records) {
+    const candidate = Number(record.found_best_objective ?? record.batch_objective_min);
+    const episode = Number(record.episode);
+    if (!Number.isFinite(candidate) || !Number.isFinite(episode)) continue;
+    best = Math.min(best, candidate);
+    points.push([episode, best]);
+  }
+  return {...source, points, best, completed:points.length};
+}
+
+function drawRouting(series) {
+  while (routingSvg.lastChild && !["title", "desc"].includes(routingSvg.lastChild.tagName))
+    routingSvg.removeChild(routingSvg.lastChild);
+  const populated = series.filter(item => item.points.length);
+  if (!populated.length) return;
+  const all = populated.flatMap(item => item.points);
+  const width = 1080, height = 340;
+  const margin = {top:18, right:34, bottom:48, left:72};
+  const plotW = width - margin.left - margin.right;
+  const plotH = height - margin.top - margin.bottom;
+  const xMax = Math.max(1, ...all.map(point => point[0]));
+  const rawMin = Math.min(...all.map(point => point[1]));
+  const rawMax = Math.max(...all.map(point => point[1]));
+  const pad = Math.max((rawMax - rawMin) * 0.12, 0.002);
+  const yMin = rawMin - pad, yMax = rawMax + pad;
+  const x = value => margin.left + value / xMax * plotW;
+  const y = value => margin.top + (yMax - value) / (yMax - yMin) * plotH;
+
+  for (let i = 0; i <= 5; i++) {
+    const xv = Math.round(xMax * i / 5), px = x(xv);
+    routingSvg.append(svgNode("line", {x1:px,y1:margin.top,x2:px,y2:margin.top+plotH,class:"routing-grid"}));
+    routingSvg.append(svgNode("text", {x:px,y:height-23,"text-anchor":"middle",class:"routing-tick"}, xv));
+    const yv = yMin + (yMax-yMin) * i / 5, py = y(yv);
+    routingSvg.append(svgNode("line", {x1:margin.left,y1:py,x2:margin.left+plotW,y2:py,class:"routing-grid"}));
+    routingSvg.append(svgNode("text", {x:margin.left-10,y:py+4,"text-anchor":"end",class:"routing-tick"}, yv.toFixed(3)));
+  }
+  routingSvg.append(svgNode("line", {x1:margin.left,y1:margin.top+plotH,x2:margin.left+plotW,y2:margin.top+plotH,class:"routing-axis"}));
+  routingSvg.append(svgNode("line", {x1:margin.left,y1:margin.top,x2:margin.left,y2:margin.top+plotH,class:"routing-axis"}));
+  routingSvg.append(svgNode("text", {x:margin.left+plotW/2,y:height-5,"text-anchor":"middle",class:"routing-label"}, "Episode"));
+  const ylabel = svgNode("text", {x:17,y:margin.top+plotH/2,"text-anchor":"middle",class:"routing-label",transform:`rotate(-90 17 ${margin.top+plotH/2})`}, "Best objective ↓");
+  routingSvg.append(ylabel);
+
+  for (const item of populated) {
+    const color = ROUTING_COLORS[item.colorIndex % ROUTING_COLORS.length];
+    const d = item.points.map((point, index) => `${index ? "L" : "M"}${x(point[0]).toFixed(2)},${y(point[1]).toFixed(2)}`).join(" ");
+    routingSvg.append(svgNode("path", {
+      d, stroke:color, class:"routing-path",
+      "stroke-dasharray": item.dashed ? "9 6" : "none"
+    }));
+    const last = item.points[item.points.length-1];
+    routingSvg.append(svgNode("circle", {cx:x(last[0]),cy:y(last[1]),r:4,fill:color}));
+  }
+}
+
+async function refreshRouting() {
+  if (routingRefreshRunning || !ROUTING_SOURCES.length) return;
+  routingRefreshRunning = true;
+  try {
+    const series = await Promise.all(ROUTING_SOURCES.map(async source => {
+      try {
+        return await readRoutingSeries(source);
+      } catch (error) {
+        return {...source, points:[], best:Infinity, completed:0, error:error.message};
+      }
+    }));
+    drawRouting(series);
+    routingStats.replaceChildren(...series.map(item => {
+      const span = document.createElement("span");
+      span.className = "routing-stat";
+      span.style.color = ROUTING_COLORS[item.colorIndex % ROUTING_COLORS.length];
+      span.innerHTML = item.error
+        ? `<b>${item.name}</b>　等待启动`
+        : `<b>${item.name}</b>　${item.completed}/360 ep　best ${Number.isFinite(item.best) ? item.best.toFixed(6) : "—"}`;
+      return span;
+    }));
+    routingUpdated.textContent = "日志刷新 " + new Date().toLocaleTimeString("zh-CN", {hour12:false});
+  } catch (error) {
+    routingUpdated.textContent = "routing 刷新失败: " + error.message;
+  } finally {
+    routingRefreshRunning = false;
+  }
+}
+
+refreshRouting();
+setInterval(refreshRouting, 10000);
+
+function drawStage3Chart(svg, arms, metric, ylabel, totalEpisodes) {
+  while (svg.lastChild && !["title", "desc"].includes(svg.lastChild.tagName))
+    svg.removeChild(svg.lastChild);
+  const series = arms
+    .map((arm, index) => ({...arm, index, points:arm.records.map(record => [Number(record.episode), Number(record[metric])])}))
+    .filter(arm => arm.points.length);
+  if (!series.length) return;
+  const all = series.flatMap(arm => arm.points);
+  const width = 540, height = 300;
+  const margin = {top:16, right:28, bottom:44, left:62};
+  const plotW = width - margin.left - margin.right;
+  const plotH = height - margin.top - margin.bottom;
+  const xMax = Math.max(1, Number(totalEpisodes));
+  const rawMin = Math.min(...all.map(point => point[1]));
+  const rawMax = Math.max(...all.map(point => point[1]));
+  const pad = Math.max((rawMax - rawMin) * 0.14, 0.0015);
+  const yMin = Math.min(rawMin - pad, 0);
+  const yMax = rawMax + pad;
+  const x = value => margin.left + value / xMax * plotW;
+  const y = value => margin.top + (yMax - value) / Math.max(yMax - yMin, 1e-9) * plotH;
+  for (let i = 0; i <= 5; i++) {
+    const xv = xMax * i / 5, px = x(xv);
+    svg.append(svgNode("line", {x1:px,y1:margin.top,x2:px,y2:margin.top+plotH,class:"routing-grid"}));
+    svg.append(svgNode("text", {x:px,y:height-20,"text-anchor":"middle",class:"routing-tick"}, Math.round(xv)));
+    const yv = yMin + (yMax-yMin) * i / 5, py = y(yv);
+    svg.append(svgNode("line", {x1:margin.left,y1:py,x2:margin.left+plotW,y2:py,class:"routing-grid"}));
+    svg.append(svgNode("text", {x:margin.left-8,y:py+4,"text-anchor":"end",class:"routing-tick"}, yv.toFixed(3)));
+  }
+  if (yMin <= 0 && yMax >= 0) {
+    svg.append(svgNode("line", {x1:margin.left,y1:y(0),x2:margin.left+plotW,y2:y(0),class:"routing-axis","stroke-dasharray":"4 4"}));
+  }
+  svg.append(svgNode("line", {x1:margin.left,y1:margin.top+plotH,x2:margin.left+plotW,y2:margin.top+plotH,class:"routing-axis"}));
+  svg.append(svgNode("line", {x1:margin.left,y1:margin.top,x2:margin.left,y2:margin.top+plotH,class:"routing-axis"}));
+  svg.append(svgNode("text", {x:margin.left+plotW/2,y:height-3,"text-anchor":"middle",class:"routing-label"}, "Episode"));
+  svg.append(svgNode("text", {x:15,y:margin.top+plotH/2,"text-anchor":"middle",class:"routing-label",transform:`rotate(-90 15 ${margin.top+plotH/2})`}, ylabel));
+  for (const arm of series) {
+    const color = STAGE3_COLORS[arm.index];
+    const d = arm.points.map((point, index) => `${index ? "L" : "M"}${x(point[0]).toFixed(2)},${y(point[1]).toFixed(2)}`).join(" ");
+    svg.append(svgNode("path", {d,stroke:color,class:"stage3-path"}));
+    const last = arm.points[arm.points.length-1];
+    svg.append(svgNode("circle", {cx:x(last[0]),cy:y(last[1]),r:4,fill:color}));
+  }
+}
+
+async function refreshStage3() {
+  if (stage3RefreshRunning) return;
+  stage3RefreshRunning = true;
+  try {
+    const response = await fetch(STAGE3_PAIR_SOURCE + "?t=" + Date.now(), {cache:"no-store"});
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const data = await response.json();
+    drawStage3Chart(stage3MeanChart, data.arms, "mean_objective", "Mean objective ↓", data.total_episodes);
+    drawStage3Chart(stage3BestChart, data.arms, "cumulative_best_objective", "Best objective ↓", data.total_episodes);
+    stage3Stats.replaceChildren(...data.arms.map((arm, index) => {
+      const span = document.createElement("span");
+      span.className = "routing-stat";
+      span.style.color = STAGE3_COLORS[index];
+      const latest = arm.records.length ? arm.records[arm.records.length - 1] : null;
+      span.innerHTML = `<b>${arm.name}</b>　${arm.completed_episodes}/${arm.total_episodes} ep　` +
+        `mean obj ${latest ? Number(latest.mean_objective).toFixed(6) : "—"}　` +
+        `best obj ${latest ? Number(latest.cumulative_best_objective).toFixed(6) : "—"}`;
+      return span;
+    }));
+    stage3Updated.textContent = "日志刷新 " + new Date().toLocaleTimeString("zh-CN", {hour12:false});
+  } catch (error) {
+    stage3Updated.textContent = "Stage3 刷新失败: " + error.message;
+  } finally {
+    stage3RefreshRunning = false;
+  }
+}
+
+refreshStage3();
+setInterval(refreshStage3, 10000);
 
 async function checkForUpdate() {
   try {
@@ -234,6 +545,8 @@ async function checkForUpdate() {
 
 setInterval(checkForUpdate, 20000);
 addEventListener("focus", checkForUpdate);
+addEventListener("focus", refreshRouting);
+addEventListener("focus", refreshStage3);
 checkForUpdate();
 
 function setCmpVisibility(show) {
@@ -242,9 +555,17 @@ function setCmpVisibility(show) {
 }
 
 try {
+  const savedArchive = localStorage.getItem(ARCHIVE_STORAGE_KEY);
+  if (savedArchive !== null) archiveToggle.checked = savedArchive !== "0";
   const savedCmp = localStorage.getItem(CMP_STORAGE_KEY);
   if (savedCmp !== null) cmpToggle.checked = savedCmp !== "0";
 } catch (_) {}
+
+archiveToggle.addEventListener("change", () => {
+  sync();
+  try { localStorage.setItem(ARCHIVE_STORAGE_KEY, archiveToggle.checked ? "1" : "0"); }
+  catch (_) {}
+});
 
 cmpToggle.addEventListener("change", () => {
   setCmpVisibility(cmpToggle.checked);
@@ -260,8 +581,13 @@ function selectedEpisode() {
 function sync() {
   const ep = selectedEpisode();
   eplab.textContent = "ep " + ep + " / " + MAIN_EPS[MAIN_EPS.length - 1] + " (main)";
-  for (const frame of frames)
-    if (frame.contentWindow) frame.contentWindow.postMessage({type:"front-episode", ep}, "*");
+  for (const frame of frames) {
+    if (!frame.contentWindow) continue;
+    frame.contentWindow.postMessage({type:"front-episode", ep}, "*");
+    frame.contentWindow.postMessage({
+      type:"front-archive-points", show:archiveToggle.checked
+    }, "*");
+  }
 }
 function stop() {
   if (!timer) return;
@@ -307,6 +633,8 @@ replacements = {
     "__BUILD_VERSION__": json.dumps(build_version),
     "__EP_INDEX_MAX__": str(len(main_eps) - 1),
     "__MAIN_EPS__": json.dumps(main_eps, separators=(",", ":")),
+    "__ROUTING_SOURCES__": json.dumps(routing_sources, separators=(",", ":")),
+    "__STAGE3_PAIR_SOURCE__": json.dumps(stage3_url),
     "__MAIN_AREA__": srcdocs["main_area"],
     "__CMP_AREA__": srcdocs["cmp_area"],
     "__MAIN_POWER__": srcdocs["main_power"],
@@ -328,4 +656,4 @@ if ! pgrep -f "http.server $PORT" >/dev/null 2>&1; then
       >/tmp/front_viewer_http.log 2>&1 &
   sleep 0.5
 fi
-echo "浏览器打开/刷新: http://localhost:$PORT/latest_front_viewer.html"
+echo "浏览器打开（新快照会自动刷新）: http://localhost:$PORT/latest_front_viewer.html"

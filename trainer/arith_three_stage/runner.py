@@ -20,6 +20,7 @@ from .bandit import ContextualThompsonBandit
 from .candidate import Candidate
 from .cell_ops import CELL_ARMS, CellOperator
 from .cem import RoutingCEM
+from .diffam_search import DiffAMStage2Search
 from .evaluator import V5CandidateEvaluator
 from .pareto import (
     ExternalArchive,
@@ -29,6 +30,7 @@ from .pareto import (
     tournament,
 )
 from .selection import select_banded
+from .stage2_modes import run_stage2_cem, run_stage2_diffam_proxy
 from .structure_actions import STRUCTURE_ARMS, StructureMutator
 
 
@@ -37,7 +39,7 @@ class ThreeStageConfig:
     population_size: int = 128
     offspring_size: int = 128
     dc_batch_size: int = 64
-    dc_parallelism: int = 64
+    dc_parallelism: int = 32
     delay_limit: float = 1.5
     error_vectors: int = 16_000_000
     seed: int = 42
@@ -45,10 +47,54 @@ class ThreeStageConfig:
     k_max: int = 24
     mred_lo: float = 1e-7
     mred_hi: float = 2e-1
+    engine_config_path: str = "configs/config_groups/mul_16_approx_error_obj.yaml"
+    approx_col_window: int = 6
+    approx_lib_path: str = "Appr_Comp/selected_compressors_all_substd.json"
+    approx42_library_path: str = "Appr_Comp/selected_compressors_all_substd.json"
+    approx42_rtl_path: str = "Appr_Comp/rtl/comp42s_standalone.v"
     handoff_bins: int = 8
     stage1_generations: int = 120
     stage2_generations: int = 120
     stage2_crossover_probability: float = 0.9
+    stage2_search_mode: str = "ga"
+    stage2_diffam_device: str = "cuda:0"
+    stage2_diffam_vectors: int = 16_000_000
+    stage2_diffam_vector_seed: int = 12345
+    stage2_diffam_steps: int = 40
+    stage2_diffam_budget_count: int = 8
+    stage2_diffam_restarts: int = 1
+    stage2_diffam_samples: int = 8
+    stage2_diffam_lr: float = 0.03
+    stage2_diffam_lam0: float = 50.0
+    stage2_diffam_lam_step: float = 100.0
+    stage2_diffam_dual_every: int = 10
+    stage2_diffam_tau_min: float = 0.25
+    stage2_diffam_init_std: float = 0.70
+    stage2_diffam_exact_bias: float = 0.80
+    stage2_diffam_warm_bias: float = 2.0
+    stage2_cem_elite_fraction: float = 0.20
+    stage2_cem_smoothing: float = 0.25
+    stage2_cem_exploration: float = 0.05
+    stage2_cem_temperature: float = 1.0
+    stage2_cem_init_approx_cells: float = 4.0
+    stage2_cem_history_per_structure: int = 128
+    stage2_proxy_ensemble: int = 3
+    stage2_proxy_min_samples: int = 384
+    stage2_proxy_observation_cap: int = 8192
+    stage2_proxy_replay_samples: int = 4096
+    stage2_proxy_batch_size: int = 256
+    stage2_proxy_epochs: int = 4
+    stage2_proxy_lr: float = 3e-4
+    stage2_proxy_weight_decay: float = 1e-4
+    stage2_proxy_rank_weight: float = 0.30
+    stage2_proxy_diffam_steps: int = 8
+    stage2_proxy_diffam_lr: float = 5e-3
+    stage2_proxy_tau_start: float = 1.5
+    stage2_proxy_logit_noise: float = 0.02
+    stage2_proxy_uncertainty_weight: float = 0.25
+    stage2_proxy_nominal_area_weight: float = 0.05
+    stage2_proxy_delay_weight: float = 10.0
+    stage2_proxy_entropy_weight: float = 0.02
     bandit_window: int = 128
     bandit_explore: float = 0.03
     stage3_elites: int = 24
@@ -81,6 +127,7 @@ class ThreeStageConfig:
     stage3_single_elite_source: Optional[str] = None
     stage3_single_elite_index: Optional[int] = None
     stage3_single_elite_id: Optional[str] = None
+    stage1_backbones_source: Optional[str] = None
     stage1_init_only: bool = False
     stop_after_stage1: bool = False
     stop_after_stage2: bool = False
@@ -130,6 +177,14 @@ class ThreeStageRunner:
         self.engine = engine
         self.run_dir = os.path.abspath(run_dir)
         self.cfg = config or ThreeStageConfig()
+        if self.cfg.stage2_search_mode not in ("ga", "diffam", "cem", "diffam_proxy"):
+            raise ValueError(
+                "stage2_search_mode must be ga, diffam, cem, or diffam_proxy; got "
+                f"{self.cfg.stage2_search_mode!r}"
+            )
+        if not 1 <= int(self.cfg.dc_parallelism) <= 64:
+            raise ValueError("dc_parallelism must be in [1, 64]")
+        self._restored_extra_state = {}
         self.rng = random.Random(self.cfg.seed)
         np.random.seed(self.cfg.seed)
         torch.manual_seed(self.cfg.seed)
@@ -336,6 +391,7 @@ class ThreeStageRunner:
         population: Sequence[Candidate],
         archive: ExternalArchive,
         bandit: ContextualThompsonBandit,
+        extra_state: Optional[dict] = None,
     ) -> None:
         stage_dir = os.path.join(self.run_dir, f"stage{stage}")
         _atomic_json(os.path.join(stage_dir, "population.json"), [c.to_dict() for c in population])
@@ -352,6 +408,7 @@ class ThreeStageRunner:
                 "rng_state": self.rng.getstate(),
                 "numpy_state": np.random.get_state(),
                 "torch_state": torch.random.get_rng_state(),
+                "extra_state": copy.deepcopy(extra_state or {}),
             },
         )
 
@@ -368,6 +425,7 @@ class ThreeStageRunner:
         archive.update(())
         bandit = self.structure_bandit if stage == 1 else self.cell_bandit
         bandit.load_state_dict(state["bandit"])
+        self._restored_extra_state[stage] = copy.deepcopy(state.get("extra_state") or {})
         return (
             int(state["generation"]),
             [Candidate.from_dict(x) for x in state["population"]],
@@ -409,6 +467,30 @@ class ThreeStageRunner:
 
     def _load_or_run_stage1(self) -> List[Candidate]:
         done = os.path.join(self.run_dir, "stage1", "backbones_32.json")
+        if self.cfg.stage1_backbones_source is not None:
+            source = os.path.abspath(self.cfg.stage1_backbones_source)
+            backbones = _load_candidates(source)
+            if len(backbones) != 32:
+                raise ValueError(
+                    f"Stage-2-only source must contain 32 backbones, got {len(backbones)}"
+                )
+            if any(candidate.cells for candidate in backbones):
+                raise ValueError("Stage-1 backbone source must not contain approximate cells")
+            if os.path.exists(done):
+                existing = _load_candidates(done)
+                old_hashes = [candidate.structure_hash for candidate in existing]
+                new_hashes = [candidate.structure_hash for candidate in backbones]
+                if old_hashes != new_hashes:
+                    raise RuntimeError(
+                        "run directory already contains a different Stage-1 backbone set"
+                    )
+            else:
+                _atomic_json(done, [candidate.to_dict() for candidate in backbones])
+            logging.info(
+                "Stage 1 skipped; imported 32 fixed backbones from %s",
+                source,
+            )
+            return backbones
         if os.path.exists(done):
             logging.info("Stage 1 already complete; loading %s", done)
             return _load_candidates(done)
@@ -494,7 +576,150 @@ class ThreeStageRunner:
         logging.info("Stage 1 complete: selected %d backbones", len(backbones))
         return backbones
 
+    def _load_or_run_stage2_diffam(
+        self,
+        backbones: Sequence[Candidate],
+    ) -> List[Candidate]:
+        done = os.path.join(self.run_dir, "stage2", "elites_24.json")
+        if os.path.exists(done):
+            logging.info("Stage 2 already complete; loading %s", done)
+            return _load_candidates(done)
+        searcher = DiffAMStage2Search(self.engine, self.cfg, self.run_dir)
+        restored = self._restore_generation(2)
+        if restored is None:
+            seen_hashes = set()
+            population = searcher.propose(
+                backbones,
+                size=self.cfg.population_size,
+                round_index=0,
+                excluded_hashes=seen_hashes,
+            )
+            self._evaluate_with_retries(population)
+            if sum(c.evaluated for c in population) < self.cfg.population_size:
+                raise RuntimeError(
+                    "DiffAM Stage 2 initial population has unresolved evaluation failures"
+                )
+            seen_hashes.update(c.cell_hash for c in population)
+            population = environmental_select(
+                population,
+                self.cfg.population_size,
+                self.cfg.delay_limit,
+            )
+            archive = self._new_archive(2)
+            archive.update(population)
+            start_generation = 0
+            self._save_generation(
+                2,
+                0,
+                population,
+                archive,
+                self.cell_bandit,
+                extra_state={
+                    "search_mode": "diffam",
+                    "seen_cell_hashes": sorted(seen_hashes),
+                },
+            )
+        else:
+            start_generation, population, archive = restored
+            extra = self._restored_extra_state.get(2, {})
+            if extra.get("search_mode") != "diffam":
+                raise RuntimeError(
+                    "Stage 2 checkpoint was not created by pure DiffAM; use a fresh run directory"
+                )
+            seen_hashes = set(extra.get("seen_cell_hashes") or ())
+            seen_hashes.update(c.cell_hash for c in population)
+            seen_hashes.update(c.cell_hash for c in archive.items)
+            logging.info(
+                "resuming DiffAM Stage 2 after generation %d with %d seen cells",
+                start_generation,
+                len(seen_hashes),
+            )
+
+        for generation in range(start_generation, self.cfg.stage2_generations):
+            offspring = searcher.propose(
+                backbones,
+                size=self.cfg.offspring_size,
+                round_index=generation + 1,
+                excluded_hashes=seen_hashes,
+                warm_starts=population,
+            )
+            if any(c.cell_hash in seen_hashes for c in offspring):
+                raise AssertionError("DiffAM proposed an already evaluated cell_hash")
+            self._evaluate_with_retries(offspring)
+            if sum(c.evaluated for c in offspring) < self.cfg.offspring_size:
+                raise RuntimeError(
+                    f"DiffAM Stage 2 generation {generation + 1} has unresolved failures"
+                )
+            seen_hashes.update(c.cell_hash for c in offspring)
+            population = environmental_select(
+                list(population) + offspring,
+                self.cfg.population_size,
+                self.cfg.delay_limit,
+            )
+            archive.update(offspring)
+            logging.info(
+                "DiffAM Stage 2 generation %d/%d complete: archive=%d seen=%d",
+                generation + 1,
+                self.cfg.stage2_generations,
+                len(archive.items),
+                len(seen_hashes),
+            )
+            if (generation + 1) % self.cfg.checkpoint_every == 0:
+                self._save_generation(
+                    2,
+                    generation + 1,
+                    population,
+                    archive,
+                    self.cell_bandit,
+                    extra_state={
+                        "search_mode": "diffam",
+                        "seen_cell_hashes": sorted(seen_hashes),
+                    },
+                )
+
+        elites = select_banded(
+            list(archive.items) + list(population),
+            n_bins=self.cfg.handoff_bins,
+            roles=("area", "power", "knee"),
+            mred_lo=self.cfg.mred_lo,
+            mred_hi=self.cfg.mred_hi,
+            delay_limit=self.cfg.delay_limit,
+        )
+        _atomic_json(done, [c.to_dict() for c in elites])
+        logging.info("DiffAM Stage 2 complete: selected %d elites", len(elites))
+        return elites
+
+    def _claim_stage2_search_mode(self) -> None:
+        path = os.path.join(self.run_dir, "stage2", "search_mode.json")
+        requested = str(self.cfg.stage2_search_mode)
+        if os.path.exists(path):
+            with open(path) as stream:
+                existing = str(json.load(stream).get("search_mode"))
+            if existing != requested:
+                raise RuntimeError(
+                    f"Stage 2 run directory belongs to {existing!r}, "
+                    f"not requested mode {requested!r}"
+                )
+            return
+        has_legacy_state = any(
+            os.path.exists(os.path.join(self.run_dir, "stage2", name))
+            for name in ("checkpoint.pt", "elites_24.json")
+        )
+        if has_legacy_state and requested != "ga":
+            raise RuntimeError(
+                "Legacy Stage 2 state has no search-mode marker and is treated as GA; "
+                "use a fresh run directory for pure DiffAM"
+            )
+        _atomic_json(path, {"search_mode": requested})
+
     def _load_or_run_stage2(self, backbones: Sequence[Candidate]) -> List[Candidate]:
+        self._claim_stage2_search_mode()
+        if self.cfg.stage2_search_mode == "cem":
+            return run_stage2_cem(self, backbones)
+        if self.cfg.stage2_search_mode == "diffam_proxy":
+            return run_stage2_diffam_proxy(self, backbones)
+        if self.cfg.stage2_search_mode == "diffam":
+            return self._load_or_run_stage2_diffam(backbones)
         done = os.path.join(self.run_dir, "stage2", "elites_24.json")
         if os.path.exists(done):
             logging.info("Stage 2 already complete; loading %s", done)
@@ -518,6 +743,11 @@ class ThreeStageRunner:
             self._save_generation(2, 0, population, archive, self.cell_bandit)
         else:
             start_generation, population, archive = restored
+            extra = self._restored_extra_state.get(2, {})
+            if extra.get("search_mode", "ga") != "ga":
+                raise RuntimeError(
+                    "Stage 2 checkpoint search mode differs from requested GA mode"
+                )
             logging.info("resuming Stage 2 after generation %d", start_generation)
 
         for generation in range(start_generation, self.cfg.stage2_generations):

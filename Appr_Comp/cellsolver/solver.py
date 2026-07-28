@@ -4,14 +4,16 @@
 library.json / library42_native.json（精确张量化，不用 diffam 的 MLP surrogate）。
 
 MRED 分层估计器（关键设计）：MRED = mean(|e|/golden) 被极少数小乘积样本主导
-（k12 floor 下 g<2^22 的 ~0.7% 样本贡献绝大部分质量；200k 均匀前缀与 16M 估计可差
+（k12 全精确-cell baseline 下 g<2^22 的 ~0.7% 样本贡献绝大部分质量；
+200k 均匀前缀与 16M 估计可差
 一个量级）。故对固定 16M xorshift 流分层：
   S12 = {0<g<2^22}（~107k 个）→ 每步全量精确；
   S3  = {g≥2^22} → 固定前缀子样本 + 权重 |S3|/n_sub（确定性、低方差：r≤|e|/2^22）。
 估计值 ≈ 16M 全量口径，且跨 repair 步确定性单调可比。终验仍走 verilator 16M。
 
 loss = 面积项（Σ 所选 cell 面积 / Σ exact 锚点面积）+ λ·relu(MRED_est/budget − 1)，
-λ 自适应；离散化贪心修复（摘 wae·2^col 最大 slot），floor 不可行时回退历史最优。
+λ 自适应。旧版离散修复通过摘除近似 cell 降误差，但全精确 cell 只是 baseline，
+并非 MRED 下界；纯 DiffAM Stage-2 不使用该单向修复。
 """
 import json
 import os
@@ -230,9 +232,32 @@ class GradientCellSolver:
                 for i, (node, t, _c) in enumerate(self.space.slots)
                 if int(arg[i]) != 0}
 
+    def prepare_gate_pp(self):
+        """Cache fixed stratified partial products for one candidate shortlist."""
+        if getattr(self, "_gate_pp", None) is None:
+            e = self.est
+            self._gate_pp = tuple(
+                S.compute_pp_bits(
+                    self.pp_specs, a, b, self.exp.bit_width, self.device
+                )
+                for a, b in ((e.a12, e.b12), (e.a3s, e.b3s))
+            )
+
+    def clear_gate_pp(self):
+        """Release the per-structure gate cache before moving to another tree."""
+        self._gate_pp = None
+
     def gate_mred(self, config):
-        return self.est.gate(self.tree, self.pp_specs, self.exp.bit_width,
-                             self.space.cell_luts_of(config))
+        self.prepare_gate_pp()
+        e = self.est
+        cell_luts = self.space.cell_luts_of(config)
+        total = torch.zeros((), dtype=torch.float64, device=self.device)
+        for pp, golden, weight in (
+                (self._gate_pp[0], e.g12, 1.0),
+                (self._gate_pp[1], e.g3s, e.w3)):
+            output = self.tree.eval_exact(pp, cell_luts)
+            total = total + weight * e._ratio_sum_exact(output, golden)
+        return float(total.item() / e.n_rel)
 
     def gate_fast(self, config):
         """S12-only 快速口径（S3 贡献视作常数），用于贪心打分/排序。"""
@@ -325,7 +350,8 @@ class GradientCellSolver:
 
     # -------------------------------------------------------- ③ 贪心加法基线
     def greedy_add(self, log=print, rescore_tol=0.7, upgrade=True, pref_const=1.0):
-        """实测口径的 lazy greedy：从 floor 出发，按 面积节省/实测Δmred 性价比加 cell。
+        """实测口径的 lazy greedy：从全精确-cell baseline 出发，按
+        面积节省/实测Δmred 性价比加 cell。
         打分用 gate_fast（S12-only，秒级），验收用完整 gate；lazy 堆——弹出堆顶先
         用当前配置重测其 Δ，仍居前才接受（捕捉 cell 间交互）。
         upgrade=False 跳过升级扫描（训练内鲁棒模式用：贴线换面积的增量会被跨布线
@@ -336,7 +362,8 @@ class GradientCellSolver:
         cfg = {}
         gm = self.gate_mred(cfg)
         base_fast = self.gate_fast(cfg)
-        log(f"[greedy] floor mred={gm:.3e} util={gm/self.budget:6.1%} "
+        log(f"[greedy] exact-cell baseline mred={gm:.3e} "
+            f"util={gm/self.budget:6.1%} "
             f"pref_const={pref_const:g}")
         heap = []
         for node, t, _col in self.space.slots:
@@ -416,7 +443,8 @@ class GradientCellSolver:
 
     def repair(self, config, log=print):
         """离散化贪心修复：超预算 → 摘解析贡献 wae·2^col 最大的 slot。
-        floor（全摘光）也超预算时返回历史途中最优由 solve() 兜底。"""
+        该旧版修复只适用于全精确-cell baseline 已满足预算的情形；因为近似 cell
+        可能与截断误差抵消，全精确配置不是 MRED 下界。纯 DiffAM Stage-2 不调用它。"""
         col_of = {node: col for node, _t, col in self.space.slots}
         while True:
             gm = self.gate_mred(config)

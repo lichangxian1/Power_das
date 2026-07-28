@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export live, episode-level Stage-3 PPO/CEM objectives from evaluation caches."""
+"""Export live, episode-level Stage-3 routing objectives."""
 
 from __future__ import annotations
 
@@ -7,8 +7,10 @@ import argparse
 import datetime as dt
 import json
 import math
+import re
 import sqlite3
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 ROLE_WEIGHTS = {
@@ -16,6 +18,7 @@ ROLE_WEIGHTS = {
     "power": (0.20, 0.60, 0.20),
     "knee": (0.35, 0.35, 0.30),
 }
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def reward(item: dict, baseline: dict, role: str, delay_limit: float) -> float:
@@ -91,6 +94,170 @@ def summarize_arm(
     }
 
 
+def summarize_logged_arm(
+    name: str,
+    run_dir: Path,
+    total_episodes: int,
+) -> dict:
+    """Read generation metrics written by optimizers whose cache may deduplicate."""
+    path = run_dir / "routing_metrics.jsonl"
+    records = []
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            records.append(
+                {
+                    "episode": int(item.get("episode", item["generation"])),
+                    "mean_objective": float(item["mean_objective"]),
+                    "batch_best_objective": float(item["batch_best_objective"]),
+                    "cumulative_best_objective": float(
+                        item["cumulative_best_objective"]
+                    ),
+                }
+            )
+    records = records[:total_episodes]
+    return {
+        "name": name,
+        "run_dir": str(run_dir.resolve()),
+        "completed_episodes": len(records),
+        "total_episodes": total_episodes,
+        "cache_rows": len(load_rows(run_dir / "evaluation_cache.sqlite")),
+        "incomplete_episode_rows": 0,
+        "records": records,
+        "best_route": None,
+    }
+
+
+def load_ppo_log_means(run_dir: Path, total_episodes: int) -> dict[int, float]:
+    """Recover unnormalised one-epoch PPO mean objectives from the run log."""
+    path = run_dir / "launcher.log"
+    if not path.is_file():
+        path = run_dir / "train_three_stage.log"
+    if not path.is_file():
+        return {}
+    pattern = re.compile(
+        r"Stage 3 (\d+)/\d+ .* losses=([-+0-9.eE]+)(?:,[-+0-9.eE]+)*$"
+    )
+    means = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        episode = int(match.group(1))
+        if 1 <= episode <= total_episodes:
+            means[episode] = float(match.group(2))
+    return means
+
+
+def summarize_vanilla_arm(
+    run_dir: Path,
+    baseline: dict,
+    role: str,
+    routes_per_episode: int,
+    total_episodes: int,
+    delay_limit: float,
+) -> dict:
+    """Restore Vanilla PPO despite evaluation-cache route deduplication.
+
+    This run used one PPO epoch, no auxiliary losses, and unnormalised
+    advantages, so its logged PPO loss is the batch mean objective. Exact
+    cache-derived means are retained until they diverge from the log; the log
+    supplies the remaining means. Cumulative best is extended using discovery
+    episodes stored on final-Pareto candidates.
+    """
+    cached = summarize_arm(
+        "Vanilla PPO",
+        run_dir,
+        baseline,
+        role,
+        routes_per_episode,
+        total_episodes,
+        delay_limit,
+    )
+    logged_means = load_ppo_log_means(run_dir, total_episodes)
+    if not logged_means:
+        return cached
+
+    exact_prefix = 0
+    for record in cached["records"]:
+        episode = int(record["episode"])
+        logged = logged_means.get(episode)
+        if logged is None or abs(float(record["mean_objective"]) - logged) > 2.0e-5:
+            break
+        exact_prefix = episode
+
+    pareto_path = run_dir / "final" / "pareto.json"
+    pareto = []
+    if pareto_path.is_file():
+        pareto = json.loads(pareto_path.read_text(encoding="utf-8"))
+    pareto_milestones = []
+    best_route = cached.get("best_route")
+    for item in pareto:
+        metadata = item.get("metadata") or {}
+        episode = int(metadata.get("stage3_episode") or 0)
+        if not 1 <= episode <= total_episodes:
+            continue
+        objective = -reward(item, baseline, role, delay_limit)
+        pareto_milestones.append((episode, float(objective), item))
+        if best_route is None or objective < float(best_route["objective"]):
+            best_route = {
+                key: float(item[key])
+                for key in ("area", "power", "delay", "mred")
+            }
+            best_route.update({"objective": float(objective), "episode": episode})
+
+    cached_by_episode = {
+        int(record["episode"]): record for record in cached["records"]
+    }
+    records = []
+    cumulative_best = math.inf
+    for episode in range(1, total_episodes + 1):
+        logged = logged_means.get(episode)
+        if logged is None:
+            break
+        exact = cached_by_episode.get(episode) if episode <= exact_prefix else None
+        if exact is not None:
+            mean_objective = float(exact["mean_objective"])
+            batch_best = float(exact["batch_best_objective"])
+            cumulative_best = float(exact["cumulative_best_objective"])
+        else:
+            mean_objective = float(logged)
+            batch_best = None
+            for discovered, objective, _item in pareto_milestones:
+                if discovered == episode:
+                    cumulative_best = min(cumulative_best, objective)
+        records.append(
+            {
+                "episode": episode,
+                "mean_objective": mean_objective,
+                "batch_best_objective": batch_best,
+                "cumulative_best_objective": float(cumulative_best),
+            }
+        )
+
+    return {
+        "name": "Vanilla PPO",
+        "run_dir": str(run_dir.resolve()),
+        "completed_episodes": len(records),
+        "total_episodes": total_episodes,
+        "cache_rows": cached["cache_rows"],
+        "incomplete_episode_rows": 0,
+        "cache_exact_episodes": exact_prefix,
+        "mean_source": (
+            f"evaluation cache episodes 1..{exact_prefix}; "
+            f"one-epoch PPO log episodes {exact_prefix + 1}..{len(records)}"
+        ),
+        "best_source": (
+            f"evaluation cache episodes 1..{exact_prefix}; "
+            "final Pareto discovery episodes thereafter"
+        ),
+        "records": records,
+        "best_route": best_route,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("pair_root", type=Path)
@@ -98,6 +265,7 @@ def main() -> None:
     parser.add_argument("--cem-dir", type=Path, required=True)
     parser.add_argument("--reheat-dir", type=Path)
     parser.add_argument("--vanilla-dir", type=Path)
+    parser.add_argument("--nsga2-dir", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--routes-per-episode", type=int, default=64)
     parser.add_argument("--vanilla-routes-per-episode", type=int, default=32)
@@ -136,14 +304,18 @@ def main() -> None:
         )
     if args.vanilla_dir is not None:
         arms.append(
-            summarize_arm(
-                "Vanilla PPO", args.vanilla_dir, baseline, role,
+            summarize_vanilla_arm(
+                args.vanilla_dir, baseline, role,
                 args.vanilla_routes_per_episode, args.episodes, args.delay_limit,
             )
         )
+    if args.nsga2_dir is not None:
+        arms.append(
+            summarize_logged_arm("NSGA-II", args.nsga2_dir, args.episodes)
+        )
 
     payload = {
-        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "generated_at": dt.datetime.now(BEIJING_TZ).isoformat(),
         "pair_root": str(args.pair_root.resolve()),
         "elite_index": 12,
         "candidate_id": source["candidate_id"],

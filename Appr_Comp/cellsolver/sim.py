@@ -174,10 +174,26 @@ def approx_luts_from_lib(t, cell):
     pats = cell.get("patterns")
     if pats is None:
         # 原生 4 输入库（library42_native.json）：pattern_bits=4，LUT 即 product('01')
-        # 顺序（a 为最高位），与 SOP 发射同约定，直接用。
+        # 顺序（a 为最高位），与 SOP 发射同约定。早期 sayadi_substd 生成器把
+        # pattern 整数按 LSB→a 解包，旧库因而是 d,c,b,a 位序；RTL 端口始终是
+        # a,b,c,d。旧条目没有 lut_order 标记，加载时反转 4-bit 索引兼容；修正后
+        # 的生成器会写明 msb_first，不再转换。
         assert int(cell.get("pattern_bits", 4)) == 4
-        return {"n_in": 4, "sum": _lut(cell["sum_lut"]),
-                "carry": _lut(cell["carry_lut"]), "cout": _lut(cell["cout_lut"])}
+        reverse_legacy = (
+            cell.get("family") == "sayadi_substd"
+            and cell.get("lut_order") != "msb_first"
+        )
+        indices = (
+            [int(f"{i:04b}"[::-1], 2) for i in range(16)]
+            if reverse_legacy
+            else list(range(16))
+        )
+        return {
+            "n_in": 4,
+            "sum": _lut([cell["sum_lut"][i] for i in indices]),
+            "carry": _lut([cell["carry_lut"][i] for i in indices]),
+            "cout": _lut([cell["cout_lut"][i] for i in indices]),
+        }
     s = np.zeros(16, dtype=np.int64)
     ca = np.zeros(16, dtype=np.int64)
     co = np.zeros(16, dtype=np.int64)
